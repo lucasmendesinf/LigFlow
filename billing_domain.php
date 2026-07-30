@@ -3,6 +3,71 @@ declare(strict_types=1);
 
 const BILLING_PAYMENT_STATUSES = ['CREATED', 'PENDING', 'IN_PROCESS', 'APPROVED', 'REJECTED', 'CANCELLED', 'EXPIRED', 'REFUNDED', 'CHARGED_BACK', 'ERROR'];
 
+function billing_decimal_to_micros(string|int $value): int
+{
+    $value = trim(str_replace(',', '.', (string)$value));
+    if (!preg_match('/^(\d+)(?:\.(\d+))?$/', $value, $matches)) {
+        return 0;
+    }
+    $whole = (int)$matches[1];
+    $fraction = (string)($matches[2] ?? '');
+    $micros = (int)str_pad(substr($fraction, 0, 6), 6, '0');
+    if (isset($fraction[6]) && (int)$fraction[6] >= 5) {
+        $micros++;
+    }
+    return max(0, ($whole * 1000000) + $micros);
+}
+
+function billing_micros_to_decimal(int $micros): string
+{
+    $micros = max(0, $micros);
+    return intdiv($micros, 1000000) . '.' . str_pad((string)($micros % 1000000), 6, '0', STR_PAD_LEFT);
+}
+
+function billing_input_to_micros(string $value): ?int
+{
+    $value = trim(str_replace(',', '.', $value));
+    if ($value === '' || !preg_match('/^\d+(?:\.\d{1,6})?$/', $value)) {
+        return null;
+    }
+    return billing_decimal_to_micros($value);
+}
+
+function billing_micros_to_brl(int $micros): string
+{
+    $negative = $micros < 0;
+    $micros = abs($micros);
+    $centavos = intdiv($micros + 5000, 10000);
+    return ($negative ? '-R$ ' : 'R$ ')
+        . number_format(intdiv($centavos, 100), 0, ',', '.')
+        . ',' . str_pad((string)($centavos % 100), 2, '0', STR_PAD_LEFT);
+}
+
+function billing_proportional_call_cost(int $billableSeconds, int $rateMicros): array
+{
+    $billableSeconds = max(0, $billableSeconds);
+    $rateMicros = max(0, $rateMicros);
+    $costMicros = $billableSeconds > 0 && $rateMicros > 0
+        ? intdiv(($billableSeconds * $rateMicros) + 30, 60)
+        : 0;
+    return [
+        'billable_seconds' => $billableSeconds,
+        'rate_micros' => $rateMicros,
+        'cost_micros' => $costMicros,
+        'cost_decimal' => billing_micros_to_decimal($costMicros),
+    ];
+}
+
+function billing_telephony_balance_after(int $balanceMicros, int $debitMicros): int
+{
+    return $balanceMicros - max(0, $debitMicros);
+}
+
+function billing_telephony_call_allowed(bool $configured, int $balanceMicros, int $rateMicros): bool
+{
+    return $configured && $balanceMicros > 0 && $rateMicros > 0;
+}
+
 function billing_status_at(?string $renewsAt, string $timezone, ?DateTimeImmutable $now = null): array
 {
     $tz = new DateTimeZone($timezone ?: 'America/Sao_Paulo');

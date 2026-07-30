@@ -33,4 +33,63 @@ $q = $pdo->prepare('SELECT COUNT(*) FROM payments WHERE company_id=?'); $q->exec
 $assert((int)$q->fetchColumn() === 1, 'isolamento entre tenants');
 $assert((int)$pdo->query("SELECT COUNT(*) FROM periods p JOIN payments x ON x.id=p.payment_id WHERE x.status='PENDING'")->fetchColumn() === 0, 'pagamento pendente nao cria periodo');
 
+$rate035 = billing_decimal_to_micros('0.35');
+$cost = static fn(int $seconds, int $rate = 350000): array => billing_proportional_call_cost($seconds, $rate);
+$assert($cost(0)['cost_micros'] === 0, '0 segundos sem custo');
+$assert($cost(10)['cost_micros'] === 58333 && $cost(10)['cost_decimal'] === '0.058333', '10 segundos proporcionais');
+$assert($cost(30)['cost_micros'] === 175000, '30 segundos proporcionais');
+$assert($cost(59)['cost_micros'] === 344167, '59 segundos proporcionais');
+$assert($cost(60)['cost_micros'] === 350000 && $cost(60)['cost_decimal'] === '0.350000', '60 segundos exatos');
+$assert($cost(61)['cost_micros'] === 355833, '61 segundos proporcionais');
+$assert($cost(90)['cost_micros'] === 525000, '90 segundos proporcionais');
+$assert($cost(0, $rate035)['cost_micros'] === 0, 'chamada nao atendida sem custo');
+$assert($cost(10, $rate035)['cost_micros'] !== $rate035, '10 segundos nao cobram minuto cheio');
+$assert($cost(60, billing_decimal_to_micros('0.50'))['cost_micros'] === 500000, 'tarifa conforme plano');
+
+$pdo->exec('CREATE TABLE call_charges (call_id INTEGER PRIMARY KEY, cost_micros INTEGER NOT NULL)');
+$charge = $pdo->prepare('INSERT INTO call_charges(call_id,cost_micros) VALUES (?,?) ON CONFLICT(call_id) DO UPDATE SET cost_micros=excluded.cost_micros');
+$charge->execute([77, $cost(30)['cost_micros']]);
+$charge->execute([77, $cost(30)['cost_micros']]);
+$assert((int)$pdo->query('SELECT SUM(cost_micros) FROM call_charges WHERE call_id=77')->fetchColumn() === 175000, 'reprocessamento sem debito duplicado');
+$assert((int)$pdo->query('SELECT SUM(cost_micros) FROM call_charges')->fetchColumn() === $cost(30)['cost_micros'], 'relatorio e saldo usam custo persistido');
+
+$credit = billing_decimal_to_micros('200.00');
+$assert($credit === 200000000, 'ativacao concede R$ 200,00 de credito');
+$assert(billing_micros_to_brl($credit) === 'R$ 200,00', 'credito exibido em BRL');
+$assert(billing_telephony_balance_after($credit, $cost(60)['cost_micros']) === 199650000, '60 segundos debitam R$ 0,35 do credito');
+$assert(billing_telephony_balance_after($credit, $cost(10)['cost_micros']) === 199941667, '10 segundos debitam valor proporcional');
+$assert(billing_telephony_balance_after($credit, $cost(90)['cost_micros']) === 199475000, '90 segundos debitam valor proporcional');
+$assert(billing_telephony_balance_after($credit, $cost(0)['cost_micros']) === $credit, 'chamada nao atendida nao debita credito');
+$assert(!billing_telephony_call_allowed(true, 0, $rate035), 'saldo zerado bloqueia nova chamada');
+$assert(!billing_telephony_call_allowed(false, $credit, $rate035) && billing_operational_route_allowed(false, 'dashboard'), 'sem credito nao bloqueia demais funcoes');
+
+$ledger = new PDO('sqlite::memory:');
+$ledger->exec('CREATE TABLE periods (id INTEGER PRIMARY KEY, company_id INTEGER, initial_micros INTEGER, rate_micros INTEGER, balance_micros INTEGER); CREATE TABLE ledger (id INTEGER PRIMARY KEY, company_id INTEGER, call_id INTEGER UNIQUE, idempotency_key TEXT UNIQUE, amount_micros INTEGER, balance_before_micros INTEGER, balance_after_micros INTEGER); CREATE TABLE audit (action TEXT, company_id INTEGER)');
+$ledger->exec('INSERT INTO periods VALUES (1,10,200000000,350000,200000000),(2,20,50000000,500000,50000000)');
+$planRateBefore = (int)$ledger->query('SELECT rate_micros FROM periods WHERE id=1')->fetchColumn();
+$editedPlanRate = billing_decimal_to_micros('0.99');
+$assert($planRateBefore === 350000 && $editedPlanRate !== $planRateBefore, 'edicao do plano nao altera tarifa do periodo ativo');
+$grant = $ledger->prepare('INSERT OR IGNORE INTO ledger(company_id,idempotency_key,amount_micros,balance_before_micros,balance_after_micros) VALUES (?,?,?,?,?)');
+$grant->execute([10, 'period-credit:1', 200000000, 0, 200000000]);
+$grant->execute([10, 'period-credit:1', 200000000, 0, 200000000]);
+$assert((int)$ledger->query("SELECT COUNT(*) FROM ledger WHERE idempotency_key='period-credit:1'")->fetchColumn() === 1, 'renovacao e webhook repetido concedem credito uma vez');
+$debit = static function (PDO $db, int $companyId, int $callId, int $amount): void {
+    $period = $db->query('SELECT * FROM periods WHERE company_id=' . $companyId)->fetch(PDO::FETCH_ASSOC);
+    $before = (int)$period['balance_micros'];
+    $after = billing_telephony_balance_after($before, $amount);
+    $stmt = $db->prepare('INSERT OR IGNORE INTO ledger(company_id,call_id,idempotency_key,amount_micros,balance_before_micros,balance_after_micros) VALUES (?,?,?,?,?,?)');
+    $stmt->execute([$companyId, $callId, 'call-debit:' . $callId, -$amount, $before, $after]);
+    if ($stmt->rowCount() === 1) {
+        $db->prepare('UPDATE periods SET balance_micros=? WHERE id=?')->execute([$after, $period['id']]);
+    }
+};
+$debit($ledger, 10, 101, $cost(60)['cost_micros']);
+$debit($ledger, 10, 101, $cost(60)['cost_micros']);
+$assert((int)$ledger->query('SELECT COUNT(*) FROM ledger WHERE call_id=101')->fetchColumn() === 1, 'callback repetido nao duplica debito');
+$debit($ledger, 10, 102, $cost(60)['cost_micros']);
+$assert((int)$ledger->query('SELECT balance_micros FROM periods WHERE id=1')->fetchColumn() === 199300000, 'dois debitos sequenciais preservam saldo consistente');
+$assert((int)$ledger->query('SELECT balance_micros FROM periods WHERE id=2')->fetchColumn() === 50000000, 'isolamento de credito entre tenants');
+$ledger->prepare('INSERT INTO audit(action,company_id) VALUES (?,?)')->execute(['ajustou_credito_telefonia', 10]);
+$assert((int)$ledger->query("SELECT COUNT(*) FROM audit WHERE action='ajustou_credito_telefonia' AND company_id=10")->fetchColumn() === 1, 'ajuste manual gera auditoria');
+
 echo "OK - {$tests} testes\n";

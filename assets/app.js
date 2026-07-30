@@ -248,7 +248,8 @@ function tickTimers() {
                 timer.dataset.startMs = String(startedAt);
             } else {
                 const raw = timer.getAttribute('data-start') || '';
-                startedAt = new Date(raw.replace(' ', 'T')).getTime();
+                const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw.replace(' ', 'T')}Z`;
+                startedAt = new Date(normalized).getTime();
             }
         }
         const elapsed = Number.isFinite(startedAt) ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0;
@@ -473,6 +474,17 @@ document.querySelectorAll('[data-call-history-close]').forEach((button) => {
     });
 });
 
+document.querySelectorAll('[data-open-callback]').forEach((button) => {
+    button.addEventListener('click', () => {
+        const id = button.getAttribute('data-open-callback');
+        document.querySelector(`[data-callback-modal="${id}"]`)?.classList.remove('is-hidden');
+    });
+});
+
+document.querySelectorAll('[data-callback-modal-close]').forEach((button) => {
+    button.addEventListener('click', () => button.closest('[data-callback-modal]')?.classList.add('is-hidden'));
+});
+
 document.querySelectorAll('[data-quick-block-call]').forEach((button) => {
     button.addEventListener('click', async () => {
         const callId = Number(button.dataset.quickBlockCall || 0);
@@ -640,6 +652,122 @@ if (listScroll) {
         if (listScroll.scrollTop + listScroll.clientHeight >= listScroll.scrollHeight - 80) loadMore();
     });
     if (hasMore && listScroll.scrollHeight <= listScroll.clientHeight + 20) loadMore();
+}
+
+const callbackWebphone = document.querySelector('[data-sip-floating]');
+if (callbackWebphone) {
+    const storageKey = 'ligflow_callback_notifications_seen';
+    const callbackPollBaseDelay = 30000;
+    const callbackPollMaxDelay = 60000;
+    const callbackEscapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[char]));
+    let callbackNotificationPolling = false;
+    let callbackPollDelay = callbackPollBaseDelay;
+    let callbackPollTimer = null;
+    let seenCallbackNotifications = [];
+    try {
+        const stored = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        seenCallbackNotifications = Array.isArray(stored) ? stored.map(String).filter(Boolean) : [];
+    } catch (error) {
+        seenCallbackNotifications = [];
+    }
+
+    const saveSeenCallbackNotifications = () => {
+        seenCallbackNotifications = Array.from(new Set(seenCallbackNotifications)).slice(-200);
+        localStorage.setItem(storageKey, JSON.stringify(seenCallbackNotifications));
+    };
+    const markCallbackNotificationSeen = (key) => {
+        if (!seenCallbackNotifications.includes(key)) {
+            seenCallbackNotifications.push(key);
+            saveSeenCallbackNotifications();
+        }
+    };
+    const callbackNotificationContainer = document.createElement('div');
+    callbackNotificationContainer.className = 'callback-notification-stack';
+    callbackNotificationContainer.setAttribute('aria-live', 'polite');
+    document.body.appendChild(callbackNotificationContainer);
+
+    const openCallbackInWebphone = (callback, notification) => {
+        const input = callbackWebphone.querySelector('[data-phone-search-input]');
+        const panel = callbackWebphone.querySelector('[data-webphone]');
+        if (input) {
+            input.value = withoutBrazilCountryCode(callback.phone || '');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        panel?.classList.remove('is-hidden');
+        callbackWebphone.querySelector('[data-phone-tab="teclado"]')?.click();
+        markCallbackNotificationSeen(`${callback.id}:${callback.scheduled_at || ''}`);
+        notification.remove();
+    };
+
+    const showCallbackNotification = (callback) => {
+        const id = Number(callback.id);
+        const notificationKey = `${id}:${callback.scheduled_at || ''}`;
+        const alreadyVisible = Array.from(callbackNotificationContainer.children).some((item) => item.dataset.callbackNotificationKey === notificationKey);
+        if (!id || seenCallbackNotifications.includes(notificationKey) || alreadyVisible) return false;
+        const notification = document.createElement('article');
+        notification.className = 'callback-notification';
+        notification.dataset.callbackNotificationKey = notificationKey;
+        notification.innerHTML = `
+            <button type="button" class="callback-notification-main">
+                <span class="callback-notification-bell" aria-hidden="true">&#128276;&#65038;</span>
+                <span><strong>Horario de retorno</strong><small>${callbackEscapeHtml(callback.contact || 'Contato')} - ${callbackEscapeHtml(callback.phone || '')}</small></span>
+            </button>
+            <button type="button" class="callback-notification-close" aria-label="Fechar notificacao">x</button>`;
+        notification.querySelector('.callback-notification-main')?.addEventListener('click', () => openCallbackInWebphone(callback, notification));
+        notification.querySelector('.callback-notification-close')?.addEventListener('click', () => {
+            markCallbackNotificationSeen(notificationKey);
+            notification.remove();
+        });
+        callbackNotificationContainer.appendChild(notification);
+        return true;
+    };
+
+    const scheduleCallbackPoll = (delay = callbackPollDelay) => {
+        window.clearTimeout(callbackPollTimer);
+        callbackPollTimer = null;
+        if (document.hidden || !navigator.onLine) return;
+        callbackPollTimer = window.setTimeout(pollCallbackNotifications, delay);
+    };
+
+    const pollCallbackNotifications = async () => {
+        if (callbackNotificationPolling || document.hidden || !navigator.onLine) return;
+        callbackNotificationPolling = true;
+        try {
+            const response = await fetch('?page=callback_notifications', { headers: { Accept: 'application/json' } });
+            const body = await response.text();
+            const data = body.trim() ? JSON.parse(body) : null;
+            if (!response.ok || !data?.ok) throw new Error('Falha ao consultar retornos.');
+            const newNotifications = (data.callbacks || []).reduce((total, callback) => total + (showCallbackNotification(callback) ? 1 : 0), 0);
+            callbackPollDelay = newNotifications > 0
+                ? callbackPollBaseDelay
+                : Math.min(callbackPollMaxDelay, callbackPollDelay * 2);
+        } catch (error) {
+            callbackPollDelay = Math.min(callbackPollMaxDelay, callbackPollDelay * 2);
+        } finally {
+            callbackNotificationPolling = false;
+            scheduleCallbackPoll();
+        }
+    };
+
+    pollCallbackNotifications();
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            window.clearTimeout(callbackPollTimer);
+            callbackPollTimer = null;
+            return;
+        }
+        callbackPollDelay = callbackPollBaseDelay;
+        pollCallbackNotifications();
+    });
+    window.addEventListener('online', () => {
+        callbackPollDelay = callbackPollBaseDelay;
+        pollCallbackNotifications();
+    });
+    window.addEventListener('offline', () => {
+        window.clearTimeout(callbackPollTimer);
+        callbackPollTimer = null;
+    });
 }
 
 document.addEventListener('keydown', (event) => {

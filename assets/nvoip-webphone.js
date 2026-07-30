@@ -119,6 +119,9 @@ class NvoipWebphoneService {
         session.on('progress', (event) => {
             const progress = this.sipResponseDetail(event);
             const direction = session._ligflowDirection || 'outgoing';
+            if (progress.code >= 300) {
+                session._ligflowLastSipFailure = progress;
+            }
             if (progress.code === 180) {
                 session._ligflowRingingConfirmed = true;
                 this.emit('RINGING', {
@@ -174,8 +177,11 @@ class NvoipWebphoneService {
             this.log('Midia conectada');
         });
         session.on('ended', (event) => {
-            const detail = this.sipResponseDetail(event);
-            const cause = this.sipCause(event);
+            const eventDetail = this.sipResponseDetail(event);
+            const detail = eventDetail.code >= 300
+                ? eventDetail
+                : (session._ligflowLastSipFailure || eventDetail);
+            const cause = detail.summary || this.sipCause(event);
             this.emit('ENDED', {
                 call: 'Encerrada',
                 cause,
@@ -188,8 +194,11 @@ class NvoipWebphoneService {
             this.session = null;
         });
         session.on('failed', (event) => {
-            const detail = this.sipResponseDetail(event);
-            const cause = this.sipCause(event);
+            const eventDetail = this.sipResponseDetail(event);
+            const detail = eventDetail.code >= 300
+                ? eventDetail
+                : (session._ligflowLastSipFailure || eventDetail);
+            const cause = detail.summary || this.sipCause(event);
             this.emit('CALL_FAILED', {
                 call: 'Falhou',
                 cause,
@@ -453,6 +462,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     let ringConfirmationTimer = null;
     let unansweredRingTimer = null;
     let earlyMediaTimer = null;
+    let terminalFailureFinalizeTimer = null;
     let forcedTerminalFailure = null;
     let ringbackAudioContext = null;
     let ringbackAudioTimer = null;
@@ -603,6 +613,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         if (earlyMediaTimer) {
             clearTimeout(earlyMediaTimer);
             earlyMediaTimer = null;
+        }
+        if (terminalFailureFinalizeTimer) {
+            clearTimeout(terminalFailureFinalizeTimer);
+            terminalFailureFinalizeTimer = null;
         }
     };
 
@@ -843,11 +857,15 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
                 ringingConfirmed: false,
             });
         }
-        if (terminalFailureSnapshot.cause === 'no_answer_early_media_timeout') {
-            setTimeout(async () => {
-                if (!currentSipCallId || stopRequestedByUser || forcedTerminalFailure?.cause !== 'no_answer_early_media_timeout') return;
+        const finalizeDelay = isImmediateSkipCause(
+            terminalFailureSnapshot.cause,
+            terminalFailureSnapshot.sipCode,
+        ) ? 50 : (terminalFailureSnapshot.cause === 'no_answer_early_media_timeout' ? 500 : 700);
+        terminalFailureFinalizeTimer = setTimeout(async () => {
+                terminalFailureFinalizeTimer = null;
+                if (!currentSipCallId || stopRequestedByUser || forcedTerminalFailure?.cause !== terminalFailureSnapshot.cause) return;
                 await finishSipCallRecord('failed', {
-                    cause: 'no_answer_early_media_timeout',
+                    cause: terminalFailureSnapshot.cause,
                     terminal_failure: true,
                     immediate_advance: true,
                     urgent_advance: true,
@@ -855,9 +873,8 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
                     sip_reason: terminalFailureSnapshot.sipReason,
                 });
                 forcedTerminalFailure = null;
-                resetFloatingCallState('Numero indisponivel. Avancando para a proxima lead.');
-            }, 250);
-        }
+                resetFloatingCallState('Chamada sem retorno valido. Avancando para a proxima lead.');
+            }, finalizeDelay);
     };
 
     const startRingConfirmationTimer = () => {
@@ -976,12 +993,17 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
                     ringConfirmationTimer = null;
                 }
                 if (isAutoDialing() && currentSipDirection !== 'incoming' && !currentSipAnswered) {
-                    if (!earlyMediaTimer) {
+                    if (isImmediateSkipCause(state.cause, state.sipCode)) {
+                        forceTerminalCallFailure(state.cause || `SIP ${state.sipCode}`, state);
+                    } else if (!earlyMediaTimer) {
                         earlyMediaTimer = setTimeout(() => {
                             earlyMediaTimer = null;
                             if (currentSipCallId && !currentSipAnswered && !currentSipRingingConfirmed) {
+                                const terminalCause = isTerminalFailureCause(state.cause)
+                                    ? state.cause
+                                    : 'no_answer_early_media_timeout';
                                 forceTerminalCallFailure(
-                                    'no_answer_early_media_timeout',
+                                    terminalCause,
                                     state,
                                 );
                             }
@@ -1172,7 +1194,11 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         try {
             const campaignId = Number(form?.querySelector('[name="campaign_id"]')?.value || 0);
-            const registeredCall = await postSipCallEvent('start', { phone: cleanNumber, campaign_id: campaignId });
+            const registeredCall = await postSipCallEvent('start', {
+                phone: cleanNumber,
+                campaign_id: campaignId,
+                auto_dialing: isAutoDialing(),
+            });
             currentSipCallId = registeredCall.callId || null;
             currentSipStartedAt = Date.now();
             currentSipAnswered = false;
@@ -1183,6 +1209,9 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             if (currentSipCallMeta) updateCurrentLeadPanel(currentSipCallMeta);
         } catch (error) {
             setText(callDetail, error.message);
+            if (isAutoDialing() && /lead automatica|reservada nesta campanha/i.test(String(error.message || ''))) {
+                setTimeout(() => window.location.reload(), 1200);
+            }
             if (!isAutoDialing() && /lista de bloqueio|bloquead/i.test(String(error.message || ''))) {
                 window.alert('Contato bloqueado. Este numero esta na lista de bloqueio e nao pode receber chamadas.');
             }
@@ -1240,7 +1269,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     });
 
     root.querySelector('[data-phone-tab="recentes"]')?.addEventListener('click', refreshPhoneHistory);
-    refreshPhoneHistory();
 
     callButton?.addEventListener('click', async (event) => {
         event.preventDefault();
@@ -1257,6 +1285,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     });
 
     const autoCallPhone = root.getAttribute('data-auto-call-phone');
+    const recoverAutoCallId = Number(root.getAttribute('data-recover-auto-call-id') || 0);
     if (autoCallPhone && !autoCallStarted) {
         autoCallStarted = true;
         const cleanAutoCallPhone = service.normalizeSipDialNumber(autoCallPhone);
@@ -1267,5 +1296,21 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         panel?.classList.remove('is-hidden');
         setText(callDetail, 'Iniciando chamada automatica pelo webfone.');
         setTimeout(() => placeCall(cleanAutoCallPhone), 500);
+    } else if (recoverAutoCallId && isAutoDialing() && !autoCallStarted) {
+        autoCallStarted = true;
+        currentSipCallId = recoverAutoCallId;
+        currentSipStartedAt = Date.now();
+        currentSipAnswered = false;
+        currentSipRingingConfirmed = false;
+        setText(callDetail, 'Recuperando a fila automatica apos perda da sessao da chamada.');
+        setTimeout(async () => {
+            await finishSipCallRecord('failed', {
+                cause: 'browser_session_lost',
+                terminal_failure: true,
+                immediate_advance: true,
+                urgent_advance: true,
+            });
+            resetFloatingCallState('Fila recuperada. Avancando para a proxima lead.');
+        }, 300);
     }
 });

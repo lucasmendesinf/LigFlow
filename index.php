@@ -7,6 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
+const DB_SCHEMA_VERSION = 6;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -54,10 +55,33 @@ function db(): PDO
     $pdo = new PDO('sqlite:' . DB_FILE);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-    migrate($pdo);
-    seed($pdo);
-    ensure_default_access_profiles($pdo);
+    initialize_database($pdo);
     return $pdo;
+}
+
+function initialize_database(PDO $pdo): void
+{
+    $currentVersion = (int)$pdo->query('PRAGMA user_version')->fetchColumn();
+    if ($currentVersion >= DB_SCHEMA_VERSION) {
+        return;
+    }
+
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $currentVersion = (int)$pdo->query('PRAGMA user_version')->fetchColumn();
+        if ($currentVersion < DB_SCHEMA_VERSION) {
+            migrate($pdo);
+            seed($pdo);
+            ensure_default_access_profiles($pdo);
+            $pdo->exec('PRAGMA user_version = ' . DB_SCHEMA_VERSION);
+        }
+        $pdo->exec('COMMIT');
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->exec('ROLLBACK');
+        }
+        throw $error;
+    }
 }
 
 function migrate(PDO $pdo): void
@@ -441,6 +465,24 @@ function migrate(PDO $pdo): void
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS telephony_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            subscription_id INTEGER NOT NULL,
+            subscription_period_id INTEGER,
+            call_id INTEGER,
+            entry_type TEXT NOT NULL,
+            amount_micros INTEGER NOT NULL,
+            balance_before_micros INTEGER NOT NULL,
+            balance_after_micros INTEGER NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            reference_type TEXT,
+            reference_id INTEGER,
+            notes TEXT,
+            responsible_user_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS payment_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             company_id INTEGER NOT NULL,
@@ -487,19 +529,45 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'internal_status', 'TEXT');
     ensure_column($pdo, 'calls', 'attempt_number', 'INTEGER DEFAULT 1');
     ensure_column($pdo, 'calls', 'error_message', 'TEXT');
+    ensure_column($pdo, 'calls', 'billing_rate_micros', 'INTEGER');
+    ensure_column($pdo, 'calls', 'estimated_cost_micros', 'INTEGER');
+    ensure_column($pdo, 'calls', 'telephony_period_id', 'INTEGER');
+    ensure_column($pdo, 'callbacks', 'call_id', 'INTEGER');
+    ensure_column($pdo, 'callbacks', 'completed_at', 'TEXT');
     ensure_column($pdo, 'plans', 'monthly_price', 'REAL DEFAULT 0');
     ensure_column($pdo, 'plans', 'setup_fee', 'REAL DEFAULT 0');
     ensure_column($pdo, 'plans', 'billing_period', "TEXT DEFAULT 'Mensal'");
     ensure_column($pdo, 'plans', 'payment_type', "TEXT DEFAULT 'Pix'");
     ensure_column($pdo, 'plans', 'description', 'TEXT');
+    ensure_column($pdo, 'plans', 'telephony_credit_micros', 'INTEGER');
+    ensure_column($pdo, 'plans', 'telephony_rate_micros', 'INTEGER');
+    ensure_column($pdo, 'subscriptions', 'telephony_period_id', 'INTEGER');
+    ensure_column($pdo, 'subscriptions', 'telephony_credit_initial_micros', 'INTEGER');
+    ensure_column($pdo, 'subscriptions', 'telephony_rate_micros', 'INTEGER');
+    ensure_column($pdo, 'subscriptions', 'telephony_balance_micros', 'INTEGER');
+    ensure_column($pdo, 'subscription_periods', 'telephony_credit_initial_micros', 'INTEGER');
+    ensure_column($pdo, 'subscription_periods', 'telephony_rate_micros', 'INTEGER');
+    ensure_column($pdo, 'subscription_periods', 'telephony_balance_micros', 'INTEGER');
+    $pdo->exec("UPDATE callbacks SET status = CASE
+        WHEN status IS NULL OR trim(status) = '' OR lower(trim(status)) = 'pending' THEN 'pendente'
+        ELSE lower(trim(status)) END");
+    $pdo->exec("UPDATE callbacks SET scheduled_at = CASE
+        WHEN length(replace(scheduled_at, 'T', ' ')) = 16 THEN replace(scheduled_at, 'T', ' ') || ':00'
+        ELSE replace(scheduled_at, 'T', ' ') END");
     ensure_index($pdo, 'idx_calls_company_campaign_created', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_created ON calls(company_id, campaign_id, created_at DESC)');
     ensure_index($pdo, 'idx_calls_company_campaign_internal_status', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_internal_status ON calls(company_id, campaign_id, internal_status)');
     ensure_index($pdo, 'idx_calls_company_destination_number', 'CREATE INDEX IF NOT EXISTS idx_calls_company_destination_number ON calls(company_id, destination_number)');
     ensure_index($pdo, 'idx_calls_company_provider_call_id', 'CREATE INDEX IF NOT EXISTS idx_calls_company_provider_call_id ON calls(company_id, provider_call_id)');
+    ensure_index($pdo, 'idx_calls_company_agent_id', 'CREATE INDEX IF NOT EXISTS idx_calls_company_agent_id ON calls(company_id, agent_id, id DESC)');
+    ensure_index($pdo, 'idx_callbacks_company_call', 'CREATE INDEX IF NOT EXISTS idx_callbacks_company_call ON callbacks(company_id, call_id)');
+    ensure_index($pdo, 'idx_callbacks_company_agent_status_scheduled', 'CREATE INDEX IF NOT EXISTS idx_callbacks_company_agent_status_scheduled ON callbacks(company_id, agent_id, status, scheduled_at)');
     ensure_index($pdo, 'idx_payments_company_created', 'CREATE INDEX IF NOT EXISTS idx_payments_company_created ON payments(company_id, created_at DESC)');
     ensure_index($pdo, 'idx_payments_company_status', 'CREATE INDEX IF NOT EXISTS idx_payments_company_status ON payments(company_id, status)');
     ensure_index($pdo, 'idx_payments_provider_id', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_id ON payments(provider, provider_payment_id) WHERE provider_payment_id IS NOT NULL');
     ensure_index($pdo, 'idx_subscription_periods_company_end', 'CREATE INDEX IF NOT EXISTS idx_subscription_periods_company_end ON subscription_periods(company_id, ends_at DESC)');
+    ensure_index($pdo, 'idx_telephony_ledger_company_created', 'CREATE INDEX IF NOT EXISTS idx_telephony_ledger_company_created ON telephony_ledger(company_id, created_at DESC)');
+    ensure_index($pdo, 'idx_telephony_ledger_period_created', 'CREATE INDEX IF NOT EXISTS idx_telephony_ledger_period_created ON telephony_ledger(subscription_period_id, created_at DESC)');
+    ensure_index($pdo, 'idx_telephony_ledger_call', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_telephony_ledger_call ON telephony_ledger(call_id) WHERE call_id IS NOT NULL');
     migrate_call_attempt_columns($pdo);
     migrate_contacts_unique_per_list($pdo);
 }
@@ -836,7 +904,6 @@ function access_modules(): array
         'recordings' => 'Gravacoes',
         'costs' => 'Plano e consumo',
         'settings' => 'Integracoes',
-        'sip_diagnostic' => 'Diagnostico SIP',
         'blocklist' => 'Bloqueio',
         'audit' => 'Auditoria',
         'account' => 'Minha conta',
@@ -846,8 +913,8 @@ function access_modules(): array
 function default_role_modules(string $role): array
 {
     $matrix = [
-        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'sip_diagnostic', 'blocklist', 'audit'],
-        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'sip_diagnostic', 'blocklist', 'audit'],
+        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
+        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
         'cliente_admin' => ['dashboard', 'users', 'lists', 'campaigns', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'admin_empresa' => ['dashboard', 'users', 'lists', 'campaigns', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'usuario_operacional' => ['dashboard', 'lists', 'agent', 'reports', 'recordings'],
@@ -939,9 +1006,28 @@ function can(string $area): bool
     return in_array($area, modules_for_user($user), true);
 }
 
+function utf8_text(mixed $value): string
+{
+    $text = (string)$value;
+    if ($text === '' || preg_match('//u', $text) === 1) {
+        return $text;
+    }
+    if (function_exists('mb_convert_encoding')) {
+        return mb_convert_encoding($text, 'UTF-8', 'Windows-1252');
+    }
+    $converted = iconv('Windows-1252', 'UTF-8//IGNORE', $text);
+    return $converted === false ? '' : $converted;
+}
+
 function h(?string $value): string
 {
-    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+    return htmlspecialchars(utf8_text($value), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function json_encode_safe(mixed $value): string
+{
+    $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    return $encoded === false ? '{"ok":false,"error":"Falha ao gerar resposta JSON."}' : $encoded;
 }
 
 function datetime_local(?string $value): string
@@ -949,8 +1035,16 @@ function datetime_local(?string $value): string
     if (!$value) {
         return '';
     }
-    $timestamp = strtotime($value);
-    return $timestamp ? date('Y-m-d\TH:i', $timestamp) : '';
+    return datetime_utc_display($value, 'Y-m-d\TH:i');
+}
+
+function callback_datetime_storage(string $value): string
+{
+    $value = str_replace('T', ' ', trim($value));
+    if (strlen($value) === 16) {
+        $value .= ':00';
+    }
+    return $value;
 }
 
 function money(float $value): string
@@ -958,7 +1052,7 @@ function money(float $value): string
     return 'R$ ' . number_format($value, 2, ',', '.');
 }
 
-function monthly_usage(int $companyId): array
+function monthly_usage(int $companyId, ?float $usedSeconds = null): array
 {
     $company = one('SELECT * FROM companies WHERE id = ?', [$companyId]);
     $subscription = one('SELECT * FROM subscriptions WHERE company_id = ?', [$companyId]);
@@ -966,7 +1060,10 @@ function monthly_usage(int $companyId): array
     if ($limit <= 0) {
         $limit = (int)($company['monthly_minutes_limit'] ?? 0);
     }
-    $used = (float)one("SELECT COALESCE(SUM(billable_seconds), 0) seconds FROM calls WHERE company_id = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')", [$companyId])['seconds'] / 60;
+    if ($usedSeconds === null) {
+        $usedSeconds = (float)one("SELECT COALESCE(SUM(billable_seconds), 0) seconds FROM calls WHERE company_id = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')", [$companyId])['seconds'];
+    }
+    $used = $usedSeconds / 60;
     $remaining = max(0, $limit - $used);
     $percent = $limit > 0 ? min(100, ($used / $limit) * 100) : 0;
     return [
@@ -975,6 +1072,61 @@ function monthly_usage(int $companyId): array
         'remaining' => round($remaining, 1),
         'percent' => round($percent, 1),
     ];
+}
+
+function recent_phone_history(int $companyId, int $agentId): array
+{
+    $items = rows("
+        SELECT 1 bucket_order, 'todas' bucket, item.* FROM (
+            SELECT co.id, co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds,
+                   ct.name contato, ct.city, ct.state, cr.name resultado
+            FROM calls co
+            LEFT JOIN contacts ct ON ct.id = co.contact_id
+            LEFT JOIN call_results cr ON cr.id = co.result_id
+            WHERE co.company_id = ? AND co.agent_id = ?
+            ORDER BY co.id DESC LIMIT 8
+        ) item
+        UNION ALL
+        SELECT 2 bucket_order, 'recebidas' bucket, item.* FROM (
+            SELECT co.id, co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds,
+                   ct.name contato, ct.city, ct.state, cr.name resultado
+            FROM calls co
+            LEFT JOIN contacts ct ON ct.id = co.contact_id
+            LEFT JOIN call_results cr ON cr.id = co.result_id
+            WHERE co.company_id = ? AND co.agent_id = ? AND co.status IN ('received','incoming','inbound')
+            ORDER BY co.id DESC LIMIT 8
+        ) item
+        UNION ALL
+        SELECT 3 bucket_order, 'realizadas' bucket, item.* FROM (
+            SELECT co.id, co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds,
+                   ct.name contato, ct.city, ct.state, cr.name resultado
+            FROM calls co
+            LEFT JOIN contacts ct ON ct.id = co.contact_id
+            LEFT JOIN call_results cr ON cr.id = co.result_id
+            WHERE co.company_id = ? AND co.agent_id = ? AND co.status NOT IN ('received','incoming','inbound')
+            ORDER BY co.id DESC LIMIT 8
+        ) item
+        UNION ALL
+        SELECT 4 bucket_order, 'perdidas' bucket, item.* FROM (
+            SELECT co.id, co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds,
+                   ct.name contato, ct.city, ct.state, cr.name resultado
+            FROM calls co
+            LEFT JOIN contacts ct ON ct.id = co.contact_id
+            LEFT JOIN call_results cr ON cr.id = co.result_id
+            WHERE co.company_id = ? AND co.agent_id = ?
+              AND (co.status IN ('failed','cancelled','busy','no_answer','missed') OR cr.name IN ('Nao atendeu','Ocupado','Caixa postal'))
+            ORDER BY co.id DESC LIMIT 8
+        ) item
+        ORDER BY bucket_order, id DESC
+    ", array_merge(...array_fill(0, 4, [$companyId, $agentId])));
+
+    $history = ['todas' => [], 'recebidas' => [], 'realizadas' => [], 'perdidas' => []];
+    foreach ($items as $item) {
+        $bucket = (string)$item['bucket'];
+        unset($item['bucket'], $item['bucket_order']);
+        $history[$bucket][] = $item;
+    }
+    return $history;
 }
 
 function env_value(string $key, string $default = ''): string
@@ -987,6 +1139,151 @@ function price_per_minute(): float
 {
     $config = nvoip_config();
     return (float)$config['price_per_minute'];
+}
+
+function call_plan_rate_micros(int $companyId): int
+{
+    $row = one("SELECT s.telephony_rate_micros, p.telephony_rate_micros plan_rate_micros
+        FROM subscriptions s
+        LEFT JOIN plans p ON p.id = s.plan_id
+        WHERE s.company_id = ?
+        ORDER BY s.id DESC LIMIT 1", [$companyId]);
+    return $row && $row['telephony_rate_micros'] !== null
+        ? max(0, (int)$row['telephony_rate_micros'])
+        : max(0, (int)($row['plan_rate_micros'] ?? 0));
+}
+
+function call_billing_values(array $call, int $billableSeconds): array
+{
+    $storedRate = array_key_exists('billing_rate_micros', $call) && $call['billing_rate_micros'] !== null
+        ? (int)$call['billing_rate_micros']
+        : call_plan_rate_micros((int)$call['company_id']);
+    return billing_proportional_call_cost($billableSeconds, $storedRate);
+}
+
+function call_billable_seconds(array $call, int $fallbackDuration, bool $answered, mixed $providerBillable = null): int
+{
+    if ($providerBillable !== null && $providerBillable !== '' && is_numeric($providerBillable)) {
+        return max(0, (int)$providerBillable);
+    }
+    if (!$answered) {
+        return 0;
+    }
+    if (!empty($call['answered_at'])) {
+        $answeredAt = strtotime((string)$call['answered_at']);
+        $endedAt = !empty($call['ended_at']) ? strtotime((string)$call['ended_at']) : time();
+        if ($answeredAt !== false && $endedAt !== false && $endedAt >= $answeredAt) {
+            return $endedAt - $answeredAt;
+        }
+    }
+    return max(0, $fallbackDuration);
+}
+
+function call_cost_sql(string $alias = 'co'): string
+{
+    return "COALESCE({$alias}.estimated_cost_micros, CAST(ROUND({$alias}.estimated_cost * 1000000) AS INTEGER), 0)";
+}
+
+function telephony_credit_state(int $companyId): array
+{
+    $subscription = one('SELECT * FROM subscriptions WHERE company_id = ?', [$companyId]) ?: [];
+    $configured = !empty($subscription['telephony_period_id'])
+        && $subscription['telephony_credit_initial_micros'] !== null
+        && $subscription['telephony_rate_micros'] !== null;
+    return [
+        'configured' => $configured,
+        'subscription' => $subscription,
+        'period_id' => (int)($subscription['telephony_period_id'] ?? 0),
+        'initial_micros' => max(0, (int)($subscription['telephony_credit_initial_micros'] ?? 0)),
+        'rate_micros' => max(0, (int)($subscription['telephony_rate_micros'] ?? 0)),
+        'balance_micros' => (int)($subscription['telephony_balance_micros'] ?? 0),
+    ];
+}
+
+function telephony_call_allowed(int $companyId): array
+{
+    $state = telephony_credit_state($companyId);
+    if (!$state['configured']) {
+        return ['ok' => false, 'message' => 'Credito de telefonia nao configurado para o periodo atual.'];
+    }
+    if ($state['rate_micros'] <= 0) {
+        return ['ok' => false, 'message' => 'Tarifa de telefonia nao configurada para o periodo atual.'];
+    }
+    if (!billing_telephony_call_allowed(true, $state['balance_micros'], $state['rate_micros'])) {
+        return ['ok' => false, 'message' => 'Credito de telefonia insuficiente para iniciar uma chamada.'];
+    }
+    return ['ok' => true, 'state' => $state];
+}
+
+function telephony_record_call_debit(array $call, array $billing, ?int $responsibleUserId = null): void
+{
+    $costMicros = max(0, (int)($billing['cost_micros'] ?? 0));
+    if ($costMicros <= 0) {
+        return;
+    }
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $existing = one('SELECT id FROM telephony_ledger WHERE call_id = ?', [(int)$call['id']]);
+        if ($existing) {
+            $pdo->exec('COMMIT');
+            return;
+        }
+        $subscription = one('SELECT * FROM subscriptions WHERE company_id = ?', [(int)$call['company_id']]);
+        $periodId = (int)($call['telephony_period_id'] ?? 0) ?: (int)($subscription['telephony_period_id'] ?? 0);
+        $period = $periodId ? one('SELECT * FROM subscription_periods WHERE id=? AND company_id=?', [$periodId, (int)$call['company_id']]) : null;
+        if (!$subscription || !$period || $period['telephony_balance_micros'] === null) {
+            $pdo->exec('COMMIT');
+            return;
+        }
+        $before = (int)$period['telephony_balance_micros'];
+        $after = billing_telephony_balance_after($before, $costMicros);
+        $idempotency = 'call-debit:' . (int)$call['id'];
+        $pdo->prepare('INSERT INTO telephony_ledger (company_id,subscription_id,subscription_period_id,call_id,entry_type,amount_micros,balance_before_micros,balance_after_micros,idempotency_key,reference_type,reference_id,responsible_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+            ->execute([(int)$call['company_id'], (int)$subscription['id'], $periodId, (int)$call['id'], 'CALL_DEBIT', -$costMicros, $before, $after, $idempotency, 'call', (int)$call['id'], $responsibleUserId]);
+        $pdo->prepare('UPDATE subscription_periods SET telephony_balance_micros=? WHERE id=?')->execute([$after, $periodId]);
+        if ((int)($subscription['telephony_period_id'] ?? 0) === $periodId) {
+            $pdo->prepare('UPDATE subscriptions SET telephony_balance_micros=? WHERE id=?')->execute([$after, (int)$subscription['id']]);
+        }
+        $pdo->exec('COMMIT');
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+        if (str_contains($e->getMessage(), 'UNIQUE constraint failed')) {
+            return;
+        }
+        throw $e;
+    }
+}
+
+function telephony_manual_adjustment(int $companyId, int $responsibleUserId, int $amountMicros, string $entryType, string $notes): void
+{
+    if (!in_array($entryType, ['MANUAL_CREDIT', 'MANUAL_DEBIT', 'REFUND'], true) || $amountMicros <= 0) {
+        throw new RuntimeException('Ajuste de credito invalido.');
+    }
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $state = telephony_credit_state($companyId);
+        if (!$state['configured']) {
+            throw new RuntimeException('O tenant nao possui um periodo de telefonia configurado.');
+        }
+        $signedAmount = $entryType === 'MANUAL_DEBIT' ? -$amountMicros : $amountMicros;
+        $before = $state['balance_micros'];
+        $after = $before + $signedAmount;
+        if ($after < 0) {
+            throw new RuntimeException('O ajuste de debito nao pode deixar o saldo de telefonia negativo.');
+        }
+        $idempotency = 'manual:' . $companyId . ':' . bin2hex(random_bytes(12));
+        $pdo->prepare('INSERT INTO telephony_ledger (company_id,subscription_id,subscription_period_id,entry_type,amount_micros,balance_before_micros,balance_after_micros,idempotency_key,reference_type,notes,responsible_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+            ->execute([$companyId, (int)$state['subscription']['id'], $state['period_id'], $entryType, $signedAmount, $before, $after, $idempotency, 'manual_adjustment', $notes, $responsibleUserId]);
+        $pdo->prepare('UPDATE subscriptions SET telephony_balance_micros=? WHERE id=?')->execute([$after, (int)$state['subscription']['id']]);
+        $pdo->prepare('UPDATE subscription_periods SET telephony_balance_micros=? WHERE id=?')->execute([$after, $state['period_id']]);
+        $pdo->exec('COMMIT');
+        audit('ajustou_credito_telefonia', 'companies:' . $companyId, null, ['entry_type' => $entryType, 'amount_micros' => $amountMicros, 'notes' => $notes]);
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+        throw $e;
+    }
 }
 
 function nvoip_enabled(): bool
@@ -1408,6 +1705,18 @@ function tenant_billing_state(int $companyId, ?DateTimeImmutable $now = null): a
     return billing_status_at($subscription['renews_at'] ?? null, (string)($company['timezone'] ?? 'America/Sao_Paulo'), $now) + ['subscription' => $subscription];
 }
 
+function telephony_plan_snapshot(array $plan): array
+{
+    if (!array_key_exists('telephony_credit_micros', $plan) || $plan['telephony_credit_micros'] === null
+        || !array_key_exists('telephony_rate_micros', $plan) || $plan['telephony_rate_micros'] === null) {
+        throw new RuntimeException('Configure o credito e a tarifa de telefonia do plano antes de utiliza-lo.');
+    }
+    return [
+        'telephony_credit_initial_micros' => max(0, (int)$plan['telephony_credit_micros']),
+        'telephony_rate_micros' => max(0, (int)$plan['telephony_rate_micros']),
+    ];
+}
+
 function apply_approved_payment(int $paymentId, array $providerPayment): void
 {
     $pdo = db();
@@ -1428,22 +1737,42 @@ function apply_approved_payment(int $paymentId, array $providerPayment): void
         $approvedValue = (string)($providerPayment['date_approved'] ?? $payment['approved_at'] ?? 'now');
         $approvedAt = (new DateTimeImmutable($approvedValue ?: 'now', $timezone))->setTimezone($timezone);
         $period = one('SELECT * FROM subscription_periods WHERE payment_id = ?', [$paymentId]);
+        $createdPeriod = !$period;
+        $snapshot = json_decode((string)$payment['limits_snapshot_json'], true) ?: [];
+        $telephonySnapshot = [
+            'telephony_credit_initial_micros' => array_key_exists('telephony_credit_initial_micros', $snapshot)
+                ? (int)$snapshot['telephony_credit_initial_micros']
+                : (int)(telephony_plan_snapshot($plan)['telephony_credit_initial_micros'] ?? 0),
+            'telephony_rate_micros' => array_key_exists('telephony_rate_micros', $snapshot)
+                ? (int)$snapshot['telephony_rate_micros']
+                : (int)(telephony_plan_snapshot($plan)['telephony_rate_micros'] ?? 0),
+        ];
         if ($period) {
             $start = new DateTimeImmutable((string)$period['starts_at'], $timezone);
             $end = new DateTimeImmutable((string)$period['ends_at'], $timezone);
+            $telephonySnapshot['telephony_credit_initial_micros'] = (int)($period['telephony_credit_initial_micros'] ?? $telephonySnapshot['telephony_credit_initial_micros']);
+            $telephonySnapshot['telephony_rate_micros'] = (int)($period['telephony_rate_micros'] ?? $telephonySnapshot['telephony_rate_micros']);
         } else {
             $currentEnd = !empty($subscription['renews_at']) ? new DateTimeImmutable((string)$subscription['renews_at'], $timezone) : $approvedAt;
             $start = $currentEnd > $approvedAt ? $currentEnd : $approvedAt;
             $end = billing_period_end($start, (string)$payment['billing_period']);
-            $pdo->prepare('INSERT INTO subscription_periods (company_id, subscription_id, plan_id, payment_id, starts_at, ends_at, limits_snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                ->execute([$payment['company_id'], $subscription['id'], $payment['plan_id'], $paymentId, $start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $payment['limits_snapshot_json']]);
+            $pdo->prepare('INSERT INTO subscription_periods (company_id, subscription_id, plan_id, payment_id, starts_at, ends_at, limits_snapshot_json, telephony_credit_initial_micros, telephony_rate_micros, telephony_balance_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$payment['company_id'], $subscription['id'], $payment['plan_id'], $paymentId, $start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $payment['limits_snapshot_json'], $telephonySnapshot['telephony_credit_initial_micros'], $telephonySnapshot['telephony_rate_micros'], $telephonySnapshot['telephony_credit_initial_micros']]);
+            $period = one('SELECT * FROM subscription_periods WHERE payment_id = ?', [$paymentId]);
         }
-        $snapshot = json_decode((string)$payment['limits_snapshot_json'], true) ?: [];
-        $pdo->prepare("UPDATE subscriptions SET plan_id=?, plan_name=?, starts_at=?, renews_at=?, included_minutes=?, max_users=?, max_consultants=?, max_lists=?, max_contacts=?, commercial_price_per_minute=?, status='Ativa' WHERE id=?")
-            ->execute([$plan['id'], $plan['name'], $start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $snapshot['included_minutes'] ?? 0, $snapshot['max_users'] ?? 1, $snapshot['max_consultants'] ?? 1, $snapshot['max_lists'] ?? 10, $snapshot['max_contacts'] ?? 1000, $snapshot['commercial_price_per_minute'] ?? 0, $subscription['id']]);
+        $periodId = (int)($period['id'] ?? 0);
+        $periodBalance = (int)($period['telephony_balance_micros'] ?? $telephonySnapshot['telephony_credit_initial_micros']);
+        $pdo->prepare("UPDATE subscriptions SET plan_id=?, plan_name=?, starts_at=?, renews_at=?, included_minutes=?, max_users=?, max_consultants=?, max_lists=?, max_contacts=?, commercial_price_per_minute=?, telephony_period_id=?, telephony_credit_initial_micros=?, telephony_rate_micros=?, telephony_balance_micros=?, status='Ativa' WHERE id=?")
+            ->execute([$plan['id'], $plan['name'], $start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $snapshot['included_minutes'] ?? 0, $snapshot['max_users'] ?? 1, $snapshot['max_consultants'] ?? 1, $snapshot['max_lists'] ?? 10, $snapshot['max_contacts'] ?? 1000, $snapshot['commercial_price_per_minute'] ?? 0, $periodId, $telephonySnapshot['telephony_credit_initial_micros'], $telephonySnapshot['telephony_rate_micros'], $periodBalance, $subscription['id']]);
+        if (!$period || !$periodId) {
+            throw new RuntimeException('Nao foi possivel criar o periodo de telefonia.');
+        }
+        $grantKey = 'period-credit:' . $periodId;
+        $pdo->prepare('INSERT OR IGNORE INTO telephony_ledger (company_id,subscription_id,subscription_period_id,entry_type,amount_micros,balance_before_micros,balance_after_micros,idempotency_key,reference_type,reference_id,responsible_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+            ->execute([(int)$payment['company_id'], (int)$subscription['id'], $periodId, 'INITIAL_CREDIT', $telephonySnapshot['telephony_credit_initial_micros'], 0, $telephonySnapshot['telephony_credit_initial_micros'], $grantKey, 'subscription_period', $periodId, (int)$payment['user_id']]);
         $pdo->prepare("UPDATE payments SET status='APPROVED', approved_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
             ->execute([$approvedAt->format('Y-m-d H:i:s'), $paymentId]);
-        if (!$period) {
+        if ($createdPeriod) {
             $pdo->prepare("INSERT INTO payment_events (company_id,payment_id,event_name,payload_json) VALUES (?,?,'PAYMENT_APPROVED',?)")
                 ->execute([$payment['company_id'], $paymentId, json_encode(['renews_at' => $end->format(DATE_ATOM)])]);
         }
@@ -1471,12 +1800,15 @@ function create_tenant_payment(int $companyId, int $userId, string $method, arra
     $subscription = one('SELECT * FROM subscriptions WHERE company_id=?', [$companyId]);
     $plan = $subscription ? one('SELECT * FROM plans WHERE id=? AND status=?', [$subscription['plan_id'], 'Ativo']) : null;
     if (!$subscription || !$plan) throw new RuntimeException('Plano ativo do tenant nao encontrado.');
+    $telephonySnapshot = telephony_plan_snapshot($plan);
     $config = mercado_pago_config();
     $enabled = ['pix' => $config['pix_enabled'], 'card' => $config['card_enabled'], 'boleto' => $config['boleto_enabled']];
     if (!isset($enabled[$method]) || !$enabled[$method]) throw new RuntimeException('Metodo de pagamento indisponivel.');
     $amount = billing_authoritative_amount($plan);
     if ($amount <= 0) throw new RuntimeException('Plano sem valor configurado.');
     $snapshot = array_intersect_key($subscription, array_flip(['included_minutes','max_users','max_consultants','max_lists','max_contacts','commercial_price_per_minute']));
+    $snapshot['telephony_credit_initial_micros'] = $telephonySnapshot['telephony_credit_initial_micros'];
+    $snapshot['telephony_rate_micros'] = $telephonySnapshot['telephony_rate_micros'];
     $reference = 'LF-' . $companyId . '-' . bin2hex(random_bytes(8));
     $idempotency = bin2hex(random_bytes(16));
     db()->prepare("INSERT INTO payments (company_id,user_id,plan_id,amount,billing_period,limits_snapshot_json,internal_reference,idempotency_key,payment_method,status) VALUES (?,?,?,?,?,?,?,?,?,'CREATED')")
@@ -1511,30 +1843,29 @@ function create_tenant_payment(int $companyId, int $userId, string $method, arra
     }
 }
 
-function datetime_utc_display(?string $value, string $format = 'Y-m-d H:i:s'): string
+function datetime_utc_display(?string $value, string $format = 'd/m/Y H:i:s'): string
 {
-    if (!$value) {
+    $value = trim((string)$value);
+    if ($value === '') {
         return '';
     }
     try {
-        return (new DateTimeImmutable($value, new DateTimeZone('UTC')))
-            ->setTimezone(new DateTimeZone('America/Sao_Paulo'))
+        $saoPaulo = new DateTimeZone('America/Sao_Paulo');
+        // Datas sem horario sao datas de calendario do sistema, nao instantes UTC.
+        $date = preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)
+            ? new DateTimeImmutable($value, $saoPaulo)
+            : new DateTimeImmutable($value, new DateTimeZone('UTC'));
+        return $date->setTimezone($saoPaulo)
             ->format($format);
     } catch (Throwable) {
-        return (string)$value;
+        return $value;
     }
 }
 
 function date_br_display(?string $value): string
 {
     if (!$value) return '-';
-    try {
-        return (new DateTimeImmutable($value))
-            ->setTimezone(new DateTimeZone('America/Sao_Paulo'))
-            ->format('d/m/Y');
-    } catch (Throwable) {
-        return (string)$value;
-    }
+    return datetime_utc_display($value);
 }
 
 function nvoip_error_hint(int $status, string $body): string
@@ -2170,11 +2501,11 @@ function handle_post(): void
         redirect('?page=settings&provider=' . rawurlencode($provider));
     }
 
-    if ($action === 'save_sip_diagnostic_config' && can('sip_diagnostic')) {
+    if ($action === 'save_sip_diagnostic_config' && can('settings')) {
         $sipPassword = trim((string)post('sip_password'));
         if ($sipPassword === '') {
             flash('Informe a senha SIP para salvar.', 'error');
-            redirect('?page=sip_diagnostic');
+            redirect('?page=settings&sip=1#diagnostico-sip');
         }
         $existing = one("SELECT * FROM integration_settings WHERE company_id = ? AND provider = 'nvoip'", [$companyId]);
         $sipWssUrl = trim((string)post('sip_wss_url', 'wss://app.nvoip.com.br:7443')) ?: 'wss://app.nvoip.com.br:7443';
@@ -2208,7 +2539,7 @@ function handle_post(): void
         }
         audit('salvou_config_sip_diagnostico', 'integration_settings:nvoip', null, ['has_sip_user' => $userSip !== '', 'has_sip_password' => true]);
         flash('Senha e configuracao SIP salvas.');
-        redirect('?page=sip_diagnostic');
+        redirect('?page=settings&sip=1#diagnostico-sip');
     }
 
     if ($action === 'agent_status' && can('agent')) {
@@ -2255,9 +2586,7 @@ function handle_post(): void
         if (post('callback_at')) {
             $call = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)post('call_id'), $companyId]);
             if ($call) {
-                $pdo->prepare("INSERT INTO callbacks (company_id, campaign_id, contact_id, agent_id, scheduled_at, priority, reason, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-                    ->execute([$companyId, $call['campaign_id'], $call['contact_id'], $user['id'], post('callback_at'), post('callback_priority', 'normal'), 'Agendamento do consultor', post('notes')]);
+                save_callback_for_call($call, (int)$user['id'], (string)post('callback_at'), (string)post('callback_priority', 'normal'), 'Agendamento do consultor', (string)post('notes'));
             }
         }
         $startedNext = false;
@@ -2284,9 +2613,7 @@ function handle_post(): void
         if (post('callback_at')) {
             $call = one('SELECT * FROM calls WHERE id = ? AND company_id = ? AND agent_id = ?', [(int)post('call_id'), $companyId, (int)$user['id']]);
             if ($call) {
-                $pdo->prepare("INSERT INTO callbacks (company_id, campaign_id, contact_id, agent_id, scheduled_at, priority, reason, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-                    ->execute([$companyId, $call['campaign_id'], $call['contact_id'], $user['id'], post('callback_at'), post('callback_priority', 'normal'), 'Agendamento do historico atendido', post('notes')]);
+                save_callback_for_call($call, (int)$user['id'], (string)post('callback_at'), (string)post('callback_priority', 'normal'), 'Agendamento do historico atendido', (string)post('notes'));
             }
         }
         redirect('?page=agent&campaign_id=' . (int)post('campaign_id'));
@@ -2308,6 +2635,57 @@ function handle_post(): void
         audit('incluiu_bloqueio', 'blocklist:' . $phone, null, $_POST);
         flash('Numero incluido na lista de bloqueio.');
         redirect('?page=blocklist');
+    }
+
+    if ($action === 'update_callback' && can('agent')) {
+        $callbackId = (int)post('callback_id');
+        $callback = is_platform_admin()
+            ? one('SELECT * FROM callbacks WHERE id = ?', [$callbackId])
+            : one('SELECT * FROM callbacks WHERE id = ? AND company_id = ?', [$callbackId, $companyId]);
+        if (!$callback || (!is_platform_admin() && (int)$callback['agent_id'] !== (int)$user['id'] && !can('supervisor'))) {
+            flash('Retorno nao encontrado ou sem permissao para alterar.', 'error');
+            redirect('?page=dashboard');
+        }
+        $callbackStatusValue = strtolower(trim((string)post('callback_status', 'pendente')));
+        $selectedResult = null;
+        if (str_starts_with($callbackStatusValue, 'resultado:')) {
+            $resultId = (int)substr($callbackStatusValue, strlen('resultado:'));
+            $selectedResult = one('SELECT * FROM call_results WHERE id = ? AND (company_id = ? OR company_id IS NULL)', [$resultId, (int)$callback['company_id']]);
+            if (!$selectedResult) {
+                flash('Status de atendimento invalido.', 'error');
+                redirect('?page=dashboard');
+            }
+            $callbackStatus = $selectedResult['action'] === 'agendar_retorno' ? 'pendente' : 'atendido';
+        } else {
+            $callbackStatus = $callbackStatusValue === 'atendido' ? 'atendido' : 'pendente';
+        }
+        $scheduledAt = callback_datetime_storage((string)post('callback_at'));
+        if ($callbackStatus === 'pendente' && $scheduledAt === '') {
+            flash('Informe a nova data e hora para continuar o agendamento.', 'error');
+            redirect('?page=dashboard');
+        }
+        $priority = strtolower(trim((string)post('callback_priority', 'normal')));
+        if (!in_array($priority, ['normal', 'alta', 'urgente'], true)) {
+            $priority = 'normal';
+        }
+        if ($selectedResult) {
+            $linkedCallId = (int)($callback['call_id'] ?? 0);
+            if ($linkedCallId <= 0) {
+                $linkedCallId = (int)(one('SELECT id FROM calls WHERE company_id = ? AND agent_id = ? AND contact_id = ? ORDER BY id DESC LIMIT 1', [(int)$callback['company_id'], (int)$callback['agent_id'], (int)$callback['contact_id']])['id'] ?? 0);
+            }
+            if ($linkedCallId > 0) {
+                $linkedCall = one('SELECT notes FROM calls WHERE id = ?', [$linkedCallId]);
+                update_answered_call($linkedCallId, (int)$selectedResult['id'], (string)($linkedCall['notes'] ?? ''), (int)$callback['company_id'], (int)$callback['agent_id']);
+                if (empty($callback['call_id'])) {
+                    db()->prepare('UPDATE callbacks SET call_id = ? WHERE id = ?')->execute([$linkedCallId, $callbackId]);
+                }
+            }
+        }
+        db()->prepare("UPDATE callbacks SET scheduled_at = ?, priority = ?, notes = ?, status = ?, completed_at = CASE WHEN ? = 'atendido' THEN datetime('now') ELSE NULL END WHERE id = ?")
+            ->execute([$scheduledAt !== '' ? $scheduledAt : $callback['scheduled_at'], $priority, (string)post('callback_notes'), $callbackStatus, $callbackStatus, $callbackId]);
+        audit('atualizou_retorno', 'callbacks:' . $callbackId, $callback, ['status' => $callbackStatus, 'scheduled_at' => $scheduledAt, 'priority' => $priority]);
+        flash($callbackStatus === 'atendido' ? 'Retorno marcado como atendido.' : 'Retorno reagendado com sucesso.');
+        redirect('?page=dashboard');
     }
 
     if ($action === 'delete_blocklist' && can('blocklist')) {
@@ -2372,8 +2750,8 @@ function download_csv_template(): never
     header('Content-Disposition: attachment; filename="modelo-contatos-ligflow.csv"');
     $out = fopen('php://output', 'wb');
     fwrite($out, "\xEF\xBB\xBF");
-    fputcsv($out, ['nome', 'telefone', 'email', 'empresa', 'documento', 'cidade', 'estado', 'produto', 'origem', 'observacao', 'codigo_externo']);
-    fputcsv($out, ['Maria Souza', '41996310725', 'maria@email.com', 'Ademicon', '12345678900', 'Curitiba', 'PR', 'Consorcio imovel', 'Instagram', 'Interessada em carta de 300 mil', 'lead-001']);
+    fputcsv($out, ['nome', 'telefone', 'email', 'empresa', 'documento', 'cidade', 'estado', 'produto', 'origem', 'observacao', 'codigo_externo'], ';');
+    fputcsv($out, ['Maria Souza', '41996310725', 'maria@email.com', 'Ademicon', '12345678900', 'Curitiba', 'PR', 'Consorcio imovel', 'Instagram', 'Interessada em carta de 300 mil', 'lead-001'], ';');
     fclose($out);
     exit;
 }
@@ -2474,8 +2852,8 @@ function prepare_csv_import(int $listId, int $companyId): string
         'list_id' => $listId,
         'company_id' => $companyId,
         'delimiter' => $delimiter,
-        'headers' => array_map(fn($v) => trim((string)$v), $headers),
-        'sample' => $sample,
+        'headers' => array_map(fn($v) => trim(utf8_text($v)), $headers),
+        'sample' => array_map(fn($row) => array_map('utf8_text', $row), $sample),
         'created_at' => time(),
     ];
 
@@ -2537,8 +2915,8 @@ function prepare_new_list_csv_import(int $companyId, int $userId): string
             'tags' => trim((string)post('tags')),
         ],
         'delimiter' => $delimiter,
-        'headers' => array_map(fn($v) => trim((string)$v), $headers),
-        'sample' => $sample,
+        'headers' => array_map(fn($v) => trim(utf8_text($v)), $headers),
+        'sample' => array_map(fn($row) => array_map('utf8_text', $row), $sample),
         'created_at' => time(),
     ];
 
@@ -2600,7 +2978,7 @@ function confirm_csv_import(string $token, int $listId, int $companyId, int $use
         $custom = [];
         foreach ($headers as $i => $header) {
             $target = (string)($mapping[$i] ?? 'ignore');
-            $value = trim((string)($row[$i] ?? ''));
+            $value = trim(utf8_text($row[$i] ?? ''));
             if ($value === '' || $target === 'ignore') {
                 continue;
             }
@@ -2648,7 +3026,7 @@ function confirm_csv_import(string $token, int $listId, int $companyId, int $use
                 $data['document'] ?? '',
                 $data['external_code'] ?? '',
                 $data['notes'] ?? '',
-                json_encode($custom, JSON_UNESCAPED_UNICODE),
+                json_encode_safe($custom),
             ]);
         $stats['imported']++;
     }
@@ -2825,6 +3203,8 @@ function create_client_account(int $fallbackCompanyId, int $adminUserId): void
 
 function plan_payload(): array
 {
+    $creditMicros = billing_input_to_micros((string)post('telephony_credit_amount'));
+    $rateMicros = billing_input_to_micros((string)post('telephony_rate_per_minute'));
     return [
         'name' => trim((string)post('name')),
         'description' => trim((string)post('description')),
@@ -2833,7 +3213,9 @@ function plan_payload(): array
         'max_consultants' => max(1, (int)post('max_consultants', '1')),
         'max_lists' => max(1, (int)post('max_lists', '10')),
         'max_contacts' => max(1, (int)post('max_contacts', '1000')),
-        'commercial_price_per_minute' => (float)str_replace(',', '.', (string)post('commercial_price_per_minute', '0')),
+        'commercial_price_per_minute' => $rateMicros === null ? null : billing_micros_to_decimal($rateMicros),
+        'telephony_credit_micros' => $creditMicros,
+        'telephony_rate_micros' => $rateMicros,
         'monthly_price' => (float)str_replace(',', '.', (string)post('monthly_price', '0')),
         'setup_fee' => (float)str_replace(',', '.', (string)post('setup_fee', '0')),
         'billing_period' => (string)post('billing_period', 'Mensal'),
@@ -2849,13 +3231,17 @@ function save_plan(): void
         flash('Informe o nome do plano.', 'error');
         return;
     }
+    if ($data['telephony_credit_micros'] === null || $data['telephony_rate_micros'] === null) {
+        flash('Informe credito e tarifa de telefonia com valores nao negativos.', 'error');
+        return;
+    }
     if (one('SELECT id FROM plans WHERE name = ?', [$data['name']])) {
         flash('Ja existe um plano com este nome.', 'error');
         return;
     }
-    db()->prepare("INSERT INTO plans (name, description, included_minutes, max_users, max_consultants, max_lists, max_contacts, commercial_price_per_minute, monthly_price, setup_fee, billing_period, payment_type, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        ->execute([$data['name'], $data['description'], $data['included_minutes'], $data['max_users'], $data['max_consultants'], $data['max_lists'], $data['max_contacts'], $data['commercial_price_per_minute'], $data['monthly_price'], $data['setup_fee'], $data['billing_period'], $data['payment_type'], $data['status']]);
+    db()->prepare("INSERT INTO plans (name, description, included_minutes, max_users, max_consultants, max_lists, max_contacts, commercial_price_per_minute, telephony_credit_micros, telephony_rate_micros, monthly_price, setup_fee, billing_period, payment_type, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        ->execute([$data['name'], $data['description'], $data['included_minutes'], $data['max_users'], $data['max_consultants'], $data['max_lists'], $data['max_contacts'], $data['commercial_price_per_minute'], $data['telephony_credit_micros'], $data['telephony_rate_micros'], $data['monthly_price'], $data['setup_fee'], $data['billing_period'], $data['payment_type'], $data['status']]);
     audit('criou_plano', 'plans:' . db()->lastInsertId(), null, $data);
     flash('Plano criado.');
 }
@@ -2872,12 +3258,16 @@ function update_plan_record(int $planId): void
         flash('Informe o nome do plano.', 'error');
         return;
     }
+    if ($data['telephony_credit_micros'] === null || $data['telephony_rate_micros'] === null) {
+        flash('Informe credito e tarifa de telefonia com valores nao negativos.', 'error');
+        return;
+    }
     if (one('SELECT id FROM plans WHERE name = ? AND id <> ?', [$data['name'], $planId])) {
         flash('Ja existe outro plano com este nome.', 'error');
         return;
     }
-    db()->prepare("UPDATE plans SET name = ?, description = ?, included_minutes = ?, max_users = ?, max_consultants = ?, max_lists = ?, max_contacts = ?, commercial_price_per_minute = ?, monthly_price = ?, setup_fee = ?, billing_period = ?, payment_type = ?, status = ? WHERE id = ?")
-        ->execute([$data['name'], $data['description'], $data['included_minutes'], $data['max_users'], $data['max_consultants'], $data['max_lists'], $data['max_contacts'], $data['commercial_price_per_minute'], $data['monthly_price'], $data['setup_fee'], $data['billing_period'], $data['payment_type'], $data['status'], $planId]);
+    db()->prepare("UPDATE plans SET name = ?, description = ?, included_minutes = ?, max_users = ?, max_consultants = ?, max_lists = ?, max_contacts = ?, commercial_price_per_minute = ?, telephony_credit_micros = ?, telephony_rate_micros = ?, monthly_price = ?, setup_fee = ?, billing_period = ?, payment_type = ?, status = ? WHERE id = ?")
+        ->execute([$data['name'], $data['description'], $data['included_minutes'], $data['max_users'], $data['max_consultants'], $data['max_lists'], $data['max_contacts'], $data['commercial_price_per_minute'], $data['telephony_credit_micros'], $data['telephony_rate_micros'], $data['monthly_price'], $data['setup_fee'], $data['billing_period'], $data['payment_type'], $data['status'], $planId]);
     audit('editou_plano', 'plans:' . $planId, $plan, $data);
     flash('Plano atualizado.');
 }
@@ -3381,7 +3771,7 @@ function classify_reprocess_lead_status(array $contact, array $payload = []): st
     $resultAction = strtolower(trim((string)($contact['result_action'] ?? '')));
     $callStatus = strtolower(trim((string)($contact['call_status'] ?? '')));
     $contactStatus = strtolower(trim((string)($contact['status'] ?? '')));
-    $cause = strtolower(trim((string)($payload['cause'] ?? $payload['reason'] ?? $payload['message'] ?? '')));
+    $cause = strtolower(trim((string)($payload['cause'] ?? $payload['reason'] ?? $payload['message'] ?? $contact['provider_status_raw'] ?? '')));
 
     if ($callStatus === '' && $resultName === '' && $resultAction === '' && in_array($contactStatus, ['novo', 'retentar'], true)) {
         return 'novo';
@@ -3393,7 +3783,7 @@ function classify_reprocess_lead_status(array $contact, array $payload = []): st
     if ($resultName !== '' && str_contains($resultName, 'caixa postal')) {
         return 'caixa_postal';
     }
-    if ($resultName === 'ocupado' || $callStatus === 'busy') {
+    if ($resultName === 'ocupado' || $callStatus === 'busy' || preg_match('/\b486\b|busy(?:\s*here)?|ocupad[oa]/i', $cause) === 1) {
         return 'ocupada';
     }
     if (preg_match('/\b(?:404|484)\b|not\s*found|address\s*incomplete|unallocated|not\s*assigned|numero\s*inexistente|nao\s*existe/i', $cause) === 1) {
@@ -3402,10 +3792,13 @@ function classify_reprocess_lead_status(array $contact, array $payload = []): st
     if (in_array($resultName, ['numero incorreto', 'numero invalido'], true) || ($resultAction === 'bloquear' && str_contains($resultName, 'numero'))) {
         return 'numero_invalido';
     }
-    if ($resultName !== '' && (str_contains($resultName, 'nao receber') || str_contains($resultName, 'recus'))) {
+    if (($resultName !== '' && (str_contains($resultName, 'nao receber') || str_contains($resultName, 'recus')))
+        || preg_match('/\b(?:403|603)\b|declin|reject|refus|recusad[oa]/i', $cause) === 1) {
         return 'recusada';
     }
-    if (in_array($callStatus, ['no_answer', 'missed'], true) || $resultName === 'nao atendeu') {
+    if (in_array($callStatus, ['no_answer', 'missed'], true)
+        || $resultName === 'nao atendeu'
+        || preg_match('/\b(?:408|480)\b|no[\s_-]*answer|ringing[\s_-]*not[\s_-]*confirmed|temporarily\s*unavailable|timeout|timed\s*out|nao\s*atendeu/i', $cause) === 1) {
         return 'nao_atendida';
     }
     if (in_array($callStatus, ['failed', 'cancelled'], true)) {
@@ -3416,6 +3809,51 @@ function classify_reprocess_lead_status(array $contact, array $payload = []): st
     }
 
     return 'nao_atendida';
+}
+
+function hydrate_reprocess_lead_statuses(array $contacts): array
+{
+    $payloadByCallId = [];
+    $callIds = array_values(array_unique(array_filter(array_map(static fn($contact) => (int)($contact['last_call_id'] ?? 0), $contacts))));
+    foreach (array_chunk($callIds, 300) as $callIdChunk) {
+        $placeholders = implode(',', array_fill(0, count($callIdChunk), '?'));
+        foreach (rows("SELECT call_id, payload FROM call_events WHERE call_id IN ($placeholders) AND event_name IN ('nvoip.webhook', 'sip.ended', 'sip.failed') ORDER BY id DESC", $callIdChunk) as $event) {
+            $callId = (int)($event['call_id'] ?? 0);
+            if ($callId > 0 && !isset($payloadByCallId[$callId])) {
+                $decoded = json_decode((string)($event['payload'] ?? ''), true);
+                $payloadByCallId[$callId] = is_array($decoded) ? $decoded : [];
+            }
+        }
+    }
+    foreach ($contacts as &$contact) {
+        $contact['reprocess_bucket'] = classify_reprocess_lead_status($contact, $payloadByCallId[(int)($contact['last_call_id'] ?? 0)] ?? []);
+    }
+    unset($contact);
+    return $contacts;
+}
+
+function list_reprocess_status_counts(int $listId, int $companyId): array
+{
+    $contacts = rows("
+        SELECT c.id, c.status,
+               lc.id AS last_call_id, lc.status AS call_status, lc.provider_status_raw,
+               COALESCE(cr.name, '') AS result_name, COALESCE(cr.action, '') AS result_action
+        FROM contacts c
+        LEFT JOIN calls lc ON lc.id = (
+            SELECT id FROM calls WHERE company_id = c.company_id AND contact_id = c.id ORDER BY id DESC LIMIT 1
+        )
+        LEFT JOIN call_results cr ON cr.id = lc.result_id
+        WHERE c.list_id = ? AND c.company_id = ? AND c.status <> 'excluido'
+    ", [$listId, $companyId]);
+    $counts = array_fill_keys(array_keys(lead_reprocess_status_labels()), 0);
+    $counts['all'] = count($contacts);
+    foreach (hydrate_reprocess_lead_statuses($contacts) as $contact) {
+        $bucket = (string)($contact['reprocess_bucket'] ?? '');
+        if (array_key_exists($bucket, $counts)) {
+            $counts[$bucket]++;
+        }
+    }
+    return $counts;
 }
 
 function create_remessa_from_selected_contacts(int $sourceListId, array $selectedIds, int $companyId, int $userId, array $statusFilters, string $remessaName = ''): int
@@ -3443,7 +3881,7 @@ function create_remessa_from_selected_contacts(int $sourceListId, array $selecte
     $contacts = rows("
         SELECT c.id, c.list_id, c.company_id, c.name, c.phone_raw, c.phone_e164, c.email, c.organization, c.city, c.state,
                c.product, c.origin, c.document, c.external_code, c.notes, c.custom_json, c.status, c.attempts, c.last_call_at,
-               lc.id AS last_call_id, lc.status AS call_status, lc.answered_at, lc.ended_at,
+               lc.id AS last_call_id, lc.status AS call_status, lc.provider_status_raw, lc.answered_at, lc.ended_at,
                COALESCE(cr.name, '') AS result_name, COALESCE(cr.action, '') AS result_action
         FROM contacts c
         LEFT JOIN calls lc ON lc.id = (
@@ -3578,7 +4016,7 @@ function create_remessa_from_selected_contacts(int $sourceListId, array $selecte
                 (string)($contact['document'] ?? ''),
                 (string)($contact['external_code'] ?? ''),
                 (string)($contact['notes'] ?? ''),
-                json_encode($custom, JSON_UNESCAPED_UNICODE),
+                json_encode_safe($custom),
             ]);
         }
 
@@ -3676,7 +4114,7 @@ function normalize_call_attempt_status(string $status, array $context = []): str
     return $status !== '' ? 'falha' : 'falha';
 }
 
-function campaign_call_logs_page(int $campaignId, array $filters = [], int $page = 1, int $perPage = 20): array
+function campaign_call_logs_page(int $campaignId, array $filters = [], int $page = 1, int $perPage = 10): array
 {
     $user = current_user();
     if (!$user || !can('reports')) {
@@ -3771,19 +4209,19 @@ function call_modal_payload(int $callId, int $companyId, int $agentId): ?array
         'campaign_id' => (int)$call['campaign_id'],
         'contact_id' => (int)$call['contact_id'],
         'external_call_id' => (string)($call['external_call_id'] ?: ''),
-        'destination_number' => (string)($call['destination_number'] ?: $call['phone_e164']),
-        'status' => (string)$call['status'],
+        'destination_number' => utf8_text($call['destination_number'] ?: $call['phone_e164']),
+        'status' => utf8_text($call['status']),
         'started_at' => (string)($call['started_at'] ?: ''),
         'answered_at' => (string)($call['answered_at'] ?: ''),
-        'name' => (string)($call['name'] ?: 'Ligacao manual'),
-        'phone' => (string)($call['phone_e164'] ?: $call['destination_number']),
-        'email' => (string)($call['email'] ?: ''),
-        'origin' => (string)($call['organization'] ?: $call['origin'] ?: ''),
-        'city_state' => trim((string)$call['city'] . ' / ' . (string)$call['state'], ' /'),
-        'product' => (string)($call['product'] ?: ''),
+        'name' => utf8_text($call['name'] ?: 'Ligacao manual'),
+        'phone' => utf8_text($call['phone_e164'] ?: $call['destination_number']),
+        'email' => utf8_text($call['email'] ?: ''),
+        'origin' => utf8_text($call['organization'] ?: $call['origin'] ?: ''),
+        'city_state' => trim(utf8_text($call['city']) . ' / ' . utf8_text($call['state']), ' /'),
+        'product' => utf8_text($call['product'] ?: ''),
         'attempts' => (int)($call['attempts'] ?? 0),
-        'campaign_name' => (string)($call['campaign_name'] ?: ''),
-        'dialer_type' => (string)($call['dialer_type'] ?: ''),
+        'campaign_name' => utf8_text($call['campaign_name'] ?: ''),
+        'dialer_type' => utf8_text($call['dialer_type'] ?: ''),
     ];
 }
 
@@ -3886,6 +4324,13 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
         flash('Chamada nao iniciada: este numero esta na lista de bloqueio.', 'error');
         return false;
     }
+    $telephony = telephony_call_allowed($companyId);
+    if (!$telephony['ok']) {
+        db()->prepare("UPDATE contacts SET status = 'novo', reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ?")
+            ->execute([$contactId]);
+        flash((string)$telephony['message'], 'error');
+        return false;
+    }
 
     $providerCall = make_provider_call($campaign, $contact, $agent ?: []);
     if (!$providerCall['ok']) {
@@ -3902,9 +4347,10 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
     $originNumber = (string)($providerCall['payload']['request']['bina'] ?? $providerCall['payload']['bina'] ?? $campaign['caller_id'] ?? '');
     $attemptNumber = max(1, (int)($contact['attempts'] ?? 0) + 1);
     $internalStatus = normalize_call_attempt_status((string)$providerCall['status'], ['event' => 'start']);
-    db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, started_at, ringing_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)")
-        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $providerCall['status'], (string)$providerCall['status'], $internalStatus, $attemptNumber, $answeredAt]);
+    $billingRateMicros = call_plan_rate_micros($companyId);
+    db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, started_at, ringing_at, answered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)")
+        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $providerCall['status'], (string)$providerCall['status'], $internalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], $answeredAt]);
     $callId = (int)db()->lastInsertId();
     db()->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contactId]);
     $nextAgentStatus = (($agent['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
@@ -4000,14 +4446,40 @@ function finish_call(int $callId, int $resultId, string $notes, int $companyId):
         return;
     }
 
-    $duration = random_int(35, 420);
-    $billable = (int)ceil($duration / 60) * 60;
-    $cost = round(($billable / 60) * price_per_minute(), 2);
+    $duration = max(0, (int)($call['duration_seconds'] ?? 0));
+    if (!empty($call['started_at'])) {
+        $startedAt = strtotime((string)$call['started_at']);
+        if ($startedAt !== false) {
+            $duration = max($duration, time() - $startedAt);
+        }
+    }
+
+    if ($action === 'adjust_telephony_credit') {
+        if (!is_platform_admin($user)) {
+            http_response_code(403);
+            exit('Acesso negado.');
+        }
+        $amount = billing_input_to_micros((string)post('amount'));
+        try {
+            if ($amount === null || $amount <= 0) {
+                throw new RuntimeException('Informe um valor de ajuste maior que zero.');
+            }
+            telephony_manual_adjustment((int)post('company_id'), (int)$user['id'], $amount, (string)post('entry_type'), trim((string)post('notes')));
+            flash('Ajuste de credito de telefonia registrado.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel registrar o ajuste: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=costs');
+    }
+    $providerBillable = (int)($call['billable_seconds'] ?? 0) > 0 ? (int)$call['billable_seconds'] : null;
+    $billable = call_billable_seconds($call, $duration, true, $providerBillable);
+    $billing = call_billing_values($call, $billable);
     $recording = $call['recording_url'] ?: (str_contains(strtolower((string)$call['provider']), 'demo') ? demo_recording_url($callId) : null);
-    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = 'atendida', ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, result_id = ?, notes = ?, recording_url = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
-        ->execute([$duration, $billable, $resultId, $notes, $recording, $cost, $callId]);
+    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = 'atendida', ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, result_id = ?, notes = ?, recording_url = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+        ->execute([$duration, $billable, $resultId, $notes, $recording, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
+    telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.completed', 'in_progress', 'completed', ?)")
-        ->execute([$companyId, $callId, json_encode(['duration_seconds' => $duration, 'estimated_cost' => $cost])]);
+        ->execute([$companyId, $callId, json_encode(['duration_seconds' => $duration, 'billable_seconds' => $billable, 'estimated_cost' => $billing['cost_decimal']])]);
 
     $contactStatus = 'concluido';
     if ($result['action'] === 'retornar_fila') {
@@ -4068,16 +4540,25 @@ function quick_hangup(int $callId, int $companyId): void
         flash('Nenhuma chamada ativa para encerrar.', 'error');
         return;
     }
-    $duration = max(1, random_int(20, 180));
-    $billable = (int)ceil($duration / 60) * 60;
-    $cost = round(($billable / 60) * price_per_minute(), 2);
-    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL OR duration_seconds > 5 THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
-        ->execute([$duration, $billable, $cost, $callId]);
+    $duration = max(0, (int)($call['duration_seconds'] ?? 0));
+    if (!empty($call['started_at'])) {
+        $startedAt = strtotime((string)$call['started_at']);
+        if ($startedAt !== false) {
+            $duration = max($duration, time() - $startedAt);
+        }
+    }
+    $wasAnswered = !empty($call['answered_at']) || (int)($call['duration_seconds'] ?? 0) > 5;
+    $providerBillable = (int)($call['billable_seconds'] ?? 0) > 0 ? (int)$call['billable_seconds'] : null;
+    $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
+    $billing = call_billing_values($call, $billable);
+    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL OR duration_seconds > 5 THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+        ->execute([$duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
+    telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
     db()->prepare("UPDATE contacts SET status = 'concluido', reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ?")
         ->execute([$call['contact_id']]);
     db()->prepare("UPDATE users SET status = 'Pos-atendimento' WHERE id = ?")->execute([$call['agent_id']]);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.quick_hangup', ?, 'completed', ?)")
-        ->execute([$companyId, $callId, $call['status'], json_encode(['duration_seconds' => $duration, 'estimated_cost' => $cost])]);
+        ->execute([$companyId, $callId, $call['status'], json_encode(['duration_seconds' => $duration, 'billable_seconds' => $billable, 'estimated_cost' => $billing['cost_decimal']])]);
     audit('encerrou_ligacao_webfone', 'calls:' . $callId);
     flash('Chamada encerrada pelo webfone.');
 }
@@ -4108,10 +4589,6 @@ function handle_nvoip_webhook(): never
     $rawStatus = (string)(first_payload_value($payload, ['status', 'call_status', 'state']) ?? $call['status']);
     $status = normalize_call_status($rawStatus);
     $duration = (int)($payload['duration_seconds'] ?? $payload['duration'] ?? $call['duration_seconds']);
-    $billable = (int)($payload['billable_seconds'] ?? (int)ceil(max($duration, 0) / 60) * 60);
-    $cost = isset($payload['cost']) || isset($payload['value'])
-        ? (float)($payload['cost'] ?? $payload['value'])
-        : round(($billable / 60) * price_per_minute(), 2);
     $recording = $recording ?: (string)($call['recording_url'] ?? '');
 
     $finalStatuses = ['completed', 'failed', 'cancelled', 'busy', 'no_answer', 'missed'];
@@ -4125,8 +4602,15 @@ function handle_nvoip_webhook(): never
         'reason' => (string)($payload['reason'] ?? ''),
         'stopped_by_user' => !empty($payload['stopped_by_user']),
     ]);
-    db()->prepare("UPDATE calls SET status = ?, provider_call_id = COALESCE(NULLIF(provider_call_id, ''), NULLIF(external_call_id, '')), provider_status_raw = ?, internal_status = ?, duration_seconds = ?, billable_seconds = ?, estimated_cost = ?, recording_url = NULLIF(?, ''), answered_at = {$answeredAtSql}, ended_at = {$endedAtSql}, updated_at = datetime('now') WHERE id = ?")
-        ->execute([$status, $rawStatus, $internalStatus, $duration, $billable, $cost, $recording, $call['id']]);
+    $providerBillable = first_payload_value($payload, ['billsec', 'billable_seconds', 'billable_duration', 'charged_seconds', 'talk_time']);
+    $wasAnswered = $internalStatus === 'atendida' || !empty($call['answered_at']) || in_array($status, ['answered', 'connected'], true);
+    $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
+    $billing = call_billing_values($call, $billable);
+    db()->prepare("UPDATE calls SET status = ?, provider_call_id = COALESCE(NULLIF(provider_call_id, ''), NULLIF(external_call_id, '')), provider_status_raw = ?, internal_status = ?, duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, recording_url = NULLIF(?, ''), answered_at = {$answeredAtSql}, ended_at = {$endedAtSql}, updated_at = datetime('now') WHERE id = ?")
+        ->execute([$status, $rawStatus, $internalStatus, $duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $recording, $call['id']]);
+    if (in_array($status, $finalStatuses, true)) {
+        telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
+    }
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'nvoip.webhook', ?, ?, ?)")
         ->execute([$call['company_id'], $call['id'], $call['status'], $status, json_encode($payload, JSON_UNESCAPED_UNICODE)]);
     log_call_status((int)$call['company_id'], (int)$call['id'], 'Nvoip', $status, 'webhook', $payload);
@@ -4134,6 +4618,25 @@ function handle_nvoip_webhook(): never
 
     echo json_encode(['ok' => true]);
     exit;
+}
+
+function save_callback_for_call(array $call, int $agentId, string $scheduledAt, string $priority, string $reason, string $notes): void
+{
+    $scheduledAt = callback_datetime_storage($scheduledAt);
+    $callId = (int)($call['id'] ?? 0);
+    $companyId = (int)($call['company_id'] ?? 0);
+    if ($callId <= 0 || $companyId <= 0 || trim($scheduledAt) === '') {
+        return;
+    }
+    $existing = one('SELECT id FROM callbacks WHERE company_id = ? AND call_id = ? ORDER BY id DESC LIMIT 1', [$companyId, $callId]);
+    if ($existing) {
+        db()->prepare("UPDATE callbacks SET campaign_id = ?, contact_id = ?, agent_id = ?, scheduled_at = ?, priority = ?, reason = ?, notes = ?, status = 'pendente' WHERE id = ?")
+            ->execute([$call['campaign_id'] ?: null, $call['contact_id'], $agentId, $scheduledAt, $priority ?: 'normal', $reason, $notes, (int)$existing['id']]);
+        return;
+    }
+    db()->prepare("INSERT INTO callbacks (company_id, call_id, campaign_id, contact_id, agent_id, scheduled_at, priority, reason, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        ->execute([$companyId, $callId, $call['campaign_id'] ?: null, $call['contact_id'], $agentId, $scheduledAt, $priority ?: 'normal', $reason, $notes]);
 }
 
 function handle_recording_file(): never
@@ -4250,49 +4753,83 @@ function handle_phone_history(): never
     header('Content-Type: application/json; charset=utf-8');
     if (!$user || !can('agent')) {
         http_response_code(403);
-        echo json_encode(['ok' => false, 'error' => 'Sem permissao para consultar chamadas.']);
+        echo json_encode_safe(['ok' => false, 'error' => 'Sem permissao para consultar chamadas.']);
         exit;
     }
 
-    $baseSql = "SELECT co.id, co.destination_number, co.status, co.created_at, co.duration_seconds,
-            ct.name contato, ct.city, ct.state, cr.name resultado
-        FROM calls co
-        LEFT JOIN contacts ct ON ct.id = co.contact_id
-        LEFT JOIN call_results cr ON cr.id = co.result_id
-        WHERE co.company_id = ? AND co.agent_id = ?";
-    $params = [(int)$user['company_id'], (int)$user['id']];
+    $history = recent_phone_history((int)$user['company_id'], (int)$user['id']);
     $prepareItems = static function (array $items): array {
         return array_map(static function (array $call): array {
             $duration = (int)($call['duration_seconds'] ?? 0);
             return [
                 'id' => (int)$call['id'],
-                'phone' => (string)($call['destination_number'] ?? ''),
-                'contact' => (string)($call['contato'] ?: 'Contato'),
-                'location' => (string)($call['city'] ?: $call['state'] ?: 'Contato'),
-                'time' => datetime_utc_display((string)($call['created_at'] ?? ''), 'H:i'),
+                'phone' => utf8_text($call['destination_number'] ?? ''),
+                'contact' => utf8_text($call['contato'] ?: 'Contato'),
+                'location' => utf8_text($call['city'] ?: $call['state'] ?: 'Contato'),
+                'time' => datetime_utc_display((string)($call['created_at'] ?? ''), 'H:i:s'),
                 'duration' => $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '',
-                'status' => (string)($call['status'] ?? ''),
-                'result' => (string)($call['resultado'] ?? ''),
+                'status' => utf8_text($call['status'] ?? ''),
+                'result' => utf8_text($call['resultado'] ?? ''),
             ];
         }, $items);
     };
 
-    echo json_encode([
+    echo json_encode_safe([
         'ok' => true,
-        'todas' => $prepareItems(rows($baseSql . ' ORDER BY co.id DESC LIMIT 8', $params)),
-        'recebidas' => $prepareItems(rows($baseSql . " AND co.status IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", $params)),
-        'realizadas' => $prepareItems(rows($baseSql . " AND co.status NOT IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", $params)),
-        'perdidas' => $prepareItems(rows($baseSql . " AND (co.status IN ('failed','cancelled','busy','no_answer','missed') OR cr.name IN ('Nao atendeu','Ocupado','Caixa postal')) ORDER BY co.id DESC LIMIT 8", $params)),
-    ], JSON_UNESCAPED_UNICODE);
+        'todas' => $prepareItems($history['todas']),
+        'recebidas' => $prepareItems($history['recebidas']),
+        'realizadas' => $prepareItems($history['realizadas']),
+        'perdidas' => $prepareItems($history['perdidas']),
+    ]);
+    exit;
+}
+
+function handle_callback_notifications(): never
+{
+    require_login();
+    header('Content-Type: application/json; charset=utf-8');
+    $user = current_user();
+    if (!$user || !can('agent')) {
+        http_response_code(403);
+        echo json_encode_safe(['ok' => false, 'error' => 'Sem permissao para consultar retornos.']);
+        exit;
+    }
+
+    $now = date('Y-m-d H:i:s');
+    $windowStart = date('Y-m-d H:i:s', strtotime('-1 day'));
+    $callbacks = rows("
+        SELECT cb.id, cb.scheduled_at, cb.priority, cb.notes,
+               COALESCE(ct.name, 'Contato') AS contact_name, ct.phone_e164
+        FROM callbacks cb
+        JOIN contacts ct ON ct.id = cb.contact_id AND ct.company_id = cb.company_id
+        WHERE cb.company_id = ?
+          AND cb.agent_id = ?
+          AND cb.status = 'pendente'
+          AND cb.scheduled_at <= ?
+          AND cb.scheduled_at >= ?
+        ORDER BY cb.scheduled_at ASC, cb.id ASC
+        LIMIT 10
+    ", [(int)$user['company_id'], (int)$user['id'], $now, $windowStart]);
+
+    echo json_encode_safe(['ok' => true, 'callbacks' => array_map(static function (array $callback): array {
+        return [
+            'id' => (int)$callback['id'],
+            'contact' => utf8_text($callback['contact_name'] ?? 'Contato'),
+            'phone' => utf8_text($callback['phone_e164'] ?? ''),
+            'scheduled_at' => utf8_text($callback['scheduled_at'] ?? ''),
+            'priority' => utf8_text($callback['priority'] ?? 'normal'),
+            'notes' => utf8_text($callback['notes'] ?? ''),
+        ];
+    }, $callbacks)]);
     exit;
 }
 
 function list_contacts_batch(int $listId, int $companyId, int $offset, int $limit, array $statusFilters = []): array
 {
     $scanLimit = max($limit + 1, 11);
-    $contacts = rows("
+    $baseSql = "
         SELECT c.id, c.list_id, c.name, c.phone_raw, c.phone_e164, c.email, c.city, c.state, c.product, c.origin, c.notes, c.custom_json, c.status, c.attempts, c.last_call_at,
-               lc.id AS last_call_id, lc.status AS call_status, lc.answered_at, lc.ended_at,
+               lc.id AS last_call_id, lc.status AS call_status, lc.provider_status_raw, lc.answered_at, lc.ended_at,
                COALESCE(cr.name, '') AS result_name, COALESCE(cr.action, '') AS result_action
         FROM contacts c
         LEFT JOIN calls lc ON lc.id = (
@@ -4301,30 +4838,25 @@ function list_contacts_batch(int $listId, int $companyId, int $offset, int $limi
         LEFT JOIN call_results cr ON cr.id = lc.result_id
         WHERE c.list_id = ? AND c.company_id = ? AND c.status <> 'excluido'
         ORDER BY c.id DESC
-        LIMIT ? OFFSET ?
-    ", [$listId, $companyId, $scanLimit, max(0, $offset)]);
+    ";
+
+    if ($statusFilters) {
+        $contacts = hydrate_reprocess_lead_statuses(rows($baseSql, [$listId, $companyId]));
+        $contacts = array_values(array_filter($contacts, static fn($contact) => in_array((string)$contact['reprocess_bucket'], $statusFilters, true)));
+        $filteredTotal = count($contacts);
+        $contacts = array_slice($contacts, max(0, $offset), $limit);
+        return [
+            'contacts' => $contacts,
+            'has_more' => $offset + $limit < $filteredTotal,
+            'next_offset' => $offset + $limit,
+        ];
+    }
+
+    $contacts = rows($baseSql . ' LIMIT ? OFFSET ?', [$listId, $companyId, $scanLimit, max(0, $offset)]);
 
     $hasMore = count($contacts) > $limit;
     $contacts = array_slice($contacts, 0, $limit);
-    $payloadByCallId = [];
-    $callIds = array_values(array_filter(array_map(static fn($contact) => (int)($contact['last_call_id'] ?? 0), $contacts)));
-    if ($callIds) {
-        $placeholders = implode(',', array_fill(0, count($callIds), '?'));
-        foreach (rows("SELECT call_id, payload FROM call_events WHERE call_id IN ($placeholders) AND event_name IN ('nvoip.webhook', 'sip.ended', 'sip.failed') ORDER BY id DESC", $callIds) as $event) {
-            $callId = (int)($event['call_id'] ?? 0);
-            if ($callId > 0 && !isset($payloadByCallId[$callId])) {
-                $decoded = json_decode((string)($event['payload'] ?? ''), true);
-                $payloadByCallId[$callId] = is_array($decoded) ? $decoded : [];
-            }
-        }
-    }
-    foreach ($contacts as &$contact) {
-        $contact['reprocess_bucket'] = classify_reprocess_lead_status($contact, $payloadByCallId[(int)($contact['last_call_id'] ?? 0)] ?? []);
-    }
-    unset($contact);
-    if ($statusFilters) {
-        $contacts = array_values(array_filter($contacts, static fn($contact) => in_array((string)$contact['reprocess_bucket'], $statusFilters, true)));
-    }
+    $contacts = hydrate_reprocess_lead_statuses($contacts);
     return ['contacts' => $contacts, 'has_more' => $hasMore, 'next_offset' => $offset + $limit];
 }
 
@@ -4427,7 +4959,7 @@ function handle_sip_call_event(): never
     header('Content-Type: application/json; charset=utf-8');
     if (!$user || !can('agent')) {
         http_response_code(403);
-        echo json_encode(['ok' => false, 'error' => 'Sem permissao para registrar chamada SIP.']);
+        echo json_encode_safe(['ok' => false, 'error' => 'Sem permissao para registrar chamada SIP.']);
         exit;
     }
 
@@ -4440,23 +4972,36 @@ function handle_sip_call_event(): never
         $phone = normalize_phone((string)($payload['phone'] ?? ''));
         if (!$phone) {
             http_response_code(422);
-            echo json_encode(['ok' => false, 'error' => 'Telefone invalido.']);
+            echo json_encode_safe(['ok' => false, 'error' => 'Telefone invalido.']);
             exit;
         }
         if (is_phone_blocked($companyId, $phone)) {
             http_response_code(409);
-            echo json_encode(['ok' => false, 'error' => 'Chamada nao iniciada: este numero esta na lista de bloqueio.']);
+            echo json_encode_safe(['ok' => false, 'error' => 'Chamada nao iniciada: este numero esta na lista de bloqueio.']);
+            exit;
+        }
+        $telephony = telephony_call_allowed($companyId);
+        if (!$telephony['ok']) {
+            http_response_code(402);
+            echo json_encode_safe(['ok' => false, 'error' => (string)$telephony['message']]);
             exit;
         }
 
         $campaignId = (int)($payload['campaign_id'] ?? 0);
+        $autoDialing = !empty($payload['auto_dialing'])
+            || (string)($user['status'] ?? '') === 'Discando automatico';
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ? AND company_id = ?', [$campaignId, $companyId]) : null;
         $contact = null;
         if ($campaign) {
-            $contact = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status = 'reservado' AND phone_e164 = ? ORDER BY reserved_at DESC LIMIT 1", [$companyId, $campaign['list_id'], $agentId, $phone]);
-            if (!$contact) {
-                $contact = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status = 'reservado' ORDER BY reserved_at DESC LIMIT 1", [$companyId, $campaign['list_id'], $agentId]);
+            $contact = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') AND phone_e164 = ? ORDER BY reserved_at DESC LIMIT 1", [$companyId, $campaign['list_id'], $agentId, $phone]);
+            if (!$contact && !$autoDialing) {
+                $contact = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$companyId, $campaign['list_id'], $agentId]);
             }
+        }
+        if ($autoDialing && (!$campaign || !$contact || (string)($campaign['dialer_type'] ?? '') === 'manual')) {
+            http_response_code(409);
+            echo json_encode_safe(['ok' => false, 'error' => 'A lead automatica nao esta mais reservada nesta campanha. Atualize o discador para continuar a lista.']);
+            exit;
         }
         if (!$campaign || !$contact) {
             $campaign = get_or_create_manual_campaign($companyId, $agentId);
@@ -4472,27 +5017,28 @@ function handle_sip_call_event(): never
         }
         if (!$campaignId || !$contact) {
             http_response_code(422);
-            echo json_encode(['ok' => false, 'error' => 'Nao foi possivel registrar a chamada SIP.']);
+            echo json_encode_safe(['ok' => false, 'error' => 'Nao foi possivel registrar a chamada SIP.']);
             exit;
         }
 
         $existing = one("SELECT * FROM calls WHERE company_id = ? AND agent_id = ? AND contact_id = ? AND status IN (" . live_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [$companyId, $agentId, $contact['id']]);
         if ($existing) {
-            echo json_encode(['ok' => true, 'callId' => (int)$existing['id'], 'status' => $existing['status'], 'call' => call_modal_payload((int)$existing['id'], $companyId, $agentId)]);
+            echo json_encode_safe(['ok' => true, 'callId' => (int)$existing['id'], 'status' => $existing['status'], 'call' => call_modal_payload((int)$existing['id'], $companyId, $agentId)]);
             exit;
         }
 
         $externalId = 'SIP-' . bin2hex(random_bytes(6));
-        db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, destination_number, status, provider_status_raw, internal_status, attempt_number, started_at)
-            VALUES (?, ?, ?, ?, 'Nvoip SIP/WebRTC', ?, ?, ?, 'in_progress', ?, ?, ?, datetime('now'))")
-            ->execute([$companyId, $campaignId, $contact['id'], $agentId, $externalId, $externalId, $phone, 'in_progress', 'iniciada', max(1, (int)($contact['attempts'] ?? 0) + 1)]);
+        $billingRateMicros = call_plan_rate_micros($companyId);
+        db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, started_at)
+            VALUES (?, ?, ?, ?, 'Nvoip SIP/WebRTC', ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, datetime('now'))")
+            ->execute([$companyId, $campaignId, $contact['id'], $agentId, $externalId, $externalId, $phone, 'in_progress', 'iniciada', max(1, (int)($contact['attempts'] ?? 0) + 1), $billingRateMicros, (int)$telephony['state']['period_id']]);
         $callId = (int)db()->lastInsertId();
         db()->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contact['id']]);
         $nextStatus = (($user['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
         db()->prepare("UPDATE users SET status = ? WHERE id = ?")->execute([$nextStatus, $agentId]);
         db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'sip.started', 'reserved', 'in_progress', ?)")
-            ->execute([$companyId, $callId, json_encode($payload, JSON_UNESCAPED_UNICODE)]);
-        echo json_encode(['ok' => true, 'callId' => $callId, 'status' => 'in_progress', 'call' => call_modal_payload($callId, $companyId, $agentId)]);
+            ->execute([$companyId, $callId, json_encode_safe($payload)]);
+        echo json_encode_safe(['ok' => true, 'callId' => $callId, 'status' => 'in_progress', 'call' => call_modal_payload($callId, $companyId, $agentId)]);
         exit;
     }
 
@@ -4500,11 +5046,11 @@ function handle_sip_call_event(): never
         $callId = (int)($payload['call_id'] ?? 0);
         $call = $callId ? one('SELECT * FROM calls WHERE id = ? AND company_id = ? AND agent_id = ?', [$callId, $companyId, $agentId]) : null;
         if (!$call) {
-            echo json_encode(['ok' => true, 'ignored' => true]);
+            echo json_encode_safe(['ok' => true, 'ignored' => true]);
             exit;
         }
         if (!in_array((string)$call['status'], ['in_progress', 'calling_origin', 'ringing'], true)) {
-            echo json_encode(['ok' => true, 'ignored' => true, 'status' => $call['status']]);
+            echo json_encode_safe(['ok' => true, 'ignored' => true, 'status' => $call['status']]);
             exit;
         }
         $statusCode = (int)($payload['status_code'] ?? 0);
@@ -4517,7 +5063,7 @@ function handle_sip_call_event(): never
         db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'sip.progress', ?, ?, ?)")
             ->execute([$companyId, $callId, $call['status'], $newStatus, json_encode($payload, JSON_UNESCAPED_UNICODE)]);
         log_call_status($companyId, $callId, 'Nvoip SIP/WebRTC', $newStatus, 'sip_progress', $payload);
-        echo json_encode(['ok' => true, 'callId' => $callId, 'status' => $newStatus, 'ringing_confirmed' => $ringingConfirmed]);
+        echo json_encode_safe(['ok' => true, 'callId' => $callId, 'status' => $newStatus, 'ringing_confirmed' => $ringingConfirmed]);
         exit;
     }
 
@@ -4525,18 +5071,18 @@ function handle_sip_call_event(): never
         $callId = (int)($payload['call_id'] ?? 0);
         $call = $callId ? one('SELECT * FROM calls WHERE id = ? AND company_id = ? AND agent_id = ?', [$callId, $companyId, $agentId]) : null;
         if (!$call) {
-            echo json_encode(['ok' => true, 'ignored' => true]);
+            echo json_encode_safe(['ok' => true, 'ignored' => true]);
             exit;
         }
         if (!in_array((string)$call['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true)) {
-            echo json_encode(['ok' => true, 'ignored' => true, 'status' => $call['status']]);
+            echo json_encode_safe(['ok' => true, 'ignored' => true, 'status' => $call['status']]);
             exit;
         }
         db()->prepare("UPDATE calls SET status = 'answered', provider_status_raw = 'answered', internal_status = 'atendida', ringing_at = COALESCE(ringing_at, datetime('now')), answered_at = COALESCE(answered_at, datetime('now')), updated_at = datetime('now') WHERE id = ?")
             ->execute([$callId]);
         db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'sip.answered', ?, 'answered', ?)")
             ->execute([$companyId, $callId, $call['status'], json_encode($payload, JSON_UNESCAPED_UNICODE)]);
-        echo json_encode(['ok' => true, 'callId' => $callId, 'status' => 'answered', 'call' => call_modal_payload($callId, $companyId, $agentId)]);
+        echo json_encode_safe(['ok' => true, 'callId' => $callId, 'status' => 'answered', 'call' => call_modal_payload($callId, $companyId, $agentId)]);
         exit;
     }
 
@@ -4544,7 +5090,7 @@ function handle_sip_call_event(): never
         $callId = (int)($payload['call_id'] ?? 0);
         $call = $callId ? one('SELECT * FROM calls WHERE id = ? AND company_id = ? AND agent_id = ?', [$callId, $companyId, $agentId]) : null;
         if (!$call) {
-            echo json_encode(['ok' => true, 'ignored' => true]);
+            echo json_encode_safe(['ok' => true, 'ignored' => true]);
             exit;
         }
         $cause = strtolower((string)($payload['cause'] ?? ''));
@@ -4585,10 +5131,12 @@ function handle_sip_call_event(): never
                 'answered_at' => $call['answered_at'] ?? null,
                 'event' => 'ended',
             ]);
-        $billable = $wasAnswered && $duration > 0 ? (int)ceil($duration / 60) * 60 : 0;
-        $cost = round(($billable / 60) * price_per_minute(), 2);
-        db()->prepare("UPDATE calls SET status = ?, provider_status_raw = ?, internal_status = ?, error_message = NULLIF(?, ''), ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
-            ->execute([$status, $rawProviderStatus, $internalStatus, $providerError, $duration, $billable, $cost, $callId]);
+        $providerBillable = first_payload_value($payload, ['billsec', 'billable_seconds', 'billable_duration', 'charged_seconds', 'talk_time']);
+        $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
+        $billing = call_billing_values($call, $billable);
+        db()->prepare("UPDATE calls SET status = ?, provider_status_raw = ?, internal_status = ?, error_message = NULLIF(?, ''), ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+            ->execute([$status, $rawProviderStatus, $internalStatus, $providerError, $duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
+        telephony_record_call_debit($call, $billing, $agentId ?: null);
         $contactStatus = $wasAnswered ? 'pos_atendimento' : 'concluido';
         db()->prepare("UPDATE contacts SET status = ?, reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ?")
             ->execute([$contactStatus, $call['contact_id']]);
@@ -4635,12 +5183,12 @@ function handle_sip_call_event(): never
                 $response['queue_empty'] = true;
             }
         }
-        echo json_encode($response);
+        echo json_encode_safe($response);
         exit;
     }
 
     http_response_code(422);
-    echo json_encode(['ok' => false, 'error' => 'Evento SIP invalido.']);
+    echo json_encode_safe(['ok' => false, 'error' => 'Evento SIP invalido.']);
     exit;
 }
 
@@ -4719,6 +5267,10 @@ if (($_GET['page'] ?? '') === 'list_contacts_batch') {
     handle_list_contacts_batch();
 }
 
+if (($_GET['page'] ?? '') === 'callback_notifications') {
+    handle_callback_notifications();
+}
+
 if (($_GET['page'] ?? '') === 'sip_call_event') {
     handle_sip_call_event();
 }
@@ -4742,6 +5294,9 @@ if (isset($_GET['logout'])) {
 }
 
 $page = $_GET['page'] ?? 'dashboard';
+if ($page === 'sip_diagnostic') {
+    redirect('?page=settings&sip=1#diagnostico-sip');
+}
 if ($page !== 'login') {
     require_login();
     $mergedCallsAccess = ($page === 'supervisor' && can('recordings'))
@@ -4773,7 +5328,6 @@ function layout(string $page, callable $content): void
         'campaigns' => 'Campanhas',
         'supervisor' => 'Chamadas',
         'costs' => 'Plano e consumo',
-        'sip_diagnostic' => 'Diagnostico SIP',
         'account' => 'Minha conta',
     ];
     $title = $titles[$page] ?? ucfirst(str_replace('_', ' ', $page));
@@ -4807,7 +5361,6 @@ function layout(string $page, callable $content): void
                 'reports' => 'Relatorios',
                 'costs' => 'Plano e consumo',
                 'settings' => 'Integracoes',
-                'sip_diagnostic' => 'Diagnostico SIP',
                 'blocklist' => 'Bloqueio',
                 'audit' => 'Auditoria',
                 'account' => 'Minha conta',
@@ -4934,7 +5487,7 @@ function render_phone_history_items(array $items, string $empty): void
         $location = trim((string)($call['city'] ?: $call['state'] ?: 'Contato'), ' /');
         $duration = (int)($call['duration_seconds'] ?? 0);
         $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '';
-        $time = $call['created_at'] ? date('H:i', strtotime((string)$call['created_at'])) : '';
+        $time = $call['created_at'] ? datetime_utc_display((string)$call['created_at'], 'H:i:s') : '';
         $meta = trim($location . ($time ? ' - ' . $time : '') . ($durationText ? ' - ' . $durationText : ''));
         $badgeClass = ['green', 'orange', 'blue'][$index % 3];
         ?>
@@ -4959,15 +5512,11 @@ function render_floating_webphone_panel(): void
     $campaignId = selected_campaign_id();
     $activeCall = get_active_call((int)$user['id'], (int)$user['company_id']);
     $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
-    $recentBaseSql = "SELECT co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds, ct.name contato, ct.city, ct.state, cr.name resultado
-        FROM calls co
-        LEFT JOIN contacts ct ON ct.id = co.contact_id
-        LEFT JOIN call_results cr ON cr.id = co.result_id
-        WHERE co.agent_id = ?";
-    $recentCalls = rows($recentBaseSql . " ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-    $recentReceived = rows($recentBaseSql . " AND co.status IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-    $recentMade = rows($recentBaseSql . " AND co.status NOT IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-    $recentMissed = rows($recentBaseSql . " AND (co.status IN ('failed','cancelled','busy','no_answer','missed') OR cr.name IN ('Nao atendeu','Ocupado','Caixa postal')) ORDER BY co.id DESC LIMIT 8", [$user['id']]);
+    $recentHistory = recent_phone_history((int)$user['company_id'], (int)$user['id']);
+    $recentCalls = $recentHistory['todas'];
+    $recentReceived = $recentHistory['recebidas'];
+    $recentMade = $recentHistory['realizadas'];
+    $recentMissed = $recentHistory['perdidas'];
     $phoneContacts = rows("SELECT name, phone_e164, product, status FROM contacts WHERE company_id = ? AND status <> 'excluido' ORDER BY last_call_at DESC, id DESC LIMIT 8", [(int)$user['company_id']]);
     ?>
     <section class="webphone-panel" data-sip-floating>
@@ -5063,18 +5612,25 @@ function render_login(): void
 
 function render_dashboard(): void
 {
-    layout('dashboard', function () {
-        [$clause, $params] = tenant_clause('c');
-        $usage = monthly_usage((int)current_user()['company_id']);
+        layout('dashboard', function () {
+            [$clause, $params] = tenant_clause('c');
+            $companyId = (int)current_user()['company_id'];
+            $dashboardCostMicros = call_cost_sql('c');
+            $dashboardStats = one("
+            SELECT
+                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN 1 ELSE 0 END), 0) chamadas_hoje,
+                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN c.billable_seconds ELSE 0 END), 0) segundos_hoje,
+                COALESCE(SUM(CASE WHEN c.company_id = ? THEN c.billable_seconds ELSE 0 END), 0) segundos_mes_empresa,
+                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN {$dashboardCostMicros} ELSE 0 END), 0) gasto_hoje_micros
+            FROM calls c
+            WHERE {$clause} AND c.created_at >= datetime('now', 'start of month')
+        ", array_merge([$companyId], $params)) ?: [];
+        $usage = monthly_usage($companyId, (float)($dashboardStats['segundos_mes_empresa'] ?? 0));
         $cards = [
-            'Chamadas hoje' => one("SELECT COUNT(*) v FROM calls c WHERE {$clause} AND date(c.created_at) = date('now')", $params)['v'],
-            'Minutos hoje' => number_format(((float)one("SELECT COALESCE(SUM(c.billable_seconds), 0) v FROM calls c WHERE {$clause} AND date(c.created_at) = date('now')", $params)['v']) / 60, 0, ',', '.'),
+            'Chamadas hoje' => (int)($dashboardStats['chamadas_hoje'] ?? 0),
+            'Minutos hoje' => number_format(((float)($dashboardStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
             'Minutos restantes' => number_format((float)$usage['remaining'], 1, ',', '.'),
-            'Gasto hoje' => money((float)one("SELECT COALESCE(SUM((c.billable_seconds / 60.0) * COALESCE(s.commercial_price_per_minute, p.commercial_price_per_minute, 0)), 0) v
-                FROM calls c
-                LEFT JOIN subscriptions s ON s.company_id = c.company_id
-                LEFT JOIN plans p ON p.id = s.plan_id
-                WHERE {$clause} AND date(c.created_at) = date('now')", $params)['v']),
+            'Gasto hoje' => money(((int)($dashboardStats['gasto_hoje_micros'] ?? 0)) / 1000000),
             'Leads restantes' => one("SELECT COUNT(*) v FROM contacts c WHERE {$clause} AND c.status IN ('novo','retentar')", $params)['v'],
             'Consultores ativos' => one("SELECT COUNT(*) v FROM users c WHERE {$clause} AND c.role IN ('atendente','usuario_operacional') AND c.status <> 'Desconectado'", $params)['v'],
             'Telefonia' => is_platform_admin() ? voip_status_label() : (nvoip_enabled() ? 'Disponivel' : 'Indisponivel'),
@@ -5102,18 +5658,27 @@ function render_dashboard(): void
                 <h2>Proximos retornos</h2>
                 <?php
                 [$cbClause, $cbParams] = tenant_clause('cb');
-                $callbacks = rows("SELECT ct.name contato, ct.phone_e164 telefone, cb.scheduled_at data, cb.priority prioridade, cb.status FROM callbacks cb JOIN contacts ct ON ct.id = cb.contact_id WHERE {$cbClause} ORDER BY cb.scheduled_at LIMIT 8", $cbParams);
+                $callbacks = rows("
+                    SELECT cb.id, cb.company_id, ct.name contato, ct.phone_e164 telefone,
+                           cb.scheduled_at data, cb.priority prioridade, cb.status, cb.notes
+                    FROM callbacks cb
+                    JOIN contacts ct ON ct.id = cb.contact_id AND ct.company_id = cb.company_id
+                    WHERE {$cbClause} AND lower(COALESCE(cb.status, 'pendente')) IN ('pendente','pending')
+                    ORDER BY datetime(cb.scheduled_at)
+                    LIMIT 8
+                ", $cbParams);
+                $callbackResultOptions = rows('SELECT id, company_id, name FROM call_results ORDER BY is_default DESC, id');
                 $today = date('Y-m-d');
                 ?>
                 <?php if (!$callbacks): ?>
                     <p class="empty">Nenhum registro encontrado.</p>
                 <?php else: ?>
-                    <div class="table-wrap"><table><thead><tr><th>Contato</th><th>Data</th><th>Prioridade</th><th>Status</th></tr></thead><tbody>
+                    <div class="table-wrap"><table><thead><tr><th>Contato</th><th>Data</th><th>Prioridade</th><th>Status</th><th>Acoes</th></tr></thead><tbody>
                     <?php foreach ($callbacks as $callback): ?>
                         <?php
-                        $isToday = substr((string)$callback['data'], 0, 10) === $today;
+                        $isToday = datetime_utc_display((string)$callback['data'], 'Y-m-d') === $today;
                         try {
-                            $callbackDate = (new DateTimeImmutable((string)$callback['data']))->format('d/m/Y H:i');
+                            $callbackDate = datetime_utc_display((string)$callback['data']);
                         } catch (Throwable) {
                             $callbackDate = (string)$callback['data'];
                         }
@@ -5122,17 +5687,45 @@ function render_dashboard(): void
                             <td><?= h((string)$callback['contato']) ?></td>
                             <td><?= h($callbackDate) ?></td>
                             <td><?= h((string)$callback['prioridade']) ?></td>
-                            <td><span class="callback-status-actions"><span><?= h((string)$callback['status']) ?></span><button class="callback-call-button" type="button" data-fill-phone="<?= h((string)$callback['telefone']) ?>" title="Ligar para este contato" aria-label="Ligar para <?= h((string)$callback['contato']) ?>">&#9742;</button></span></td>
+                            <td><?= h((string)$callback['status']) ?></td>
+                            <td><span class="callback-status-actions"><button class="callback-call-button" type="button" data-fill-phone="<?= h((string)$callback['telefone']) ?>" title="Ligar para este contato" aria-label="Ligar para <?= h((string)$callback['contato']) ?>">&#9742;</button><button class="mini-link" type="button" data-open-callback="<?= (int)$callback['id'] ?>">Gerenciar</button></span></td>
                         </tr>
                     <?php endforeach; ?>
                     </tbody></table></div>
+                    <?php foreach ($callbacks as $callback): ?>
+                        <section class="call-modal-backdrop is-hidden" data-callback-modal="<?= (int)$callback['id'] ?>">
+                            <article class="call-modal callback-manage-modal">
+                                <header>
+                                    <div><span class="modal-kicker">Proximo retorno</span><h2><?= h((string)$callback['contato']) ?></h2><p><?= h((string)$callback['telefone']) ?></p></div>
+                                    <button type="button" class="icon-button" data-callback-modal-close aria-label="Fechar modal">x</button>
+                                </header>
+                                <form method="post" class="stack">
+                                    <input type="hidden" name="action" value="update_callback">
+                                    <input type="hidden" name="callback_id" value="<?= (int)$callback['id'] ?>">
+                                    <label>Anotacoes<textarea name="callback_notes" rows="4"><?= h((string)$callback['notes']) ?></textarea></label>
+                                    <label>Status<select name="callback_status">
+                                        <option value="pendente" selected>Continuar agendamento</option>
+                                        <option value="atendido">Atendido</option>
+                                        <?php foreach ($callbackResultOptions as $resultOption): ?>
+                                            <?php if ($resultOption['company_id'] === null || (int)$resultOption['company_id'] === (int)$callback['company_id']): ?>
+                                                <option value="resultado:<?= (int)$resultOption['id'] ?>"><?= h((string)$resultOption['name']) ?></option>
+                                            <?php endif; ?>
+                                        <?php endforeach; ?>
+                                    </select></label>
+                                    <label>Nova data de retorno<input name="callback_at" type="datetime-local" value="<?= h(datetime_local((string)$callback['data'])) ?>"></label>
+                                    <label>Prioridade<select name="callback_priority"><option <?= $callback['prioridade'] === 'normal' ? 'selected' : '' ?>>normal</option><option <?= $callback['prioridade'] === 'alta' ? 'selected' : '' ?>>alta</option><option <?= $callback['prioridade'] === 'urgente' ? 'selected' : '' ?>>urgente</option></select></label>
+                                    <button class="button" type="submit">Salvar retorno</button>
+                                </form>
+                            </article>
+                        </section>
+                    <?php endforeach; ?>
                 <?php endif; ?>
             </article>
         </section>
         <section class="grid two">
             <article class="panel">
                 <h2>Ligações por hora hoje</h2>
-                <?= table(rows("SELECT strftime('%H:00', c.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(c.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM(c.estimated_cost)) gasto FROM calls c WHERE {$clause} AND date(c.created_at) = date('now') GROUP BY hora ORDER BY hora", $params), ['hora', 'ligacoes', 'minutos', 'gasto']) ?>
+                <?= table(rows("SELECT strftime('%H:00', c.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(c.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$dashboardCostMicros}) / 1000000.0) gasto FROM calls c WHERE {$clause} AND date(c.created_at) = date('now') GROUP BY hora ORDER BY hora", $params), ['hora', 'ligacoes', 'minutos', 'gasto']) ?>
             </article>
             <article class="panel">
                 <h2><?= is_platform_admin() ? 'Configuracao tecnica' : 'Telefonia' ?></h2>
@@ -5160,6 +5753,7 @@ function render_dashboard(): void
 
 function table(array $rows, array $columns): string
 {
+    $dateColumns = ['created_at', 'updated_at', 'started_at', 'ended_at', 'answered_at', 'scheduled_at', 'approved_at', 'expires_at', 'starts_at', 'renews_at'];
     $labels = [
         'acoes' => 'Ações',
         'duracao_min' => 'Duração',
@@ -5186,7 +5780,11 @@ function table(array $rows, array $columns): string
     foreach ($rows as $row) {
         echo '<tr>';
         foreach ($columns as $column) {
-            echo '<td>' . h((string)($row[$column] ?? '')) . '</td>';
+            $value = (string)($row[$column] ?? '');
+            if (in_array($column, $dateColumns, true) || ($column === 'data' && preg_match('/^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?/', $value))) {
+                $value = datetime_utc_display($value);
+            }
+            echo '<td>' . h($value) . '</td>';
         }
         echo '</tr>';
     }
@@ -5216,17 +5814,18 @@ function render_plans(): void
                     <p class="empty">Nenhum plano encontrado.</p>
                 <?php else: ?>
                     <div class="table-wrap"><table>
-                        <thead><tr><th>Plano</th><th>Valor</th><th>Periodo</th><th>Pagamento</th><th>Minutos</th><th>Excedente</th><th>Status</th><th>Acoes</th></tr></thead>
+                        <thead><tr><th>Plano</th><th>Assinatura</th><th>Credito/ciclo</th><th>Tarifa/min</th><th>Periodo</th><th>Pagamento</th><th>Minutos</th><th>Status</th><th>Acoes</th></tr></thead>
                         <tbody>
                         <?php foreach ($plans as $plan): ?>
                             <?php $usageCount = plan_usage_count($plan); ?>
                             <tr>
                                 <td><?= h($plan['name']) ?></td>
                                 <td><?= h(money((float)$plan['monthly_price'])) ?></td>
+                                <td><?= $plan['telephony_credit_micros'] === null ? '<span class="muted">Nao configurado</span>' : h(billing_micros_to_brl((int)$plan['telephony_credit_micros'])) ?></td>
+                                <td><?= $plan['telephony_rate_micros'] === null ? '<span class="muted">Nao configurada</span>' : h(billing_micros_to_brl((int)$plan['telephony_rate_micros'])) . '/min' ?></td>
                                 <td><?= h($plan['billing_period']) ?></td>
                                 <td><?= h($plan['payment_type']) ?></td>
                                 <td><?= h((string)$plan['included_minutes']) ?></td>
-                                <td><?= h(money((float)$plan['commercial_price_per_minute'])) ?>/min</td>
                                 <td><?= h($plan['status']) ?></td>
                                 <td class="actions">
                                     <a class="mini-link" href="?page=plans&edit_plan=<?= (int)$plan['id'] ?>">Editar</a>
@@ -5264,8 +5863,9 @@ function render_plans(): void
                         <label>Taxa de implantacao<input name="setup_fee" type="number" step="0.01" value="<?= h((string)$field('setup_fee', '0')) ?>"></label>
                         <label>Periodo<select name="billing_period"><?php foreach (['Mensal','Trimestral','Semestral','Anual','Teste'] as $period): ?><option <?= (string)$field('billing_period', 'Mensal') === $period ? 'selected' : '' ?>><?= h($period) ?></option><?php endforeach; ?></select></label>
                         <label>Tipo de pagamento<select name="payment_type"><?php foreach (['Pix','Cartao','Boleto','Pix/Cartao','Boleto/Pix','Manual'] as $payment): ?><option <?= (string)$field('payment_type', 'Pix') === $payment ? 'selected' : '' ?>><?= h($payment) ?></option><?php endforeach; ?></select></label>
-                        <label>Minutos do plano<input name="included_minutes" type="number" value="<?= h((string)$field('included_minutes', '200')) ?>"></label>
-                        <label>Valor por minuto excedente<input name="commercial_price_per_minute" type="number" step="0.01" value="<?= h((string)$field('commercial_price_per_minute', '0.35')) ?>"></label>
+                        <label>Minutos do plano<input name="included_minutes" type="number" min="0" value="<?= h((string)$field('included_minutes', '200')) ?>"></label>
+                        <label>Credito de telefonia por ciclo<input name="telephony_credit_amount" type="number" min="0" step="0.000001" required value="<?= h($editing && $field('telephony_credit_micros') !== null ? billing_micros_to_decimal((int)$field('telephony_credit_micros')) : '') ?>"></label>
+                        <label>Tarifa de telefonia por minuto<input name="telephony_rate_per_minute" type="number" min="0" step="0.000001" required value="<?= h($editing && $field('telephony_rate_micros') !== null ? billing_micros_to_decimal((int)$field('telephony_rate_micros')) : '') ?>"></label>
                         <label>Limite usuarios<input name="max_users" type="number" value="<?= h((string)$field('max_users', '1')) ?>"></label>
                         <label>Limite consultores<input name="max_consultants" type="number" value="<?= h((string)$field('max_consultants', '1')) ?>"></label>
                         <label>Limite listas<input name="max_lists" type="number" value="<?= h((string)$field('max_lists', '10')) ?>"></label>
@@ -5716,16 +6316,12 @@ function render_lists(): void
         if ($selectedListId) {
             $selectedList = one("SELECT * FROM contact_lists WHERE id = ? AND {$clause}", array_merge([$selectedListId], $params));
             if ($selectedList) {
-                $contactTotal = (int)(one("SELECT COUNT(*) total FROM contacts WHERE list_id = ? AND company_id = ? AND status <> 'excluido'", [$selectedListId, $selectedList['company_id']])['total'] ?? 0);
-                $leadStatusCounts['all'] = $contactTotal;
+                $leadStatusCounts = list_reprocess_status_counts($selectedListId, (int)$selectedList['company_id']);
+                $contactTotal = (int)$leadStatusCounts['all'];
                 $batch = list_contacts_batch($selectedListId, (int)$selectedList['company_id'], 0, 10, $leadStatusFilters);
                 $contacts = $batch['contacts'];
                 $displayContacts = $contacts;
                 $hasMoreContacts = (bool)$batch['has_more'];
-                foreach ($displayContacts as $contact) {
-                    $bucket = (string)($contact['reprocess_bucket'] ?? '');
-                    $leadStatusCounts[$bucket] = ($leadStatusCounts[$bucket] ?? 0) + 1;
-                }
                 $sourceName = lead_reprocess_source_name($selectedList, (int)$selectedList['company_id']);
                 $suggestedRemessaName = suggest_remessa_name((int)$selectedList['company_id'], $sourceName);
             }
@@ -5834,7 +6430,7 @@ function render_lists(): void
                             <td><?= h($list['source']) ?></td>
                             <td><?= h((string)$list['contatos']) ?></td>
                             <td><?= h($list['tags']) ?></td>
-                            <td><?= h($list['created_at']) ?></td>
+                            <td><?= h(datetime_utc_display((string)$list['created_at'])) ?></td>
                             <td class="actions">
                                 <a class="mini-link" href="?page=lists&list_id=<?= (int)$list['id'] ?>">Ver numeros</a>
                                 <?php if (is_account_admin()): ?>
@@ -5904,7 +6500,7 @@ function render_lists(): void
                                     <strong><?= (int)($leadStatusCounts[$filterKey] ?? 0) ?></strong>
                                 </label>
                             <?php endforeach; ?>
-                            <button class="button secondary small" type="submit">Aplicar filtros</button>
+                            <button class="button small filter-accent" type="submit">Aplicar filtros</button>
                         </form>
                         <form method="post" class="remessa-create-form" id="remessa-create-form" data-create-remessa-form>
                             <input type="hidden" name="action" value="create_remessa_from_selection">
@@ -6109,33 +6705,32 @@ function render_agent(): void
         $campaigns = rows("SELECT id, name, status FROM campaigns WHERE {$clause} AND status <> 'Manual' ORDER BY status, name", $params);
         $campaignId = selected_campaign_id();
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ?', [$campaignId]) : null;
+        $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
         $usage = monthly_usage((int)$user['company_id']);
-        $activeCall = get_active_call((int)$user['id'], (int)$user['company_id']);
+        $activeCall = $isAutoDialing && $campaignId
+            ? one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND campaign_id = ? AND status IN (" . active_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [(int)$user['id'], (int)$user['company_id'], $campaignId])
+            : get_active_call((int)$user['id'], (int)$user['company_id']);
         $isCallLive = $activeCall && in_array((string)$activeCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
         $reserved = $activeCall ? one('SELECT * FROM contacts WHERE id = ? AND company_id = ?', [$activeCall['contact_id'], $activeCall['company_id']]) : null;
         if (!$reserved && $campaign) {
-            $reserved = one("SELECT * FROM contacts WHERE company_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$campaign['company_id'], $user['id']]);
+            $reserved = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$campaign['company_id'], $campaign['list_id'], $user['id']]);
         }
         $autoNextPhone = (string)($_SESSION['auto_next_phone'] ?? '');
         if ($autoNextPhone !== '') {
             unset($_SESSION['auto_next_phone']);
         }
-        $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
         $showAnsweredModal = call_was_answered($activeCall);
         $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
-        $recentBaseSql = "SELECT co.destination_number, co.origin_number, co.status, co.created_at, co.duration_seconds, ct.name contato, ct.city, ct.state, cr.name resultado
-            FROM calls co
-            LEFT JOIN contacts ct ON ct.id = co.contact_id
-            LEFT JOIN call_results cr ON cr.id = co.result_id
-            WHERE co.agent_id = ?";
-        $recentCalls = rows($recentBaseSql . " ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-        $recentReceived = rows($recentBaseSql . " AND co.status IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-        $recentMade = rows($recentBaseSql . " AND co.status NOT IN ('received','incoming','inbound') ORDER BY co.id DESC LIMIT 8", [$user['id']]);
-        $recentMissed = rows($recentBaseSql . " AND (co.status IN ('failed','cancelled','busy','no_answer','missed') OR cr.name IN ('Nao atendeu','Ocupado','Caixa postal')) ORDER BY co.id DESC LIMIT 8", [$user['id']]);
+        $recentHistory = recent_phone_history((int)$user['company_id'], (int)$user['id']);
+        $recentCalls = $recentHistory['todas'];
+        $recentReceived = $recentHistory['recebidas'];
+        $recentMade = $recentHistory['realizadas'];
+        $recentMissed = $recentHistory['perdidas'];
         $answeredCalls = rows("
             SELECT co.id, co.campaign_id, co.contact_id, co.created_at, co.started_at, co.answered_at, co.ended_at, co.destination_number, co.origin_number, co.status, co.duration_seconds, co.result_id, co.notes,
-                   ct.name contato, ct.email, ct.city, ct.state, ct.product, ct.origin contato_origem, ct.attempts,
+                   ct.name contato, ct.email, ct.city, ct.state, ct.product, ct.origin contato_origem, ct.attempts, ct.notes contato_observacoes, ct.custom_json,
                    ca.name campanha, COALESCE(cr.name, '-') resultado,
+                   cb.scheduled_at callback_at, cb.priority callback_priority, cb.status callback_status, cb.reason callback_reason,
                    EXISTS(
                        SELECT 1
                        FROM call_events ce
@@ -6147,6 +6742,16 @@ function render_agent(): void
             LEFT JOIN contacts ct ON ct.id = co.contact_id
             LEFT JOIN campaigns ca ON ca.id = co.campaign_id
             LEFT JOIN call_results cr ON cr.id = co.result_id
+            LEFT JOIN callbacks cb ON cb.id = (
+                SELECT cbx.id
+                FROM callbacks cbx
+                WHERE cbx.company_id = co.company_id
+                  AND cbx.agent_id = co.agent_id
+                  AND cbx.contact_id = co.contact_id
+                  AND (cbx.call_id = co.id OR cbx.call_id IS NULL)
+                ORDER BY (cbx.call_id IS NULL) ASC, cbx.id DESC
+                LIMIT 1
+            )
             WHERE co.agent_id = ?
               AND (
                 co.answered_at IS NOT NULL
@@ -6168,7 +6773,7 @@ function render_agent(): void
                 $location = trim((string)($call['city'] ?: $call['state'] ?: 'Contato'), ' /');
                 $duration = (int)($call['duration_seconds'] ?? 0);
                 $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '';
-                $time = $call['created_at'] ? date('H:i', strtotime((string)$call['created_at'])) : '';
+                $time = $call['created_at'] ? datetime_utc_display((string)$call['created_at'], 'H:i:s') : '';
                 $meta = trim($location . ($time ? ' - ' . $time : '') . ($durationText ? ' - ' . $durationText : ''));
                 $badgeClass = ['green', 'orange', 'blue'][$index % 3];
                 ?>
@@ -6304,7 +6909,7 @@ function render_agent(): void
                             $isAnsweredCall = !empty($call['ever_answered']) && $answeredSeconds > 5;
                             ?>
                             <tr class="<?= $isAnsweredCall ? 'call-history-attended' : '' ?>">
-                                <td><?= h($call['answered_at'] ?: $call['created_at']) ?></td>
+                            <td><?= h(datetime_utc_display((string)($call['answered_at'] ?: $call['created_at']))) ?></td>
                                 <td><?= h($call['contato'] ?: 'Sem nome') ?></td>
                                 <?php
                                 $phoneDigits = nvoip_phone_digits((string)$call['destination_number']);
@@ -6346,6 +6951,18 @@ function render_agent(): void
                     }
                     $whatsappMessage = 'Oi, aqui é ' . (string)$user['name'] . ', da Ademicon, conforme combinado, vamos seguir nossa conversa por aqui ';
                     $modalWhatsappLink = $modalPhoneDigits !== '' ? 'https://wa.me/' . $modalPhoneDigits . '?text=' . rawurlencode($whatsappMessage) : '';
+                    $callbackAtValue = !empty($call['callback_at']) ? datetime_local((string)$call['callback_at']) : '';
+                    $callbackDisplay = '';
+                    if (!empty($call['callback_at'])) {
+                        try {
+                            $callbackDisplay = (new DateTimeImmutable((string)$call['callback_at']))->format('d/m/Y H:i');
+                        } catch (Throwable) {
+                            $callbackDisplay = (string)$call['callback_at'];
+                        }
+                    }
+                    $callbackPriority = (string)($call['callback_priority'] ?: 'normal');
+                    $contactCustomFields = json_decode((string)($call['custom_json'] ?? ''), true);
+                    $contactCustomFields = is_array($contactCustomFields) ? $contactCustomFields : [];
                     ?>
                     <section class="call-modal-backdrop is-hidden" data-call-history-modal="<?= (int)$call['id'] ?>">
                         <article class="call-modal">
@@ -6367,6 +6984,13 @@ function render_agent(): void
                                     <dt>Cidade</dt><dd><?= h(trim((string)$call['city'] . ' / ' . (string)$call['state'], ' /') ?: '-') ?></dd>
                                     <dt>Produto</dt><dd><?= h($call['product'] ?: '-') ?></dd>
                                     <dt>Campanha</dt><dd><?= h($call['campanha'] ?: '-') ?></dd>
+                                    <?php if (!empty($call['contato_observacoes'])): ?><dt>Observacao do contato</dt><dd><?= nl2br(h((string)$call['contato_observacoes'])) ?></dd><?php endif; ?>
+                                    <?php if ($callbackDisplay): ?><dt>Retorno agendado</dt><dd><?= h($callbackDisplay) ?></dd><?php endif; ?>
+                                    <?php if (!empty($call['callback_status'])): ?><dt>Status do retorno</dt><dd><?= h((string)$call['callback_status']) ?></dd><?php endif; ?>
+                                    <?php if (!empty($call['callback_reason'])): ?><dt>Motivo do retorno</dt><dd><?= h((string)$call['callback_reason']) ?></dd><?php endif; ?>
+                                    <?php foreach ($contactCustomFields as $customKey => $customValue): ?>
+                                        <?php if (is_scalar($customValue) && trim((string)$customValue) !== ''): ?><dt><?= h((string)$customKey) ?></dt><dd><?= h((string)$customValue) ?></dd><?php endif; ?>
+                                    <?php endforeach; ?>
                                 </dl>
                                 <div class="live-call-card is-live">
                                     <div class="live-indicator"><span></span> Atendimento registrado</div>
@@ -6380,8 +7004,8 @@ function render_agent(): void
                                 <input type="hidden" name="call_id" value="<?= (int)$call['id'] ?>">
                                 <label>Resultado<select name="result_id"><?php foreach ($results as $r): ?><option value="<?= $r['id'] ?>" <?= (int)$call['result_id'] === (int)$r['id'] ? 'selected' : '' ?>><?= h($r['name']) ?></option><?php endforeach; ?></select></label>
                                 <label>Observações<textarea name="notes" rows="5"><?= h((string)$call['notes']) ?></textarea></label>
-                                <label>Agendar retorno<input name="callback_at" type="datetime-local"></label>
-                                <label>Prioridade<select name="callback_priority"><option>normal</option><option>alta</option><option>urgente</option></select></label>
+                                <label>Agendar retorno<input name="callback_at" type="datetime-local" value="<?= h($callbackAtValue) ?>"></label>
+                                <label>Prioridade<select name="callback_priority"><option <?= $callbackPriority === 'normal' ? 'selected' : '' ?>>normal</option><option <?= $callbackPriority === 'alta' ? 'selected' : '' ?>>alta</option><option <?= $callbackPriority === 'urgente' ? 'selected' : '' ?>>urgente</option></select></label>
                                 <button class="button" type="submit">Salvar atendimento</button>
                             </form>
                         </article>
@@ -6389,11 +7013,11 @@ function render_agent(): void
                 <?php endforeach; ?>
             <?php endif; ?>
         </section>
-        <section class="webphone-panel" data-sip-floating data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= $isAutoDialing && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?>>
+        <section class="webphone-panel" data-sip-floating data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= $isAutoDialing && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
             <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
             <article class="webphone is-hidden" data-webphone>
                 <header>
-                    <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong>Webfone manual</strong></div>
+                    <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong><?= $isAutoDialing ? 'Discador automatico' : 'Webfone manual' ?></strong></div>
                     <button type="button" class="icon-button" data-webphone-close aria-label="Fechar webfone">x</button>
                 </header>
                 <form class="webphone-form" data-floating-webphone-form>
@@ -6556,6 +7180,7 @@ function render_reports(): void
 {
     layout('reports', function () {
         [$clause, $params] = tenant_clause('co');
+        $reportCostMicros = call_cost_sql('co');
         [$campaignClause, $campaignParams] = tenant_clause('ca');
         $campaigns = rows("SELECT ca.id, ca.name FROM campaigns ca WHERE {$campaignClause} ORDER BY ca.name", $campaignParams);
         $selectedCampaignId = (int)($_GET['campaign_id'] ?? ($campaigns[0]['id'] ?? 0));
@@ -6570,7 +7195,7 @@ function render_reports(): void
             'to' => trim((string)($_GET['to'] ?? '')),
         ];
         $logPage = max(1, (int)($_GET['logs_page'] ?? 1));
-        $campaignLogs = $selectedCampaignId > 0 ? campaign_call_logs_page($selectedCampaignId, $logFilters, $logPage, 20) : ['rows' => [], 'total' => 0, 'page' => 1, 'per_page' => 20, 'pages' => 1];
+        $campaignLogs = $selectedCampaignId > 0 ? campaign_call_logs_page($selectedCampaignId, $logFilters, $logPage, 10) : ['rows' => [], 'total' => 0, 'page' => 1, 'per_page' => 10, 'pages' => 1];
         $statusLabels = call_attempt_status_labels();
         $baseQuery = $_GET;
         unset($baseQuery['logs_page']);
@@ -6655,7 +7280,7 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Ligações detalhadas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT co.created_at data, ct.name contato, co.destination_number telefone, u.name consultor, ca.name campanha, ROUND(co.billable_seconds / 60.0, 1) minutos, COALESCE(cr.name, '-') resultado, co.status, printf('%.2f', co.estimated_cost) custo
+                <?= table(rows("SELECT co.created_at data, ct.name contato, co.destination_number telefone, u.name consultor, ca.name campanha, ROUND(co.billable_seconds / 60.0, 1) minutos, COALESCE(cr.name, '-') resultado, co.status, printf('%.2f', ({$reportCostMicros}) / 1000000.0) custo
                     FROM calls co
                     JOIN contacts ct ON ct.id = co.contact_id
                     LEFT JOIN users u ON u.id = co.agent_id
@@ -6669,7 +7294,7 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Produtividade por consultor</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT u.name consultor, COUNT(co.id) ligacoes, SUM(CASE WHEN co.status = 'completed' THEN 1 ELSE 0 END) concluidas, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM(co.estimated_cost), 0)) custo
+                <?= table(rows("SELECT u.name consultor, COUNT(co.id) ligacoes, SUM(CASE WHEN co.status = 'completed' THEN 1 ELSE 0 END) concluidas, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM({$reportCostMicros}), 0) / 1000000.0) custo
                     FROM users u
                     LEFT JOIN calls co ON co.agent_id = u.id
                     WHERE u.company_id = ?
@@ -6683,13 +7308,13 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por dia</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT date(co.created_at) dia, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM(co.estimated_cost)) custo FROM calls co WHERE {$clause} GROUP BY dia ORDER BY dia DESC LIMIT 31", $params), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT date(co.created_at) dia, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY dia ORDER BY dia DESC LIMIT 31", $params), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por mes</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y-%m', co.created_at) mes, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM(co.estimated_cost)) custo FROM calls co WHERE {$clause} GROUP BY mes ORDER BY mes DESC LIMIT 24", $params), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%Y-%m', co.created_at) mes, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY mes ORDER BY mes DESC LIMIT 24", $params), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
@@ -6697,13 +7322,13 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por hora</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y-%m-%d %H:00', co.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM(co.estimated_cost)) custo FROM calls co WHERE {$clause} GROUP BY hora ORDER BY hora DESC LIMIT 48", $params), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%Y-%m-%d %H:00', co.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY hora ORDER BY hora DESC LIMIT 48", $params), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por ano</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y', co.created_at) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM(co.estimated_cost)) custo FROM calls co WHERE {$clause} GROUP BY ano ORDER BY ano DESC", $params), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%Y', co.created_at) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY ano ORDER BY ano DESC", $params), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
@@ -6711,7 +7336,7 @@ function render_reports(): void
             <summary><span>Campanhas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
             <?php [$caClause, $caParams] = tenant_clause('ca'); ?>
-            <?= table(rows("SELECT ca.name campanha, COUNT(ct.id) leads, SUM(CASE WHEN ct.status = 'concluido' THEN 1 ELSE 0 END) trabalhados, SUM(CASE WHEN ct.status IN ('novo','retentar') THEN 1 ELSE 0 END) restantes, printf('%.2f', COALESCE(SUM(co.estimated_cost), 0)) custo
+            <?= table(rows("SELECT ca.name campanha, COUNT(ct.id) leads, SUM(CASE WHEN ct.status = 'concluido' THEN 1 ELSE 0 END) trabalhados, SUM(CASE WHEN ct.status IN ('novo','retentar') THEN 1 ELSE 0 END) restantes, printf('%.2f', COALESCE(SUM({$reportCostMicros}), 0) / 1000000.0) custo
                 FROM campaigns ca
                 LEFT JOIN contacts ct ON ct.list_id = ca.list_id
                 LEFT JOIN calls co ON co.campaign_id = ca.id
@@ -6793,7 +7418,7 @@ function render_recordings_content(): void
                         <tbody>
                         <?php foreach ($webhookLogs as $log): ?>
                             <tr>
-                                <td><?= h($log['created_at']) ?></td>
+                                <td><?= h(datetime_utc_display((string)$log['created_at'])) ?></td>
                                 <td><?= h($log['status'] ?: '-') ?></td>
                                 <td><?= h($log['call_id'] ? '#' . $log['call_id'] : 'Nao vinculada') ?></td>
                                 <td><?= h($log['match_key'] ?: '-') ?></td>
@@ -6918,8 +7543,12 @@ function render_costs(): void
         $companyId = (int)$user['company_id'];
         [$clause, $params] = tenant_clause('co');
         $usage = monthly_usage($companyId);
-        $total = one("SELECT COUNT(*) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, COALESCE(SUM(co.estimated_cost), 0) custo FROM calls co WHERE {$clause}", $params);
+        $costMicrosSql = call_cost_sql('co');
+        $total = one("SELECT COUNT(*) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, COALESCE(SUM({$costMicrosSql}), 0) custo_micros FROM calls co WHERE {$clause}", $params);
         $subscription = one('SELECT s.*,p.monthly_price,p.billing_period,p.description FROM subscriptions s LEFT JOIN plans p ON p.id=s.plan_id WHERE s.company_id=?', [$companyId]) ?: [];
+        $telephony = telephony_credit_state($companyId);
+        $telephonyLedger = rows('SELECT l.*, u.name responsavel FROM telephony_ledger l LEFT JOIN users u ON u.id=l.responsible_user_id WHERE l.company_id=? ORDER BY l.id DESC LIMIT 50', [$companyId]);
+        $telephonyConsumedMicros = (int)(one("SELECT COALESCE(SUM(-amount_micros), 0) total FROM telephony_ledger WHERE company_id=? AND entry_type='CALL_DEBIT'", [$companyId])['total'] ?? 0);
         $billing = tenant_billing_state($companyId);
         $payments = rows('SELECT * FROM payments WHERE company_id=? ORDER BY id DESC LIMIT 30', [$companyId]);
         $paymentHistory = array_map(static function (array $payment): array {
@@ -6941,6 +7570,9 @@ function render_costs(): void
                 <?php endif; ?>
                 <dt>Status</dt><dd><?= h(strtoupper((string)$billing['state'])) ?></dd>
                 <dt>Saldo restante</dt><dd><?= h(number_format((float)$usage['remaining'],1,',','.')) ?> minutos</dd>
+                <dt>Credito inicial do ciclo</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['initial_micros'])) : 'Nao configurado' ?></dd>
+                <dt>Tarifa vigente</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['rate_micros'])) . ' / min' : 'Nao configurada' ?></dd>
+                <dt>Saldo de telefonia</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['balance_micros'])) : 'Configure e renove o plano' ?></dd>
             </dl>
         </section>
         <section class="metric-grid">
@@ -6949,18 +7581,46 @@ function render_costs(): void
             <article class="metric"><span>Limite mensal</span><strong><?= h(number_format((float)$usage['limit'], 0, ',', '.')) ?></strong></article>
             <article class="metric"><span>Total de ligações</span><strong><?= h((string)$total['ligacoes']) ?></strong></article>
             <article class="metric"><span>Minutos tarifados</span><strong><?= h((string)$total['minutos']) ?></strong></article>
-            <article class="metric"><span>Gasto estimado</span><strong><?= h(money((float)$total['custo'])) ?></strong></article>
+            <article class="metric"><span>Gasto estimado</span><strong><?= h(money(((int)$total['custo_micros']) / 1000000)) ?></strong></article>
+            <article class="metric"><span>Credito consumido</span><strong><?= $telephony['configured'] ? h(billing_micros_to_brl($telephonyConsumedMicros)) : '-' ?></strong></article>
+            <article class="metric"><span>Saldo de telefonia</span><strong><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['balance_micros'])) : '-' ?></strong></article>
         </section>
+        <section class="panel">
+            <div class="section-head"><div><h2>Historico financeiro de telefonia</h2><p>Creditos, debitos de chamadas, estornos e ajustes deste ciclo.</p></div></div>
+            <?php if (!$telephonyLedger): ?>
+                <p class="empty">Nenhum lancamento de telefonia neste tenant.</p>
+            <?php else: ?>
+                <div class="table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Valor</th><th>Saldo anterior</th><th>Saldo posterior</th><th>Referencia</th><th>Responsavel</th></tr></thead><tbody>
+                <?php foreach ($telephonyLedger as $entry): ?>
+                    <tr><td><?= h(date_br_display((string)$entry['created_at'])) ?></td><td><?= h((string)$entry['entry_type']) ?></td><td><?= h(billing_micros_to_brl((int)$entry['amount_micros'])) ?></td><td><?= h(billing_micros_to_brl((int)$entry['balance_before_micros'])) ?></td><td><?= h(billing_micros_to_brl((int)$entry['balance_after_micros'])) ?></td><td><?= h((string)($entry['reference_type'] ?: '-')) ?><?= $entry['reference_id'] ? ':' . (int)$entry['reference_id'] : '' ?></td><td><?= h((string)($entry['responsavel'] ?: '-')) ?></td></tr>
+                <?php endforeach; ?>
+                </tbody></table></div>
+            <?php endif; ?>
+        </section>
+        <?php if (is_platform_admin()): ?>
+            <?php $adjustmentCompanies = rows('SELECT id, trade_name FROM companies ORDER BY trade_name'); ?>
+            <section class="panel">
+                <h2>Ajuste manual de credito</h2>
+                <form method="post" class="form-grid">
+                    <input type="hidden" name="action" value="adjust_telephony_credit">
+                    <label>Cliente<select name="company_id" required><?php foreach ($adjustmentCompanies as $adjustmentCompany): ?><option value="<?= (int)$adjustmentCompany['id'] ?>"><?= h((string)$adjustmentCompany['trade_name']) ?></option><?php endforeach; ?></select></label>
+                    <label>Tipo<select name="entry_type"><option value="MANUAL_CREDIT">Adicionar credito</option><option value="MANUAL_DEBIT">Debitar credito</option><option value="REFUND">Estornar debito</option></select></label>
+                    <label>Valor<input name="amount" type="number" min="0.000001" step="0.000001" required></label>
+                    <label>Observacao<input name="notes" maxlength="500"></label>
+                    <button class="button" type="submit">Salvar ajuste</button>
+                </form>
+            </section>
+        <?php endif; ?>
         <section class="<?= is_platform_admin() ? 'grid two' : '' ?>">
             <?php if (is_platform_admin()): ?>
             <article class="panel">
                 <h2>Gasto por consultor</h2>
-                <?= table(rows("SELECT u.name consultor, COUNT(co.id) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM(co.estimated_cost), 0)) custo FROM users u LEFT JOIN calls co ON co.agent_id = u.id WHERE u.company_id = ? GROUP BY u.id ORDER BY custo DESC", [current_user()['company_id']]), ['consultor', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT u.name consultor, COUNT(co.id) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM({$costMicrosSql}), 0) / 1000000.0) custo FROM users u LEFT JOIN calls co ON co.agent_id = u.id WHERE u.company_id = ? GROUP BY u.id ORDER BY COALESCE(SUM({$costMicrosSql}), 0) DESC", [current_user()['company_id']]), ['consultor', 'ligacoes', 'minutos', 'custo']) ?>
             </article>
             <?php endif; ?>
             <article class="panel">
                 <h2>Gasto por campanha</h2>
-                <?= table(rows("SELECT ca.name campanha, COUNT(co.id) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM(co.estimated_cost), 0)) custo FROM campaigns ca LEFT JOIN calls co ON co.campaign_id = ca.id WHERE ca.company_id = ? GROUP BY ca.id ORDER BY custo DESC", [current_user()['company_id']]), ['campanha', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT ca.name campanha, COUNT(co.id) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM({$costMicrosSql}), 0) / 1000000.0) custo FROM campaigns ca LEFT JOIN calls co ON co.campaign_id = ca.id WHERE ca.company_id = ? GROUP BY ca.id ORDER BY COALESCE(SUM({$costMicrosSql}), 0) DESC", [current_user()['company_id']]), ['campanha', 'ligacoes', 'minutos', 'custo']) ?>
             </article>
         </section>
         <?php if (!is_platform_admin()): ?>
@@ -7139,7 +7799,9 @@ function render_settings(): void
         $mpStored = one('SELECT * FROM payment_settings WHERE id=1') ?: [];
         ?>
         <?php if (is_platform_admin($user)): ?>
-        <section class="panel" id="mercado-pago">
+        <details class="panel import-history-disclosure" id="mercado-pago">
+            <summary><span>Mercado Pago</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <div class="import-history-content">
             <div class="section-head"><div><h2>Mercado Pago</h2><p>Configuracao global de cobranca dos planos LigFlow.</p></div><span class="status-badge <?= $mpConfig['active'] ? 'called' : '' ?>"><?= $mpConfig['active'] ? 'Ativa' : 'Inativa' ?></span></div>
             <form method="post" class="form-grid">
                 <input type="hidden" name="action" value="save_mercado_pago_settings">
@@ -7155,9 +7817,12 @@ function render_settings(): void
                 <button class="button" type="submit">Salvar Mercado Pago</button>
             </form>
             <form method="post"><input type="hidden" name="action" value="test_mercado_pago"><button class="button secondary" type="submit">Testar conexao</button></form>
-        </section>
+            </div>
+        </details>
         <?php endif; ?>
-        <section class="panel">
+        <details class="panel import-history-disclosure">
+            <summary><span>Integracoes cadastradas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <div class="import-history-content">
             <div class="section-head">
                 <div>
                     <h2>Integrações</h2>
@@ -7186,9 +7851,12 @@ function render_settings(): void
                     <?php endif; ?>
                 </select>
             </form>
-        </section>
+            </div>
+        </details>
         <section class="grid two">
-            <form class="panel form-grid" method="post">
+            <details class="panel import-history-disclosure" <?= isset($_GET['new']) || isset($_GET['provider']) ? 'open' : '' ?>>
+                <summary><span><?= $isNew ? 'Nova integracao' : 'Configuracao da integracao' ?></span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <form class="form-grid import-history-content" method="post">
                 <input type="hidden" name="action" value="save_integration_settings">
                 <input type="hidden" name="company_id" value="<?= (int)$companyId ?>">
                 <h2><?= $isNew ? 'Nova integração' : 'Editar integração' ?></h2>
@@ -7228,7 +7896,10 @@ function render_settings(): void
                 <button class="button">Salvar integração</button>
                 <p class="hint">Todos os campos são opcionais, exceto nome ou identificador. Campos de senha vazios mantêm o valor salvo ao editar.</p>
             </form>
-            <article class="panel">
+            </details>
+            <details class="panel import-history-disclosure">
+                <summary><span>Status da integracao</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <article class="import-history-content">
                 <h2>Status da integração</h2>
                 <dl>
                     <dt>Integração</dt><dd><?= h(($config['integration_name'] ?: strtoupper((string)$config['provider'])) ?: 'Nova') ?></dd>
@@ -7263,17 +7934,20 @@ function render_settings(): void
                     <div class="flash error">Este webhook esta em localhost. Para a Nvoip enviar status e gravacoes, configure uma URL publica HTTPS do LigFlow.</div>
                 <?php endif; ?>
             </article>
+            </details>
         </section>
+        <?php render_sip_diagnostic_sections(); ?>
     <?php });
 }
 
-function render_sip_diagnostic(): void
+function render_sip_diagnostic_sections(): void
 {
-    layout('sip_diagnostic', function () {
-        $config = nvoip_config((int)current_user()['company_id']);
-        ?>
+    $config = nvoip_config((int)current_user()['company_id']);
+    ?>
         <section class="grid two">
-            <form class="panel form-grid" method="post" data-sip-diagnostic>
+            <details class="panel import-history-disclosure" id="diagnostico-sip" <?= isset($_GET['sip']) ? 'open' : '' ?>>
+                <summary><span>Diagnostico SIP/WebRTC Nvoip</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <form class="form-grid import-history-content" method="post" data-sip-diagnostic>
                 <input type="hidden" name="action" value="save_sip_diagnostic_config">
                 <h2>Diagnostico SIP/WebRTC Nvoip</h2>
                 <p class="hint wide">Use esta tela para provar o registro SIP no navegador. O discador e o webfone flutuante usam este mesmo caminho de chamada.</p>
@@ -7299,7 +7973,10 @@ function render_sip_diagnostic(): void
                 </div>
                 <audio id="nvoip-remote-audio" autoplay></audio>
             </form>
-            <article class="panel">
+            </details>
+            <details class="panel import-history-disclosure" <?= isset($_GET['sip']) ? 'open' : '' ?>>
+                <summary><span>Status do webphone</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <article class="import-history-content">
                 <h2>Status do webphone</h2>
                 <dl class="sip-status-grid">
                     <dt>Estado</dt><dd data-sip-status>DISCONNECTED</dd>
@@ -7315,8 +7992,14 @@ function render_sip_diagnostic(): void
                 <h3>Eventos sanitizados</h3>
                 <ol class="sip-log" data-sip-log></ol>
             </article>
+            </details>
         </section>
-    <?php });
+    <?php
+}
+
+function render_sip_diagnostic(): void
+{
+    redirect('?page=settings&sip=1#diagnostico-sip');
 }
 
 function render_blocklist(): void
@@ -7368,7 +8051,7 @@ function render_blocklist(): void
                                 <td><?= h($row['reason']) ?></td>
                                 <td><?= h($row['source']) ?></td>
                                 <td><?= h($row['notes']) ?></td>
-                                <td><?= h($row['created_at']) ?></td>
+                                <td><?= h(datetime_utc_display((string)$row['created_at'])) ?></td>
                                 <td class="actions">
                                     <form method="post" onsubmit="return confirm('Remover este numero do bloqueio?');">
                                         <input type="hidden" name="action" value="delete_blocklist">
@@ -7430,10 +8113,16 @@ function render_audit(): void
 {
     layout('audit', function () {
         [$clause, $params] = tenant_clause('a');
+        $auditLogs = rows("SELECT a.created_at, COALESCE(u.name, 'Sistema') usuario, a.action, a.resource, a.ip_address FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id WHERE {$clause} ORDER BY a.id DESC LIMIT 100", $params);
+        foreach ($auditLogs as &$auditLog) {
+            $auditLog['data'] = datetime_utc_display((string)($auditLog['created_at'] ?? ''), 'd/m/Y H:i:s');
+            unset($auditLog['created_at']);
+        }
+        unset($auditLog);
         ?>
         <section class="panel">
             <h2>Logs de auditoria</h2>
-            <?= table(rows("SELECT a.created_at, COALESCE(u.name, 'Sistema') usuario, a.action, a.resource, a.ip_address FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id WHERE {$clause} ORDER BY a.id DESC LIMIT 100", $params), ['created_at', 'usuario', 'action', 'resource', 'ip_address']) ?>
+            <?= table($auditLogs, ['data', 'usuario', 'action', 'resource', 'ip_address']) ?>
         </section>
     <?php });
 }

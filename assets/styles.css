@@ -970,6 +970,16 @@ body.light-theme .button.secondary:hover {
     font-size: 12px;
 }
 
+.button.filter-accent {
+    background: var(--warning);
+    color: #171717;
+}
+
+.button.filter-accent:hover {
+    background: var(--accent);
+    color: #171717;
+}
+
 .mini-link {
     color: var(--primary);
     font-weight: 700;
@@ -1141,6 +1151,84 @@ body.light-theme .table-wrap tr.callback-today {
 .callback-call-button:hover {
     color: #fff;
     background: var(--primary);
+}
+
+.callback-notification-stack {
+    position: fixed;
+    left: 18px;
+    bottom: 18px;
+    z-index: 1300;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 10px;
+    width: min(360px, calc(100vw - 36px));
+}
+
+.callback-notification {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 36px;
+    align-items: stretch;
+    overflow: hidden;
+    border: 1px solid var(--primary-line);
+    border-left: 5px solid var(--warning);
+    border-radius: 8px;
+    background: var(--panel);
+    box-shadow: var(--shadow);
+}
+
+.callback-notification-main,
+.callback-notification-close {
+    border: 0;
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+}
+
+.callback-notification-main {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 14px;
+    text-align: left;
+}
+
+.callback-notification-main:hover {
+    background: var(--hover);
+}
+
+.callback-notification-main span:last-child {
+    display: grid;
+    min-width: 0;
+    gap: 4px;
+}
+
+.callback-notification-main small {
+    overflow: hidden;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.callback-notification-bell {
+    display: inline-grid;
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--primary);
+    color: #ffffff;
+    font-size: 20px;
+}
+
+.callback-notification-close {
+    font-size: 16px;
+    font-weight: 800;
+}
+
+.callback-notification-close:hover {
+    background: var(--hover);
 }
 
 .call-history-badge {
@@ -2017,6 +2105,10 @@ body.light-theme .dialpad button {
     text-align: center;
     color: var(--muted);
     font-weight: 700;
+}
+
+.list-loading-more.is-hidden {
+    display: none;
 }
 
 .import-history-disclosure > summary {
