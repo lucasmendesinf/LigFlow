@@ -51,6 +51,16 @@ document.querySelectorAll('[data-theme-toggle]').forEach((button) => {
     });
 });
 
+document.querySelectorAll('[data-radar-select-all]').forEach((toggle) => {
+    toggle.addEventListener('change', () => {
+        const table = toggle.closest('table');
+        if (!table) return;
+        table.querySelectorAll('input[name="place_ids[]"]').forEach((checkbox) => {
+            checkbox.checked = toggle.checked;
+        });
+    });
+});
+
 document.querySelectorAll('[data-user-menu]').forEach((menu) => {
     const trigger = menu.querySelector('[data-user-menu-toggle]');
     const panel = menu.querySelector('[data-user-menu-panel]');
