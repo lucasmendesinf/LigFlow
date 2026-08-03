@@ -63,6 +63,11 @@ function billing_telephony_balance_after(int $balanceMicros, int $debitMicros): 
     return $balanceMicros - max(0, $debitMicros);
 }
 
+function billing_mvp_test_call_allowed(bool $platformAdmin, string $planName): bool
+{
+    return $platformAdmin && strtoupper(trim($planName)) === 'MVP';
+}
+
 function billing_telephony_call_allowed(bool $configured, int $balanceMicros, int $rateMicros): bool
 {
     return $configured && $balanceMicros > 0 && $rateMicros > 0;

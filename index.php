@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 6;
+const DB_SCHEMA_VERSION = 11;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -429,6 +429,61 @@ function migrate(PDO $pdo): void
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS google_places_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            active INTEGER NOT NULL DEFAULT 0,
+            api_key_encrypted TEXT,
+            updated_by INTEGER,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS radar_lead_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            list_id INTEGER,
+            place_id TEXT NOT NULL,
+            phone_e164 TEXT,
+            search_json TEXT NOT NULL DEFAULT '{}',
+            created_by INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(company_id, place_id),
+            UNIQUE(company_id, phone_e164)
+        );
+
+        CREATE TABLE IF NOT EXISTS asterisk_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            environment TEXT NOT NULL DEFAULT 'test',
+            active_mode TEXT NOT NULL DEFAULT 'NVOIP_DIRECT',
+            active_route TEXT NOT NULL DEFAULT 'NVOIP_TRUNK',
+            ari_url TEXT,
+            ari_ws_url TEXT,
+            ari_username TEXT,
+            ari_password_encrypted TEXT,
+            stasis_app TEXT NOT NULL DEFAULT 'ligflow',
+            originate_timeout_seconds INTEGER NOT NULL DEFAULT 30,
+            bridge_timeout_seconds INTEGER NOT NULL DEFAULT 15,
+            reconnect_initial_seconds INTEGER NOT NULL DEFAULT 2,
+            reconnect_max_seconds INTEGER NOT NULL DEFAULT 30,
+            sip_wss_url TEXT,
+            sip_domain TEXT,
+            consultant_endpoint TEXT,
+            nvoip_trunk TEXT NOT NULL DEFAULT 'NVOIP_TRUNK',
+            directcall_trunk TEXT NOT NULL DEFAULT 'DIRECTCALL_TRUNK',
+            nvoip_trunk_config_json TEXT DEFAULT '{}',
+            directcall_trunk_config_json TEXT DEFAULT '{}',
+            updated_by INTEGER,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS asterisk_ari_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            call_id INTEGER,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             company_id INTEGER NOT NULL,
@@ -532,6 +587,16 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'billing_rate_micros', 'INTEGER');
     ensure_column($pdo, 'calls', 'estimated_cost_micros', 'INTEGER');
     ensure_column($pdo, 'calls', 'telephony_period_id', 'INTEGER');
+    ensure_column($pdo, 'calls', 'telephony_mode', "TEXT DEFAULT 'NVOIP_DIRECT'");
+    ensure_column($pdo, 'calls', 'telephony_trunk', 'TEXT');
+    ensure_column($pdo, 'calls', 'provider_channel_id', 'TEXT');
+    ensure_column($pdo, 'calls', 'provider_linked_id', 'TEXT');
+    ensure_column($pdo, 'calls', 'provider_bridge_id', 'TEXT');
+    ensure_column($pdo, 'calls', 'event_origin', 'TEXT');
+    ensure_column($pdo, 'calls', 'last_event_at', 'TEXT');
+    ensure_column($pdo, 'calls', 'connected_at', 'TEXT');
+    ensure_column($pdo, 'calls', 'finalized_at', 'TEXT');
+    ensure_column($pdo, 'calls', 'hangup_cause', 'TEXT');
     ensure_column($pdo, 'callbacks', 'call_id', 'INTEGER');
     ensure_column($pdo, 'callbacks', 'completed_at', 'TEXT');
     ensure_column($pdo, 'plans', 'monthly_price', 'REAL DEFAULT 0');
@@ -548,6 +613,7 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'subscription_periods', 'telephony_credit_initial_micros', 'INTEGER');
     ensure_column($pdo, 'subscription_periods', 'telephony_rate_micros', 'INTEGER');
     ensure_column($pdo, 'subscription_periods', 'telephony_balance_micros', 'INTEGER');
+    ensure_column($pdo, 'contact_lists', 'radar_target_leads', 'INTEGER');
     $pdo->exec("UPDATE callbacks SET status = CASE
         WHEN status IS NULL OR trim(status) = '' OR lower(trim(status)) = 'pending' THEN 'pendente'
         ELSE lower(trim(status)) END");
@@ -555,9 +621,12 @@ function migrate(PDO $pdo): void
         WHEN length(replace(scheduled_at, 'T', ' ')) = 16 THEN replace(scheduled_at, 'T', ' ') || ':00'
         ELSE replace(scheduled_at, 'T', ' ') END");
     ensure_index($pdo, 'idx_calls_company_campaign_created', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_created ON calls(company_id, campaign_id, created_at DESC)');
+    ensure_index($pdo, 'idx_radar_lead_history_company_list', 'CREATE INDEX IF NOT EXISTS idx_radar_lead_history_company_list ON radar_lead_history(company_id, list_id, created_at DESC)');
     ensure_index($pdo, 'idx_calls_company_campaign_internal_status', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_internal_status ON calls(company_id, campaign_id, internal_status)');
     ensure_index($pdo, 'idx_calls_company_destination_number', 'CREATE INDEX IF NOT EXISTS idx_calls_company_destination_number ON calls(company_id, destination_number)');
     ensure_index($pdo, 'idx_calls_company_provider_call_id', 'CREATE INDEX IF NOT EXISTS idx_calls_company_provider_call_id ON calls(company_id, provider_call_id)');
+    ensure_index($pdo, 'idx_calls_provider_channel_id', 'CREATE INDEX IF NOT EXISTS idx_calls_provider_channel_id ON calls(provider_channel_id)');
+    ensure_index($pdo, 'idx_calls_company_external_id', 'CREATE INDEX IF NOT EXISTS idx_calls_company_external_id ON calls(company_id, external_call_id)');
     ensure_index($pdo, 'idx_calls_company_agent_id', 'CREATE INDEX IF NOT EXISTS idx_calls_company_agent_id ON calls(company_id, agent_id, id DESC)');
     ensure_index($pdo, 'idx_callbacks_company_call', 'CREATE INDEX IF NOT EXISTS idx_callbacks_company_call ON callbacks(company_id, call_id)');
     ensure_index($pdo, 'idx_callbacks_company_agent_status_scheduled', 'CREATE INDEX IF NOT EXISTS idx_callbacks_company_agent_status_scheduled ON callbacks(company_id, agent_id, status, scheduled_at)');
@@ -904,6 +973,7 @@ function access_modules(): array
         'recordings' => 'Gravacoes',
         'costs' => 'Plano e consumo',
         'settings' => 'Integracoes',
+        'radar' => 'Radar de Leads',
         'blocklist' => 'Bloqueio',
         'audit' => 'Auditoria',
         'account' => 'Minha conta',
@@ -913,10 +983,10 @@ function access_modules(): array
 function default_role_modules(string $role): array
 {
     $matrix = [
-        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
-        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
-        'cliente_admin' => ['dashboard', 'users', 'lists', 'campaigns', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
-        'admin_empresa' => ['dashboard', 'users', 'lists', 'campaigns', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
+        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
+        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
+        'cliente_admin' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
+        'admin_empresa' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'usuario_operacional' => ['dashboard', 'lists', 'agent', 'reports', 'recordings'],
         'supervisor' => ['dashboard', 'lists', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'atendente' => ['dashboard', 'lists', 'agent', 'recordings'],
@@ -1200,9 +1270,22 @@ function telephony_credit_state(int $companyId): array
     ];
 }
 
+function mvp_test_telephony_allowed(int $companyId): bool
+{
+    $user = current_user();
+    if (!$user || !is_platform_admin($user) || (int)$user['company_id'] !== $companyId) {
+        return false;
+    }
+    $plan = one('SELECT p.name FROM subscriptions s LEFT JOIN plans p ON p.id = s.plan_id WHERE s.company_id = ?', [$companyId]) ?: [];
+    return billing_mvp_test_call_allowed(true, (string)($plan['name'] ?? ''));
+}
+
 function telephony_call_allowed(int $companyId): array
 {
     $state = telephony_credit_state($companyId);
+    if (mvp_test_telephony_allowed($companyId)) {
+        return ['ok' => true, 'state' => $state, 'test_mode' => true];
+    }
     if (!$state['configured']) {
         return ['ok' => false, 'message' => 'Credito de telefonia nao configurado para o periodo atual.'];
     }
@@ -1517,7 +1600,358 @@ function decrypt_secret(string $value): string
     return $decrypted === false ? '' : $decrypted;
 }
 
+function google_places_config(): array
+{
+    $row = one('SELECT * FROM google_places_settings WHERE id = 1') ?: [];
+    return [
+        'active' => (int)($row['active'] ?? 0) === 1,
+        'api_key' => !empty($row['api_key_encrypted'])
+            ? decrypt_secret((string)$row['api_key_encrypted'])
+            : env_value('GOOGLE_PLACES_API_KEY'),
+    ];
+}
+
+function google_places_search(array $filters, string $pageToken = ''): array
+{
+    $config = google_places_config();
+    if (!$config['active'] || $config['api_key'] === '') {
+        throw new RuntimeException('Google Places API nao configurada ou inativa.');
+    }
+    if (!function_exists('curl_init')) {
+        throw new RuntimeException('A extensao cURL do PHP e necessaria para consultar o Google Places.');
+    }
+    $queryParts = array_filter([
+        trim((string)($filters['segment'] ?? '')),
+        trim((string)($filters['street'] ?? '')),
+        trim((string)($filters['neighborhood'] ?? '')),
+        trim((string)($filters['city'] ?? '')),
+        trim((string)($filters['state'] ?? '')),
+        'Brasil',
+    ]);
+    if (trim((string)($filters['segment'] ?? '')) === '' || trim((string)($filters['city'] ?? '')) === '' || trim((string)($filters['state'] ?? '')) === '') {
+        throw new RuntimeException('Informe segmento, cidade e estado para pesquisar empresas.');
+    }
+    $ch = curl_init('https://places.googleapis.com/v1/places:searchText');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'X-Goog-Api-Key: ' . $config['api_key'],
+            'X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.googleMapsUri',
+        ],
+        CURLOPT_POSTFIELDS => json_encode(array_filter([
+            'textQuery' => implode(', ', $queryParts),
+            'pageSize' => 20,
+            'languageCode' => 'pt-BR',
+            'pageToken' => $pageToken ?: null,
+        ], static fn($value) => $value !== null), JSON_UNESCAPED_UNICODE),
+    ]);
+    $body = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+    $decoded = json_decode((string)$body, true);
+    if ($body === false || $status >= 400 || !is_array($decoded)) {
+        $message = (string)($decoded['error']['message'] ?? $error ?: 'Resposta invalida da Google Places API.');
+        throw new RuntimeException($message);
+    }
+    $onlyWithPhone = !empty($filters['only_with_phone']);
+    $places = [];
+    foreach (($decoded['places'] ?? []) as $place) {
+        $phone = normalize_phone((string)($place['nationalPhoneNumber'] ?? ''));
+        if ($onlyWithPhone && !$phone) continue;
+        $placeId = trim((string)($place['id'] ?? ''));
+        if ($placeId === '') continue;
+        $places[] = [
+            'place_id' => $placeId,
+            'name' => trim((string)($place['displayName']['text'] ?? 'Empresa sem nome')),
+            'phone' => $phone ?: '',
+            'address' => trim((string)($place['formattedAddress'] ?? '')),
+            'website' => trim((string)($place['websiteUri'] ?? '')),
+            'rating' => isset($place['rating']) ? (string)$place['rating'] : '-',
+            'maps_url' => trim((string)($place['googleMapsUri'] ?? '')),
+        ];
+    }
+    return ['places' => $places, 'next_page_token' => trim((string)($decoded['nextPageToken'] ?? ''))];
+}
+
+function radar_duplicate_keys(int $companyId, array $places): array
+{
+    $placeIds = array_values(array_filter(array_unique(array_column($places, 'place_id'))));
+    $phones = array_values(array_filter(array_unique(array_column($places, 'phone'))));
+    $existingPlaces = [];
+    $existingPhones = [];
+    if ($placeIds) {
+        $marks = implode(',', array_fill(0, count($placeIds), '?'));
+        foreach (rows("SELECT external_code FROM contacts WHERE company_id = ? AND external_code IN ($marks)", array_merge([$companyId], array_map(static fn(string $id): string => 'google_place:' . $id, $placeIds))) as $row) {
+            $existingPlaces[(string)$row['external_code']] = true;
+        }
+        foreach (rows("SELECT place_id FROM radar_lead_history WHERE company_id = ? AND place_id IN ($marks)", array_merge([$companyId], $placeIds)) as $row) {
+            $existingPlaces['google_place:' . (string)$row['place_id']] = true;
+        }
+    }
+    if ($phones) {
+        $marks = implode(',', array_fill(0, count($phones), '?'));
+        foreach (rows("SELECT phone_e164 FROM contacts WHERE company_id = ? AND phone_e164 IN ($marks)", array_merge([$companyId], $phones)) as $row) {
+            $existingPhones[(string)$row['phone_e164']] = true;
+        }
+        foreach (rows("SELECT phone_e164 FROM radar_lead_history WHERE company_id = ? AND phone_e164 IN ($marks)", array_merge([$companyId], $phones)) as $row) {
+            $existingPhones[(string)$row['phone_e164']] = true;
+        }
+    }
+    return ['places' => $existingPlaces, 'phones' => $existingPhones];
+}
+
+function radar_register_new_places(int $companyId, int $userId, array $filters, array $places): array
+{
+    $duplicates = radar_duplicate_keys($companyId, $places);
+    $new = [];
+    $discarded = 0;
+    $stmt = db()->prepare("INSERT OR IGNORE INTO radar_lead_history (company_id,place_id,phone_e164,search_json,created_by) VALUES (?,?,?,?,?)");
+    foreach ($places as $place) {
+        $placeKey = 'google_place:' . (string)$place['place_id'];
+        $phone = trim((string)($place['phone'] ?? ''));
+        if (isset($duplicates['places'][$placeKey]) || ($phone !== '' && isset($duplicates['phones'][$phone]))) {
+            $discarded++;
+            continue;
+        }
+        $stmt->execute([$companyId, $place['place_id'], $phone ?: null, json_encode($filters, JSON_UNESCAPED_UNICODE), $userId]);
+        if ($stmt->rowCount() !== 1) {
+            $discarded++;
+            continue;
+        }
+        $new[] = $place;
+    }
+    return ['places' => $new, 'discarded' => $discarded];
+}
+
+function radar_add_places_to_list(int $companyId, int $userId, int $listId, array $places): int
+{
+    if (!$places || !$listId) return 0;
+    $list = one('SELECT id FROM contact_lists WHERE id = ? AND company_id = ?', [$listId, $companyId]);
+    if (!$list) throw new RuntimeException('Lista nao encontrada.');
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $insert = $pdo->prepare("INSERT OR IGNORE INTO contacts (company_id,list_id,name,phone_raw,phone_e164,organization,origin,external_code,notes,status) VALUES (?,?,?,?,?,?,?,?,?,'novo')");
+        $linkHistory = $pdo->prepare('UPDATE radar_lead_history SET list_id = ? WHERE company_id = ? AND place_id = ?');
+        $added = 0;
+        foreach ($places as $place) {
+            $phone = trim((string)($place['phone'] ?? ''));
+            if ($phone === '') continue;
+            $insert->execute([$companyId, $listId, $place['name'], $phone, $phone, $place['name'], 'Google Places', 'google_place:' . $place['place_id'], trim((string)($place['address'] ?? ''))]);
+            $added += $insert->rowCount();
+            $linkHistory->execute([$listId, $companyId, $place['place_id']]);
+        }
+        $pdo->commit();
+        return $added;
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+}
+
+function radar_session_places(array $placeIds): array
+{
+    $stored = $_SESSION['radar_leads'] ?? [];
+    $wanted = array_fill_keys(array_filter(array_map('strval', $placeIds)), true);
+    return array_values(array_filter((array)($stored['places'] ?? []), static fn(array $place): bool => isset($wanted[(string)($place['place_id'] ?? '')])));
+}
+
+interface TelephonyProvider
+{
+    public function mode(): string;
+    public function trunk(): string;
+    public function originate(array $campaign, array $contact, array $agent): array;
+    public function hangup(array $call): void;
+    public function health(): array;
+}
+
+function asterisk_config(): array
+{
+    $row = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
+    $route = strtoupper((string)($row['active_route'] ?? 'NVOIP_TRUNK'));
+    if (!in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) $route = 'NVOIP_TRUNK';
+    return [
+        'enabled' => (int)($row['enabled'] ?? 0) === 1,
+        'environment' => (string)($row['environment'] ?? 'test'),
+        'active_mode' => strtoupper((string)($row['active_mode'] ?? 'NVOIP_DIRECT')),
+        'active_route' => $route,
+        'ari_url' => rtrim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL')), '/'),
+        'ari_ws_url' => (string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')),
+        'ari_username' => (string)($row['ari_username'] ?? env_value('ASTERISK_ARI_USERNAME')),
+        'ari_password' => !empty($row['ari_password_encrypted']) ? decrypt_secret((string)$row['ari_password_encrypted']) : env_value('ASTERISK_ARI_PASSWORD'),
+        'stasis_app' => trim((string)($row['stasis_app'] ?? 'ligflow')) ?: 'ligflow',
+        'originate_timeout_seconds' => max(5, (int)($row['originate_timeout_seconds'] ?? 30)),
+        'bridge_timeout_seconds' => max(5, (int)($row['bridge_timeout_seconds'] ?? 15)),
+        'reconnect_initial_seconds' => max(1, (int)($row['reconnect_initial_seconds'] ?? 2)),
+        'reconnect_max_seconds' => max(2, (int)($row['reconnect_max_seconds'] ?? 30)),
+        'sip_wss_url' => (string)($row['sip_wss_url'] ?? ''),
+        'sip_domain' => (string)($row['sip_domain'] ?? ''),
+        'consultant_endpoint' => trim((string)($row['consultant_endpoint'] ?? '')),
+        'nvoip_trunk' => trim((string)($row['nvoip_trunk'] ?? 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK',
+        'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'DIRECTCALL_TRUNK')) ?: 'DIRECTCALL_TRUNK',
+    ];
+}
+
+function asterisk_ari_request(array $config, string $method, string $path, ?array $payload = null): array
+{
+    if (!function_exists('curl_init')) throw new RuntimeException('A extensao cURL e obrigatoria para a integracao Asterisk ARI.');
+    if ($config['ari_url'] === '' || $config['ari_username'] === '' || $config['ari_password'] === '') {
+        throw new RuntimeException('Configure URL, usuario e senha do ARI antes de usar o Asterisk.');
+    }
+    if (!filter_var($config['ari_url'], FILTER_VALIDATE_URL)) throw new RuntimeException('URL do ARI invalida.');
+    $url = $config['ari_url'] . '/' . ltrim($path, '/');
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_USERPWD => $config['ari_username'] . ':' . $config['ari_password'],
+        CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json'],
+        CURLOPT_TIMEOUT => max(5, (int)$config['originate_timeout_seconds']),
+    ]);
+    if ($payload !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE));
+    $body = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+    $decoded = json_decode((string)$body, true);
+    if ($body === false || $status < 200 || $status >= 300) {
+        $message = (string)($decoded['message'] ?? $error ?: 'Falha na requisicao ARI.');
+        throw new RuntimeException('ARI: ' . $message);
+    }
+    return is_array($decoded) ? $decoded : [];
+}
+
+final class NvoipDirectProvider implements TelephonyProvider
+{
+    public function mode(): string { return 'NVOIP_DIRECT'; }
+    public function trunk(): string { return 'NVOIP_DIRECT'; }
+    public function originate(array $campaign, array $contact, array $agent): array
+    {
+        $result = make_nvoip_direct_call($campaign, $contact, $agent);
+        $result['telephony_mode'] = $this->mode();
+        $result['telephony_trunk'] = $this->trunk();
+        return $result;
+    }
+    public function hangup(array $call): void { }
+    public function health(): array { return ['server' => nvoip_enabled(), 'ari' => null, 'websocket' => null, 'webrtc' => null, 'trunks' => []]; }
+}
+
+final class AsteriskProvider implements TelephonyProvider
+{
+    public function __construct(private array $config) {}
+    public function mode(): string { return 'ASTERISK'; }
+    public function trunk(): string { return $this->config['active_route']; }
+    private function routeTrunk(): string
+    {
+        return $this->trunk() === 'DIRECTCALL_TRUNK' ? $this->config['directcall_trunk'] : $this->config['nvoip_trunk'];
+    }
+    private function safeEndpoint(string $endpoint): string
+    {
+        if (!preg_match('/^[A-Za-z0-9_.-]+$/', $endpoint)) throw new RuntimeException('Endpoint Asterisk invalido.');
+        return $endpoint;
+    }
+    public function createBridge(string $bridgeId): array
+    {
+        return asterisk_ari_request($this->config, 'POST', '/bridges/' . rawurlencode($bridgeId), ['type' => 'mixing', 'name' => 'LigFlow ' . $bridgeId]);
+    }
+    public function destroyBridge(string $bridgeId): void
+    {
+        if ($bridgeId !== '') asterisk_ari_request($this->config, 'DELETE', '/bridges/' . rawurlencode($bridgeId));
+    }
+    public function addChannelToBridge(string $bridgeId, string $channelId): void
+    {
+        if ($bridgeId !== '' && $channelId !== '') asterisk_ari_request($this->config, 'POST', '/bridges/' . rawurlencode($bridgeId) . '/addChannel', ['channel' => $channelId]);
+    }
+    public function connectConsultant(string $bridgeId, string $endpoint): array
+    {
+        $endpoint = $this->safeEndpoint($endpoint);
+        return asterisk_ari_request($this->config, 'POST', '/channels', [
+            'endpoint' => 'PJSIP/' . $endpoint,
+            'app' => $this->config['stasis_app'],
+            'appArgs' => 'ligflow,consultant,' . $bridgeId,
+            'timeout' => $this->config['bridge_timeout_seconds'],
+        ]);
+    }
+    public function originate(array $campaign, array $contact, array $agent): array
+    {
+        if (!$this->config['enabled']) throw new RuntimeException('Asterisk esta desabilitado.');
+        $destination = nvoip_phone_digits((string)$contact['phone_e164']);
+        if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
+        $trunk = $this->safeEndpoint($this->routeTrunk());
+        $externalId = 'ARI-' . bin2hex(random_bytes(12));
+        $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
+        try {
+            $this->createBridge($bridgeId);
+            $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
+                'channelId' => $externalId,
+                'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+                'app' => $this->config['stasis_app'],
+                'appArgs' => 'ligflow,' . $externalId,
+                'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
+                'timeout' => $this->config['originate_timeout_seconds'],
+                'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
+            ]);
+            return [
+                'ok' => true,
+                'provider' => 'Asterisk ARI',
+                'external_call_id' => $externalId,
+                'provider_channel_id' => (string)($channel['id'] ?? $externalId),
+                'provider_linked_id' => (string)($channel['connected']['id'] ?? ''),
+                'provider_bridge_id' => $bridgeId,
+                'telephony_mode' => $this->mode(),
+                'telephony_trunk' => $this->trunk(),
+                'status' => 'in_progress',
+                'message' => 'Chamada enviada ao Asterisk pela rota ' . $this->trunk() . '.',
+                'payload' => ['route' => $this->trunk(), 'channel_id' => $channel['id'] ?? $externalId, 'bridge_id' => $bridgeId],
+            ];
+        } catch (Throwable $e) {
+            try { $this->destroyBridge($bridgeId); } catch (Throwable) { }
+            throw $e;
+        }
+    }
+    public function hangup(array $call): void
+    {
+        $channelId = (string)($call['provider_channel_id'] ?? $call['provider_call_id'] ?? '');
+        if ($channelId !== '') asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($channelId));
+        if (!empty($call['provider_bridge_id'])) $this->destroyBridge((string)$call['provider_bridge_id']);
+    }
+    public function health(): array
+    {
+        $health = ['server' => false, 'ari' => false, 'websocket' => $this->config['ari_ws_url'] !== '', 'webrtc' => $this->config['sip_wss_url'] !== '', 'trunks' => ['NVOIP_TRUNK' => false, 'DIRECTCALL_TRUNK' => false]];
+        try {
+            $health['server'] = true;
+            asterisk_ari_request($this->config, 'GET', '/asterisk/info');
+            $health['ari'] = true;
+            foreach (['NVOIP_TRUNK' => $this->config['nvoip_trunk'], 'DIRECTCALL_TRUNK' => $this->config['directcall_trunk']] as $key => $trunk) {
+                $health['trunks'][$key] = $trunk !== '';
+            }
+        } catch (Throwable) { }
+        return $health;
+    }
+}
+
+function telephony_provider_for_company(int $companyId): TelephonyProvider
+{
+    $config = asterisk_config();
+    if ($config['enabled'] && $config['active_mode'] === 'ASTERISK') return new AsteriskProvider($config);
+    return new NvoipDirectProvider();
+}
+
 function make_provider_call(array $campaign, array $contact, array $agent): array
+{
+    try {
+        return telephony_provider_for_company((int)$campaign['company_id'])->originate($campaign, $contact, $agent);
+    } catch (Throwable $e) {
+        return ['ok' => false, 'provider' => 'Asterisk ARI', 'external_call_id' => '', 'telephony_mode' => 'ASTERISK', 'telephony_trunk' => asterisk_config()['active_route'], 'status' => 'failed', 'message' => $e->getMessage(), 'payload' => []];
+    }
+}
+
+function make_nvoip_direct_call(array $campaign, array $contact, array $agent): array
 {
     $externalId = 'NVOIP-DEMO-' . strtoupper(bin2hex(random_bytes(4)));
     $config = nvoip_config((int)$campaign['company_id']);
@@ -2198,6 +2632,134 @@ function handle_post(): void
         redirect('?page=settings#mercado-pago');
     }
 
+    if ($action === 'save_google_places_settings') {
+        if (!is_platform_admin($user)) { http_response_code(403); exit('Acesso negado.'); }
+        if (!function_exists('openssl_encrypt')) { flash('OpenSSL e obrigatorio para salvar a chave privada.', 'error'); redirect('?page=settings#google-places'); }
+        $existing = one('SELECT * FROM google_places_settings WHERE id = 1') ?: [];
+        $apiKey = trim((string)post('google_places_api_key'));
+        if ($apiKey === '') $apiKey = decrypt_secret((string)($existing['api_key_encrypted'] ?? ''));
+        $pdo->prepare("INSERT INTO google_places_settings (id,active,api_key_encrypted,updated_by,updated_at) VALUES (1,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET active=excluded.active,api_key_encrypted=excluded.api_key_encrypted,updated_by=excluded.updated_by,updated_at=CURRENT_TIMESTAMP")
+            ->execute([post('google_places_active') ? 1 : 0, encrypt_secret($apiKey), (int)$user['id']]);
+        audit('configurou_google_places', 'google_places_settings:1', null, ['active' => post('google_places_active') ? 1 : 0, 'has_api_key' => $apiKey !== '']);
+        flash('Google Places atualizado.');
+        redirect('?page=settings#google-places');
+    }
+
+    if ($action === 'test_google_places') {
+        if (!is_platform_admin($user)) { http_response_code(403); exit('Acesso negado.'); }
+        try {
+            google_places_search(['segment' => 'restaurante', 'city' => 'Sao Paulo', 'state' => 'SP']);
+            flash('Conexao com Google Places realizada com sucesso.');
+        } catch (Throwable $e) {
+            flash('Falha no Google Places: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=settings#google-places');
+    }
+
+    if ($action === 'search_radar_leads' && can('radar')) {
+        try {
+            $filters = [
+                'segment' => trim((string)post('segment')),
+                'state' => trim((string)post('state')),
+                'city' => trim((string)post('city')),
+                'neighborhood' => trim((string)post('neighborhood')),
+                'street' => trim((string)post('street')),
+                'only_with_phone' => post('only_with_phone') ? 1 : 0,
+            ];
+            $result = google_places_search($filters);
+            $registered = radar_register_new_places((int)$user['company_id'], (int)$user['id'], $filters, $result['places']);
+            $_SESSION['radar_leads'] = [
+                'company_id' => (int)$user['company_id'],
+                'filters' => $filters,
+                'places' => $registered['places'],
+                'next_page_token' => $result['next_page_token'],
+                'discarded' => $registered['discarded'],
+                'target_count' => max(1, min(1000, (int)post('target_count', '20'))),
+                'list_id' => 0,
+                'added' => 0,
+            ];
+            flash(count($registered['places']) . ' empresa(s) nova(s) encontrada(s). ' . $registered['discarded'] . ' repetida(s) foram descartadas.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel buscar empresas: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=radar');
+    }
+
+    if ($action === 'search_radar_more' && can('radar')) {
+        try {
+            $stored = $_SESSION['radar_leads'] ?? [];
+            if ((int)($stored['company_id'] ?? 0) !== (int)$user['company_id'] || empty($stored['next_page_token'])) {
+                throw new RuntimeException('Nao ha mais resultados para esta busca.');
+            }
+            $result = google_places_search((array)$stored['filters'], (string)$stored['next_page_token']);
+            $registered = radar_register_new_places((int)$user['company_id'], (int)$user['id'], (array)$stored['filters'], $result['places']);
+            $stored['places'] = array_merge((array)($stored['places'] ?? []), $registered['places']);
+            $stored['next_page_token'] = $result['next_page_token'];
+            $stored['discarded'] = (int)($stored['discarded'] ?? 0) + $registered['discarded'];
+            $_SESSION['radar_leads'] = $stored;
+            flash(count($registered['places']) . ' empresa(s) nova(s) adicionada(s) ao resultado.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel buscar mais empresas: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=radar');
+    }
+
+    if ($action === 'create_radar_list' && can('radar')) {
+        try {
+            $places = radar_session_places((array)post('place_ids', []));
+            if (!$places) throw new RuntimeException('Selecione ao menos uma empresa nova.');
+            $name = trim((string)post('list_name'));
+            if ($name === '') throw new RuntimeException('Informe o nome da lista.');
+            $target = max(1, min(1000, (int)post('target_count', '20')));
+            $pdo->prepare("INSERT INTO contact_lists (company_id,name,description,source,status,tags,radar_target_leads,created_by) VALUES (?,?,?,?,?,?,?,?)")
+                ->execute([(int)$user['company_id'], $name, 'Lista criada pelo Radar de Leads.', 'Google Places', 'Disponivel', 'radar', $target, (int)$user['id']]);
+            $listId = (int)$pdo->lastInsertId();
+            $added = radar_add_places_to_list((int)$user['company_id'], (int)$user['id'], $listId, $places);
+            $_SESSION['radar_leads']['list_id'] = $listId;
+            $_SESSION['radar_leads']['added'] = (int)($_SESSION['radar_leads']['added'] ?? 0) + $added;
+            audit('criou_lista_radar', 'contact_lists:' . $listId, null, ['added' => $added]);
+            flash('Lista criada com ' . $added . ' lead(s) do Radar.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel criar a lista: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=radar');
+    }
+
+    if ($action === 'add_radar_to_list' && can('radar')) {
+        try {
+            $places = radar_session_places((array)post('place_ids', []));
+            $listId = (int)post('list_id');
+            if (!$places || !$listId) throw new RuntimeException('Selecione empresas e uma lista de destino.');
+            $added = radar_add_places_to_list((int)$user['company_id'], (int)$user['id'], $listId, $places);
+            $target = max(1, min(1000, (int)post('target_count', '20')));
+            $pdo->prepare('UPDATE contact_lists SET radar_target_leads = CASE WHEN COALESCE(radar_target_leads, 0) <= 0 THEN ? ELSE radar_target_leads END WHERE id = ? AND company_id = ?')
+                ->execute([$target, $listId, (int)$user['company_id']]);
+            $_SESSION['radar_leads']['list_id'] = $listId;
+            $_SESSION['radar_leads']['added'] = (int)($_SESSION['radar_leads']['added'] ?? 0) + $added;
+            audit('adicionou_leads_radar', 'contact_lists:' . $listId, null, ['added' => $added]);
+            flash($added . ' lead(s) adicionada(s) a lista selecionada.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel adicionar os leads: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=radar');
+    }
+
+    if ($action === 'create_radar_campaign' && can('campaigns')) {
+        try {
+            $listId = (int)post('list_id');
+            $list = one('SELECT * FROM contact_lists WHERE id = ? AND company_id = ?', [$listId, (int)$user['company_id']]);
+            if (!$list) throw new RuntimeException('Lista nao encontrada.');
+            $name = trim((string)post('campaign_name')) ?: 'Radar - ' . (string)$list['name'];
+            $pdo->prepare("INSERT INTO campaigns (company_id,list_id,name,description,dialer_type,sip_trunk,script,max_attempts,status) VALUES (?,?,?,?,?,'Telefonia gerenciada',?,1,'Ativa')")
+                ->execute([(int)$user['company_id'], $listId, $name, 'Campanha criada a partir do Radar de Leads.', 'progressivo', 'Confirme o interesse do contato e registre o resultado.']);
+            audit('criou_campanha_radar', 'campaigns:' . $pdo->lastInsertId(), null, ['list_id' => $listId]);
+            flash('Campanha criada a partir da lista do Radar.');
+        } catch (Throwable $e) {
+            flash('Nao foi possivel criar a campanha: ' . $e->getMessage(), 'error');
+        }
+        redirect('?page=radar');
+    }
+
     if ($action === 'create_payment' && can('costs')) {
         try {
             $payment = create_tenant_payment((int)$user['company_id'], (int)$user['id'], strtolower((string)post('payment_method')), $_POST);
@@ -2413,6 +2975,56 @@ function handle_post(): void
         flash('Campanha excluida.');
         redirect('?page=campaigns');
     }
+
+    if ($action === 'save_global_telephony_mode' && is_platform_admin($user)) {
+        $mode = strtoupper((string)post('active_mode', 'NVOIP_DIRECT'));
+        if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true)) {
+            flash('Provedor de telefonia invalido.', 'error');
+            redirect('?page=settings#integracoes-cadastradas');
+        }
+        $asterisk = asterisk_config();
+        if ($mode === 'ASTERISK' && empty($asterisk['enabled'])) {
+            flash('Habilite e configure o Asterisk antes de torna-lo o provedor ativo.', 'error');
+            redirect('?page=settings#asterisk');
+        }
+        db()->prepare("INSERT INTO asterisk_settings (id, active_mode, updated_by, updated_at) VALUES (1, ?, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET active_mode = excluded.active_mode, updated_by = excluded.updated_by, updated_at = excluded.updated_at")
+            ->execute([$mode, (int)$user['id']]);
+        audit('atualizou_provedor_telefonia', 'asterisk_settings:1', null, ['active_mode' => $mode]);
+        flash('Provedor ativo para novas chamadas: ' . ($mode === 'ASTERISK' ? 'Asterisk' : 'Nvoip nativa') . '.');
+        redirect('?page=settings#integracoes-cadastradas');
+    }
+    if (($action === 'save_asterisk_settings' || $action === 'test_asterisk_connection') && is_platform_admin($user)) {
+        $existing = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
+        if ($action === 'test_asterisk_connection') {
+            try {
+                $health = (new AsteriskProvider(asterisk_config()))->health();
+                flash(!empty($health['ari']) ? 'Conexao ARI validada.' : 'ARI nao respondeu. Confira URL, usuario e senha.', !empty($health['ari']) ? 'ok' : 'error');
+            } catch (Throwable $e) {
+                flash('Falha ao testar Asterisk: ' . $e->getMessage(), 'error');
+            }
+            redirect('?page=settings#asterisk');
+        }
+        $mode = strtoupper((string)post('active_mode', 'NVOIP_DIRECT'));
+        $route = strtoupper((string)post('active_route', 'NVOIP_TRUNK'));
+        if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) {
+            flash('Modo ou rota Asterisk invalida.', 'error'); redirect('?page=settings#asterisk');
+        }
+        $ariUrl = trim((string)post('ari_url'));
+        $ariWsUrl = trim((string)post('ari_ws_url'));
+        if ((int)post('enabled') === 1 && (!filter_var($ariUrl, FILTER_VALIDATE_URL) || !filter_var($ariWsUrl, FILTER_VALIDATE_URL))) {
+            flash('Informe URLs ARI e WebSocket validas para habilitar o Asterisk.', 'error'); redirect('?page=settings#asterisk');
+        }
+        $password = trim((string)post('ari_password'));
+        $encrypted = $password !== '' ? encrypt_secret($password) : (string)($existing['ari_password_encrypted'] ?? '');
+        db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, updated_by, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
+            ->execute([(int)post('enabled'), (string)post('environment', 'test'), $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $encrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), trim((string)post('sip_wss_url')), trim((string)post('sip_domain')), trim((string)post('consultant_endpoint')), trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', trim((string)post('directcall_trunk', 'DIRECTCALL_TRUNK')) ?: 'DIRECTCALL_TRUNK', trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', (int)$user['id']]);
+        audit('atualizou_asterisk', 'asterisk_settings:1');
+        flash('Configuracao Asterisk salva. O modo atual para novas chamadas e ' . $mode . '.');
+        redirect('?page=settings#asterisk');
+    }
+
 
     if (($action === 'save_integration_settings' || $action === 'save_nvoip_settings') && can('settings')) {
         $provider = integration_provider_key((string)post('provider'));
@@ -4332,11 +4944,18 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
         return false;
     }
 
-    $providerCall = make_provider_call($campaign, $contact, $agent ?: []);
+    $asterisk = asterisk_config();
+    if (!empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK') {
+        $active = (int)scalar("SELECT COUNT(*) FROM calls WHERE company_id = ? AND telephony_mode = 'ASTERISK' AND status IN ('in_progress','calling_origin','ringing','answered')", [$companyId]);
+        if ($active >= 1) {
+            flash('O modo Asterisk permite somente uma chamada simultanea nesta etapa.', 'error');
+            return false;
+        }
+    }    $providerCall = make_provider_call($campaign, $contact, $agent ?: []);
     if (!$providerCall['ok']) {
         db()->prepare("INSERT INTO call_events (company_id, event_name, old_status, new_status, payload) VALUES (?, 'call.provider_failed', 'reserved', 'failed', ?)")
             ->execute([$companyId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
-        log_call_status($companyId, null, 'Nvoip', (string)($providerCall['status'] ?? 'failed'), (string)($providerCall['message'] ?? 'provider_failed'), (array)($providerCall['payload'] ?? []));
+        log_call_status($companyId, null, (string)($providerCall['provider'] ?? 'Nvoip'), (string)($providerCall['status'] ?? 'failed'), (string)($providerCall['message'] ?? 'provider_failed'), (array)($providerCall['payload'] ?? []));
         db()->prepare("UPDATE contacts SET status = 'novo', reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ? AND attempts = 0")
             ->execute([$contactId]);
         flash($providerCall['message'], 'error');
@@ -4348,16 +4967,16 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
     $attemptNumber = max(1, (int)($contact['attempts'] ?? 0) + 1);
     $internalStatus = normalize_call_attempt_status((string)$providerCall['status'], ['event' => 'start']);
     $billingRateMicros = call_plan_rate_micros($companyId);
-    db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, started_at, ringing_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)")
-        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $providerCall['status'], (string)$providerCall['status'], $internalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], $answeredAt]);
+    db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, telephony_mode, telephony_trunk, provider_channel_id, provider_linked_id, provider_bridge_id, started_at, ringing_at, answered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)")
+        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $providerCall['status'], (string)$providerCall['status'], $internalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], (string)($providerCall['telephony_mode'] ?? 'NVOIP_DIRECT'), (string)($providerCall['telephony_trunk'] ?? 'NVOIP_DIRECT'), (string)($providerCall['provider_channel_id'] ?? ''), (string)($providerCall['provider_linked_id'] ?? ''), (string)($providerCall['provider_bridge_id'] ?? ''), $answeredAt]);
     $callId = (int)db()->lastInsertId();
     db()->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contactId]);
     $nextAgentStatus = (($agent['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
     db()->prepare("UPDATE users SET status = ? WHERE id = ?")->execute([$nextAgentStatus, $agentId]);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.started', 'reserved', 'in_progress', ?)")
         ->execute([$companyId, $callId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
-    log_call_status($companyId, $callId, 'Nvoip', (string)$providerCall['status'], 'call_started', (array)$providerCall['payload']);
+    log_call_status($companyId, $callId, (string)($providerCall['provider'] ?? 'Nvoip'), (string)$providerCall['status'], 'call_started', (array)$providerCall['payload']);
     audit('iniciou_ligacao', 'calls:' . $callId);
     flash($providerCall['message']);
     return true;
@@ -4446,6 +5065,10 @@ function finish_call(int $callId, int $resultId, string $notes, int $companyId):
         return;
     }
 
+    if ((string)($call['telephony_mode'] ?? '') === 'ASTERISK') {
+        try { (new AsteriskProvider(asterisk_config()))->hangup($call); }
+        catch (Throwable $e) { log_call_status($companyId, $callId, 'Asterisk ARI', 'hangup_failed', $e->getMessage()); }
+    }
     $duration = max(0, (int)($call['duration_seconds'] ?? 0));
     if (!empty($call['started_at'])) {
         $startedAt = strtotime((string)$call['started_at']);
@@ -4539,6 +5162,10 @@ function quick_hangup(int $callId, int $companyId): void
     if (!$call) {
         flash('Nenhuma chamada ativa para encerrar.', 'error');
         return;
+    }
+    if ((string)($call['telephony_mode'] ?? '') === 'ASTERISK') {
+        try { (new AsteriskProvider(asterisk_config()))->hangup($call); }
+        catch (Throwable $e) { log_call_status($companyId, $callId, 'Asterisk ARI', 'hangup_failed', $e->getMessage()); }
     }
     $duration = max(0, (int)($call['duration_seconds'] ?? 0));
     if (!empty($call['started_at'])) {
@@ -5283,6 +5910,144 @@ if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_template'])) {
     download_csv_template();
 }
 
+function asterisk_event_key(array $event): string
+{
+    $channelId = (string)($event['channel']['id'] ?? $event['channel']['name'] ?? '');
+    return hash('sha256', implode('|', [(string)($event['timestamp'] ?? ''), (string)($event['type'] ?? ''), $channelId, json_encode_safe($event)]));
+}
+
+function asterisk_normalized_event_status(array $event): array
+{
+    $type = (string)($event['type'] ?? '');
+    $state = strtolower((string)($event['channel']['state'] ?? ''));
+    if ($type === 'StasisStart') return ['in_progress', 'iniciada'];
+    if ($type === 'ChannelAnswered' || $state === 'up') return ['answered', 'atendida'];
+    if ($type === 'ChannelStateChange' && in_array($state, ['ring', 'ringing'], true)) return ['ringing', 'chamando'];
+    if (in_array($type, ['ChannelDestroyed', 'StasisEnd'], true)) {
+        $cause = (int)($event['cause'] ?? $event['channel']['cause'] ?? 0);
+        return [in_array($cause, [16, 0], true) ? 'completed' : 'failed', in_array($cause, [16, 0], true) ? 'atendida' : 'falha'];
+    }
+    return ['', ''];
+}
+
+function asterisk_event_transition(array $event, array $call): array
+{
+    $type = strtolower((string)($event['type'] ?? ''));
+    $state = strtolower((string)($event['channel']['state'] ?? ''));
+    $cause = (int)($event['cause'] ?? $event['channel']['cause'] ?? -1);
+    $answered = !empty($call['answered_at']) || in_array((string)$call['internal_status'], ['atendida', 'conectada'], true);
+    if ($type === 'channelcreated' || $type === 'stasisstart') return ['in_progress', 'iniciada', false];
+    if ($type === 'channelstatechange' && in_array($state, ['ring', 'ringing'], true)) return ['ringing', 'chamando', false];
+    if ($type === 'channelanswered' || ($type === 'channelstatechange' && $state === 'up')) return ['answered', 'atendida', false];
+    if ($type === 'bridgeenter' && !empty($event['bridge']['id'])) return ['connected', 'conectada', false];
+    if (!in_array($type, ['channeldestroyed', 'stasisend'], true)) return ['', '', false];
+    if (in_array($cause, [17], true)) return ['busy', 'ocupado', true];
+    if (in_array($cause, [18, 19], true)) return ['no_answer', 'nao_atendida', true];
+    if (in_array($cause, [1, 3, 28], true)) return ['invalid_number', 'numero_inexistente', true];
+    if (in_array($cause, [21], true)) return ['failed', 'falha', true];
+    if (in_array($cause, [16, 0], true)) return [$answered ? 'completed' : 'no_answer', $answered ? 'atendida' : 'nao_atendida', true];
+    return ['failed', 'falha', true];
+}
+
+function asterisk_handle_event(array $event): void
+{
+    $eventKey = asterisk_event_key($event);
+    $channelId = (string)($event['channel']['id'] ?? '');
+    $linkedId = (string)($event['channel']['linkedid'] ?? '');
+    $eventType = (string)($event['type'] ?? 'unknown');
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $saved = $pdo->prepare("INSERT OR IGNORE INTO asterisk_ari_events (event_key, event_type, payload_json) VALUES (?, ?, ?)");
+        $saved->execute([$eventKey, $eventType, json_encode_safe($event)]);
+        if ($saved->rowCount() === 0) { $pdo->commit(); return; }
+        $call = $channelId !== '' ? one('SELECT * FROM calls WHERE provider_channel_id = ? ORDER BY id DESC LIMIT 1', [$channelId]) : null;
+        if (!$call && $linkedId !== '') $call = one('SELECT * FROM calls WHERE provider_linked_id = ? ORDER BY id DESC LIMIT 1', [$linkedId]);
+        if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') { $pdo->commit(); return; }
+        $pdo->prepare('UPDATE asterisk_ari_events SET call_id = ? WHERE event_key = ?')->execute([(int)$call['id'], $eventKey]);
+        $terminal = !empty($call['finalized_at']);
+        [$status, $internal, $isFinal] = asterisk_event_transition($event, $call);
+        if ($status === '' || $terminal) { $pdo->commit(); return; }
+        $rawCause = trim((string)($event['cause_txt'] ?? $event['cause'] ?? ''));
+        $sets = ['status = ?', 'provider_status_raw = ?', 'internal_status = ?', "provider_channel_id = COALESCE(NULLIF(?, ''), provider_channel_id)", "provider_linked_id = COALESCE(NULLIF(?, ''), provider_linked_id)", "last_event_at = datetime('now')", "event_origin = 'ASTERISK_ARI'"];
+        $params = [$status, $eventType . ($rawCause !== '' ? ' - ' . $rawCause : ''), $internal, $channelId, $linkedId];
+        if ($internal === 'atendida') $sets[] = "answered_at = COALESCE(answered_at, datetime('now'))";
+        if ($internal === 'conectada') { $sets[] = "answered_at = COALESCE(answered_at, datetime('now'))"; $sets[] = "connected_at = COALESCE(connected_at, datetime('now'))"; }
+        if ($isFinal) { $sets[] = "ended_at = COALESCE(ended_at, datetime('now'))"; $sets[] = "finalized_at = COALESCE(finalized_at, datetime('now'))"; $sets[] = 'hangup_cause = ?'; $sets[] = "error_message = COALESCE(NULLIF(?, ''), error_message)"; $params[] = $rawCause; $params[] = $rawCause; }
+        $params[] = (int)$call['id'];
+        $pdo->prepare('UPDATE calls SET ' . implode(', ', $sets) . ' WHERE id = ?')->execute($params);
+        $pdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, ?, ?, ?)")
+            ->execute([(int)$call['company_id'], (int)$call['id'], 'asterisk.' . strtolower($eventType), (string)$call['status'], $status, json_encode_safe($event)]);
+        $pdo->commit();
+        if ($isFinal) {
+            $updated = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)$call['id'], (int)$call['company_id']]);
+            if ($updated) {
+                $answered = !empty($updated['answered_at']);
+                $duration = $answered && !empty($updated['answered_at']) ? max(0, time() - (int)strtotime((string)$updated['answered_at'])) : 0;
+                $billable = call_billable_seconds($updated, $duration, $answered, $event['billsec'] ?? $event['billable_seconds'] ?? null);
+                $billing = call_billing_values($updated, $billable);
+                db()->prepare("UPDATE calls SET duration_seconds = ?, billable_seconds = ?, estimated_cost_micros = ?, confirmed_cost = ? WHERE id = ? AND finalized_at IS NOT NULL")
+                    ->execute([$duration, $billable, (int)$billing['cost_micros'], (int)$billing['cost_micros'] / 1000000, (int)$updated['id']]);
+                telephony_record_call_debit($updated, $billing, (int)$updated['agent_id']);
+            }
+        }
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+}
+final class AsteriskAriWebSocket
+{
+    private $socket = null;
+    public function __construct(private array $config) {}
+    public function connect(): void
+    {
+        $url = (string)($this->config['ari_ws_url'] ?? '');
+        if ($url === '') throw new RuntimeException('URL WebSocket ARI nao configurada.');
+        $parts = parse_url($url);
+        if (!$parts || !in_array($parts['scheme'] ?? '', ['ws', 'wss'], true) || empty($parts['host'])) throw new RuntimeException('URL WebSocket ARI invalida.');
+        $scheme = ($parts['scheme'] === 'wss') ? 'tls' : 'tcp';
+        $port = (int)($parts['port'] ?? ($parts['scheme'] === 'wss' ? 443 : 80));
+        $errno = 0; $error = '';
+        $this->socket = @stream_socket_client($scheme . '://' . $parts['host'] . ':' . $port, $errno, $error, 10, STREAM_CLIENT_CONNECT);
+        if (!$this->socket) throw new RuntimeException('Nao foi possivel conectar ao WebSocket ARI.');
+        stream_set_timeout($this->socket, 10);
+        $path = ($parts['path'] ?? '/ari/events');
+        parse_str($parts['query'] ?? '', $query);
+        $query['app'] = (string)$this->config['stasis_app'];
+        $query['api_key'] = (string)$this->config['ari_username'] . ':' . (string)$this->config['ari_password'];
+        $path .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+        $key = base64_encode(random_bytes(16));
+        $host = $parts['host'] . (($port === 80 || $port === 443) ? '' : ':' . $port);
+        fwrite($this->socket, "GET {$path} HTTP/1.1\r\nHost: {$host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {$key}\r\nSec-WebSocket-Version: 13\r\n\r\n");
+        $response = '';
+        while (!str_contains($response, "\r\n\r\n") && !feof($this->socket)) $response .= (string)fgets($this->socket);
+        if (!str_contains($response, ' 101 ')) { $this->close(); throw new RuntimeException('Handshake WebSocket ARI recusado.'); }
+    }
+    private function bytes(int $length): string
+    {
+        $data = '';
+        while (strlen($data) < $length && !feof($this->socket)) { $part = fread($this->socket, $length - strlen($data)); if ($part === false || $part === '') break; $data .= $part; }
+        return $data;
+    }
+    public function readEvent(int $timeoutSeconds = 10): ?array
+    {
+        if (!$this->socket) return null;
+        stream_set_timeout($this->socket, $timeoutSeconds);
+        $head = $this->bytes(2); if (strlen($head) < 2) return null;
+        $opcode = ord($head[0]) & 0x0f; $length = ord($head[1]) & 0x7f;
+        if ($length === 126) { $raw = $this->bytes(2); if (strlen($raw) < 2) return null; $length = unpack('n', $raw)[1]; }
+        elseif ($length === 127) { $raw = $this->bytes(8); if (strlen($raw) < 8) return null; $size = unpack('N2', $raw); $length = $size[1] * 4294967296 + $size[2]; }
+        if ($length > 1048576) throw new RuntimeException('Evento ARI excede o limite permitido.');
+        $payload = $this->bytes((int)$length);
+        if ($opcode === 8) return null;
+        if ($opcode !== 1 || $payload === '') return null;
+        $event = json_decode($payload, true);
+        return is_array($event) ? $event : null;
+    }
+    public function close(): void { if (is_resource($this->socket)) fclose($this->socket); $this->socket = null; }
+}
+if (!defined('LIGFLOW_ARI_WORKER')) {
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
     handle_post();
 }
@@ -5326,6 +6091,7 @@ function layout(string $page, callable $content): void
         'settings' => 'Integracoes',
         'agent' => 'Discador',
         'campaigns' => 'Campanhas',
+        'radar' => 'Radar de Leads',
         'supervisor' => 'Chamadas',
         'costs' => 'Plano e consumo',
         'account' => 'Minha conta',
@@ -5356,6 +6122,7 @@ function layout(string $page, callable $content): void
                 'users' => 'Acessos',
                 'lists' => 'Contatos e Listas',
                 'campaigns' => 'Campanhas',
+                'radar' => 'Radar de Leads',
                 'agent' => 'Discador',
                 'supervisor' => 'Chamadas',
                 'reports' => 'Relatorios',
@@ -6697,6 +7464,83 @@ function render_campaigns(): void
     <?php });
 }
 
+function render_radar(): void
+{
+    layout('radar', function () {
+        $user = current_user();
+        $stored = $_SESSION['radar_leads'] ?? [];
+        $sameTenant = (int)($stored['company_id'] ?? 0) === (int)$user['company_id'];
+        $filters = $sameTenant && is_array($stored['filters'] ?? null) ? $stored['filters'] : [];
+        $places = $sameTenant && is_array($stored['places'] ?? null) ? $stored['places'] : [];
+        $targetCount = max(1, (int)($stored['target_count'] ?? 20));
+        $activeListId = $sameTenant ? (int)($stored['list_id'] ?? 0) : 0;
+        $listRows = rows("SELECT l.id,l.name,l.radar_target_leads,COUNT(c.id) contact_count FROM contact_lists l LEFT JOIN contacts c ON c.list_id=l.id AND c.status <> 'excluido' WHERE l.company_id=? GROUP BY l.id ORDER BY l.id DESC", [(int)$user['company_id']]);
+        $historyListIds = [];
+        if ($places) {
+            $marks = implode(',', array_fill(0, count($places), '?'));
+            foreach (rows("SELECT place_id,list_id FROM radar_lead_history WHERE company_id=? AND place_id IN ($marks)", array_merge([(int)$user['company_id']], array_column($places, 'place_id'))) as $history) {
+                $historyListIds[(string)$history['place_id']] = (int)($history['list_id'] ?? 0);
+            }
+        }
+        $activeList = null;
+        foreach ($listRows as $row) if ((int)$row['id'] === $activeListId) { $activeList = $row; break; }
+        $activeTotal = (int)($activeList['contact_count'] ?? 0);
+        ?>
+        <section class="panel">
+            <div class="section-head">
+                <div><h2>Radar de Leads</h2><p>Encontre empresas novas no Google Places, sem repetir empresas ja apresentadas ou importadas.</p></div>
+            </div>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="search_radar_leads">
+                <label>Segmento<input name="segment" required value="<?= h((string)($filters['segment'] ?? '')) ?>" placeholder="Ex: imobiliaria, construtora"></label>
+                <label>Estado<input name="state" required maxlength="2" value="<?= h((string)($filters['state'] ?? '')) ?>" placeholder="PR"></label>
+                <label>Cidade<input name="city" required value="<?= h((string)($filters['city'] ?? '')) ?>" placeholder="Curitiba"></label>
+                <label>Bairro<input name="neighborhood" value="<?= h((string)($filters['neighborhood'] ?? '')) ?>" placeholder="Opcional"></label>
+                <label>Rua<input name="street" value="<?= h((string)($filters['street'] ?? '')) ?>" placeholder="Opcional"></label>
+                <label>Quantidade desejada<input name="target_count" type="number" min="1" max="1000" value="<?= h((string)$targetCount) ?>"></label>
+                <label class="check"><input type="checkbox" name="only_with_phone" <?= !empty($filters['only_with_phone']) ? 'checked' : '' ?>> Somente com telefone</label>
+                <button class="button" type="submit">Buscar empresas</button>
+            </form>
+        </section>
+        <?php if ($places): ?>
+        <section class="panel">
+            <div class="section-head"><div><h2>Empresas encontradas</h2><p>Meta: <?= h((string)$targetCount) ?> | Lista atual: <?= h((string)$activeTotal) ?> | Novas nesta busca: <?= h((string)count($places)) ?> | Descartadas: <?= h((string)($stored['discarded'] ?? 0)) ?></p></div></div>
+            <form method="post">
+                <div class="form-grid compact-form">
+                    <label>Nome da nova lista<input name="list_name" value="<?= h('Radar ' . ($filters['segment'] ?? '') . ' - ' . ($filters['city'] ?? '')) ?>"></label>
+                    <label>Meta da lista<input name="target_count" type="number" min="1" max="1000" value="<?= h((string)$targetCount) ?>"></label>
+                    <label>Adicionar em lista existente<select name="list_id"><option value="">Selecione</option><?php foreach ($listRows as $list): ?><option value="<?= (int)$list['id'] ?>" <?= (int)$list['id'] === $activeListId ? 'selected' : '' ?>><?= h($list['name']) ?> (<?= (int)$list['contact_count'] ?>)</option><?php endforeach; ?></select></label>
+                    <button class="button" type="submit" name="action" value="create_radar_list">Criar lista</button>
+                    <button class="button secondary" type="submit" name="action" value="add_radar_to_list">Adicionar selecionadas</button>
+                </div>
+            <div class="table-wrap"><table>
+                <thead><tr><th><input type="checkbox" data-radar-select-all></th><th>Nome</th><th>Telefone</th><th>Endereco</th><th>Site</th><th>Nota</th><th>Google Maps</th><th>Status</th></tr></thead>
+                <tbody><?php foreach ($places as $place): ?>
+                    <?php $linkedListId = (int)($historyListIds[$place['place_id']] ?? 0); $canSelect = $place['phone'] !== '' && $linkedListId === 0; ?>
+                    <tr>
+                        <td><?= $canSelect ? '<input type="checkbox" name="place_ids[]" value="' . h($place['place_id']) . '">' : '' ?></td>
+                        <td><?= h($place['name']) ?></td>
+                        <td><?= h($place['phone'] ?: '-') ?></td>
+                        <td><?= h($place['address'] ?: '-') ?></td>
+                        <td><?= $place['website'] ? '<a class="mini-link" href="' . h($place['website']) . '" target="_blank" rel="noopener">Abrir site</a>' : '-' ?></td>
+                        <td><?= h($place['rating']) ?></td>
+                        <td><?= $place['maps_url'] ? '<a class="mini-link" href="' . h($place['maps_url']) . '" target="_blank" rel="noopener">Ver no Maps</a>' : '-' ?></td>
+                        <td><span class="status-badge <?= $linkedListId ? 'called' : '' ?>"><?= $linkedListId ? 'Adicionada a lista' : ($place['phone'] === '' ? 'Sem telefone' : 'Nova') ?></span></td>
+                    </tr>
+                <?php endforeach; ?></tbody>
+            </table></div>
+            </form>
+            <div class="actions-row">
+                <?php if (!empty($stored['next_page_token'])): ?><form method="post"><input type="hidden" name="action" value="search_radar_more"><button class="button secondary" type="submit">Buscar mais empresas</button></form><?php else: ?><span class="muted">Nao ha mais empresas disponiveis para estes filtros.</span><?php endif; ?>
+                <?php if ($activeListId): ?><form method="post" class="inline-form"><input type="hidden" name="action" value="create_radar_campaign"><input type="hidden" name="list_id" value="<?= $activeListId ?>"><input name="campaign_name" placeholder="Nome da campanha (opcional)"><button class="button" type="submit">Criar campanha</button></form><?php endif; ?>
+            </div>
+        </section>
+        <?php elseif ($sameTenant && $filters): ?>
+        <section class="panel"><p class="empty">Nenhuma empresa encontrada para os filtros informados.</p></section>
+        <?php endif; ?>
+    <?php });
+}
+
 function render_agent(): void
 {
     layout('agent', function () {
@@ -7797,8 +8641,25 @@ function render_settings(): void
         $webhookIsLocal = preg_match('~https?://(localhost|127\.0\.0\.1)~i', $webhookUrl) === 1;
         $mpConfig = mercado_pago_config();
         $mpStored = one('SELECT * FROM payment_settings WHERE id=1') ?: [];
+        $googlePlacesConfig = google_places_config();
+        $googlePlacesStored = one('SELECT * FROM google_places_settings WHERE id=1') ?: [];
+        $telephonyModeConfig = asterisk_config();
         ?>
         <?php if (is_platform_admin($user)): ?>
+        <details class="panel import-history-disclosure" id="google-places">
+            <summary><span>Google Places API</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <div class="import-history-content">
+                <div class="section-head"><div><h2>Google Places API (New)</h2><p>Configuracao global para o Radar de Leads. A chave nunca e enviada ao navegador.</p></div><span class="status-badge <?= $googlePlacesConfig['active'] ? 'called' : '' ?>"><?= $googlePlacesConfig['active'] ? 'Ativa' : 'Inativa' ?></span></div>
+                <form method="post" class="form-grid">
+                    <input type="hidden" name="action" value="save_google_places_settings">
+                    <label class="check"><input type="checkbox" name="google_places_active" <?= $googlePlacesConfig['active'] ? 'checked' : '' ?>> Integracao ativa</label>
+                    <label>Chave da API<input type="password" name="google_places_api_key" placeholder="<?= h(masked_secret((string)($googlePlacesStored['api_key_encrypted'] ?? '')) ?: 'Cole a chave do Google Places') ?>"></label>
+                    <p class="hint wide">Restrinja a chave no Google Cloud para Places API (New) e para os domínios/IPs permitidos do LigFlow.</p>
+                    <button class="button" type="submit">Salvar Google Places</button>
+                </form>
+                <form method="post"><input type="hidden" name="action" value="test_google_places"><button class="button secondary" type="submit">Testar conexao</button></form>
+            </div>
+        </details>
         <details class="panel import-history-disclosure" id="mercado-pago">
             <summary><span>Mercado Pago</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
@@ -7820,9 +8681,27 @@ function render_settings(): void
             </div>
         </details>
         <?php endif; ?>
-        <details class="panel import-history-disclosure">
+        <details class="panel import-history-disclosure" id="integracoes-cadastradas">
             <summary><span>Integracoes cadastradas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
+                        <?php if (is_platform_admin($user)): ?>
+                <div class="section-head">
+                    <div>
+                        <h2>Telefonia ativa da plataforma</h2>
+                        <p>Define o provedor usado nas novas chamadas de todos os usuarios.</p>
+                    </div>
+                    <form method="post" class="inline">
+                        <input type="hidden" name="action" value="save_global_telephony_mode">
+                        <label>Provedor ativo
+                            <select name="active_mode">
+                                <option value="NVOIP_DIRECT" <?= $telephonyModeConfig['active_mode'] === 'NVOIP_DIRECT' ? 'selected' : '' ?>>Nvoip (nativa)</option>
+                                <option value="ASTERISK" <?= $telephonyModeConfig['active_mode'] === 'ASTERISK' ? 'selected' : '' ?> <?= empty($telephonyModeConfig['enabled']) ? 'disabled' : '' ?>>Asterisk<?= empty($telephonyModeConfig['enabled']) ? ' (configure primeiro)' : '' ?></option>
+                            </select>
+                        </label>
+                        <button class="button" type="submit">Salvar provedor ativo</button>
+                    </form>
+                </div>
+            <?php endif; ?>
             <div class="section-head">
                 <div>
                     <h2>Integrações</h2>
@@ -7853,10 +8732,11 @@ function render_settings(): void
             </form>
             </div>
         </details>
-        <section class="grid two">
+        <section>
             <details class="panel import-history-disclosure" <?= isset($_GET['new']) || isset($_GET['provider']) ? 'open' : '' ?>>
-                <summary><span><?= $isNew ? 'Nova integracao' : 'Configuracao da integracao' ?></span><span class="import-history-chevron" aria-hidden="true"></span></summary>
-            <form class="form-grid import-history-content" method="post">
+                <summary><span><?= $isNew ? 'Nova integracao' : 'Configuracao e status da integracao' ?></span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <div class="grid two import-history-content">
+            <form class="form-grid" method="post">
                 <input type="hidden" name="action" value="save_integration_settings">
                 <input type="hidden" name="company_id" value="<?= (int)$companyId ?>">
                 <h2><?= $isNew ? 'Nova integração' : 'Editar integração' ?></h2>
@@ -7896,10 +8776,7 @@ function render_settings(): void
                 <button class="button">Salvar integração</button>
                 <p class="hint">Todos os campos são opcionais, exceto nome ou identificador. Campos de senha vazios mantêm o valor salvo ao editar.</p>
             </form>
-            </details>
-            <details class="panel import-history-disclosure">
-                <summary><span>Status da integracao</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
-            <article class="import-history-content">
+            <article class="form-grid">
                 <h2>Status da integração</h2>
                 <dl>
                     <dt>Integração</dt><dd><?= h(($config['integration_name'] ?: strtoupper((string)$config['provider'])) ?: 'Nova') ?></dd>
@@ -7934,19 +8811,63 @@ function render_settings(): void
                     <div class="flash error">Este webhook esta em localhost. Para a Nvoip enviar status e gravacoes, configure uma URL publica HTTPS do LigFlow.</div>
                 <?php endif; ?>
             </article>
+            </div>
             </details>
         </section>
+        <?php render_asterisk_settings_section(); ?>
         <?php render_sip_diagnostic_sections(); ?>
     <?php });
 }
 
+function render_asterisk_settings_section(): void
+{
+    $user = current_user();
+    if (!is_platform_admin($user)) return;
+    $saved = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
+    $config = asterisk_config();
+    $hasPassword = !empty($saved['ari_password_encrypted']);
+    ?>
+    <section>
+        <details class="panel import-history-disclosure" id="asterisk">
+            <summary><span>Asterisk (ARI)</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <form class="form-grid import-history-content" method="post">
+                <input type="hidden" name="action" value="save_asterisk_settings">
+                <h2>Telefonia via Asterisk</h2>
+                <p class="hint wide">Apenas novas chamadas usam o modo selecionado. Chamadas iniciadas preservam permanentemente sua rota e tronco.</p>
+                <label class="check"><input type="checkbox" name="enabled" value="1" <?= !empty($config['enabled']) ? 'checked' : '' ?>> Asterisk habilitado</label>
+                <label>Ambiente<select name="environment"><option value="test" <?= $config['environment'] === 'test' ? 'selected' : '' ?>>Teste</option><option value="production" <?= $config['environment'] === 'production' ? 'selected' : '' ?>>Producao</option></select></label>
+                <label>Modo ativo para novas chamadas<select name="active_mode"><option value="NVOIP_DIRECT" <?= $config['active_mode'] === 'NVOIP_DIRECT' ? 'selected' : '' ?>>NVOIP_DIRECT</option><option value="ASTERISK" <?= $config['active_mode'] === 'ASTERISK' ? 'selected' : '' ?>>ASTERISK</option></select></label>
+                <label>Rota ativa no Asterisk<select name="active_route"><option value="NVOIP_TRUNK" <?= $config['active_route'] === 'NVOIP_TRUNK' ? 'selected' : '' ?>>Nvoip (NVOIP_TRUNK)</option><option value="DIRECTCALL_TRUNK" <?= $config['active_route'] === 'DIRECTCALL_TRUNK' ? 'selected' : '' ?>>DirectCall (DIRECTCALL_TRUNK)</option></select></label>
+                <label>URL do ARI<input name="ari_url" type="url" value="<?= h($config['ari_url']) ?>" placeholder="https://asterisk.exemplo/ari"></label>
+                <label>URL WebSocket ARI<input name="ari_ws_url" type="url" value="<?= h($config['ari_ws_url']) ?>" placeholder="wss://asterisk.exemplo/ari/events"></label>
+                <label>Usuario ARI<input name="ari_username" value="<?= h($config['ari_username']) ?>"></label>
+                <label>Senha ARI<input name="ari_password" type="password" placeholder="<?= $hasPassword ? 'Senha salva (deixe vazio para manter)' : 'Senha ARI' ?>"></label>
+                <label>Aplicacao Stasis<input name="stasis_app" value="<?= h($config['stasis_app']) ?>"></label>
+                <label>Ramal/endpoint do consultor<input name="consultant_endpoint" value="<?= h($config['consultant_endpoint']) ?>" placeholder="PJSIP/1001"></label>
+                <label>Timeout de originacao (segundos)<input name="originate_timeout_seconds" type="number" min="5" value="<?= (int)$config['originate_timeout_seconds'] ?>"></label>
+                <label>Timeout de bridge (segundos)<input name="bridge_timeout_seconds" type="number" min="5" value="<?= (int)$config['bridge_timeout_seconds'] ?>"></label>
+                <label>Reconexao inicial (segundos)<input name="reconnect_initial_seconds" type="number" min="1" value="<?= (int)$config['reconnect_initial_seconds'] ?>"></label>
+                <label>Reconexao maxima (segundos)<input name="reconnect_max_seconds" type="number" min="2" value="<?= (int)$config['reconnect_max_seconds'] ?>"></label>
+                <label>WSS SIP/WebRTC<input name="sip_wss_url" type="url" value="<?= h($config['sip_wss_url']) ?>"></label>
+                <label>Dominio SIP/WebRTC<input name="sip_domain" value="<?= h($config['sip_domain']) ?>"></label>
+                <label>Tronco Nvoip<input name="nvoip_trunk" value="<?= h($config['nvoip_trunk']) ?>" readonly></label>
+                <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" readonly></label>
+                <label class="wide">Configuracao operacional Nvoip (JSON)<textarea name="nvoip_trunk_config_json" rows="2"><?= h((string)($saved['nvoip_trunk_config_json'] ?? '{}')) ?></textarea></label>
+                <label class="wide">Configuracao operacional DirectCall (JSON)<textarea name="directcall_trunk_config_json" rows="2"><?= h((string)($saved['directcall_trunk_config_json'] ?? '{}')) ?></textarea></label>
+                <div class="script-box wide"><strong>Saude configurada</strong><p>Servidor/ARI: <?= $config['ari_url'] && $config['ari_username'] && $hasPassword ? 'configurado' : 'pendente' ?>; WebSocket: <?= $config['ari_ws_url'] ? 'configurado' : 'pendente' ?>; WebRTC: <?= $config['sip_wss_url'] && $config['sip_domain'] ? 'configurado' : 'pendente' ?>; NVOIP_TRUNK e DIRECTCALL_TRUNK: configuracao separada pronta. Use Testar conexao para validar o ARI.</p></div>
+                <div class="button-row wide"><button class="button">Salvar Asterisk</button><button class="button secondary" name="action" value="test_asterisk_connection">Testar conexao</button></div>
+            </form>
+        </details>
+    </section>
+    <?php
+}
 function render_sip_diagnostic_sections(): void
 {
     $config = nvoip_config((int)current_user()['company_id']);
     ?>
-        <section class="grid two">
+        <section>
             <details class="panel import-history-disclosure" id="diagnostico-sip" <?= isset($_GET['sip']) ? 'open' : '' ?>>
-                <summary><span>Diagnostico SIP/WebRTC Nvoip</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+                <summary><span>Diagnostico SIP/WebRTC e status do webphone</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <form class="form-grid import-history-content" method="post" data-sip-diagnostic>
                 <input type="hidden" name="action" value="save_sip_diagnostic_config">
                 <h2>Diagnostico SIP/WebRTC Nvoip</h2>
@@ -7973,9 +8894,6 @@ function render_sip_diagnostic_sections(): void
                 </div>
                 <audio id="nvoip-remote-audio" autoplay></audio>
             </form>
-            </details>
-            <details class="panel import-history-disclosure" <?= isset($_GET['sip']) ? 'open' : '' ?>>
-                <summary><span>Status do webphone</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <article class="import-history-content">
                 <h2>Status do webphone</h2>
                 <dl class="sip-status-grid">
@@ -8136,6 +9054,7 @@ match ($page) {
     'teams' => render_teams(),
     'lists' => render_lists(),
     'campaigns' => render_campaigns(),
+    'radar' => render_radar(),
     'agent' => render_agent(),
     'supervisor' => render_supervisor(),
     'reports' => render_reports(),
@@ -8148,3 +9067,4 @@ match ($page) {
     'audit' => render_audit(),
     default => render_dashboard(),
 };
+}

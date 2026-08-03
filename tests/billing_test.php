@@ -60,6 +60,10 @@ $assert(billing_telephony_balance_after($credit, $cost(60)['cost_micros']) === 1
 $assert(billing_telephony_balance_after($credit, $cost(10)['cost_micros']) === 199941667, '10 segundos debitam valor proporcional');
 $assert(billing_telephony_balance_after($credit, $cost(90)['cost_micros']) === 199475000, '90 segundos debitam valor proporcional');
 $assert(billing_telephony_balance_after($credit, $cost(0)['cost_micros']) === $credit, 'chamada nao atendida nao debita credito');
+$assert(billing_mvp_test_call_allowed(true, 'MVP'), 'MVP permite chamada de teste para admin');
+$assert(billing_mvp_test_call_allowed(true, 'mvp'), 'MVP ignora maiusculas');
+$assert(!billing_mvp_test_call_allowed(false, 'MVP'), 'MVP nao libera usuario comum');
+$assert(!billing_mvp_test_call_allowed(true, 'Start'), 'outro plano continua exigindo credito');
 $assert(!billing_telephony_call_allowed(true, 0, $rate035), 'saldo zerado bloqueia nova chamada');
 $assert(!billing_telephony_call_allowed(false, $credit, $rate035) && billing_operational_route_allowed(false, 'dashboard'), 'sem credito nao bloqueia demais funcoes');
 
