@@ -8796,22 +8796,17 @@ function render_settings(): void
                     <dt>Origem</dt><dd><?= h($config['origin_number'] ?: 'Não configurada') ?></dd>
                     <dt>Webhook</dt><dd><?= h($webhookUrl) ?></dd>
                 </dl>
-                <div class="script-box">
-                    <strong>Como usar</strong>
-                    <p>Use esta tela para cadastrar Nvoip ou qualquer outro provedor. Para Nvoip, use o identificador interno nvoip. O payload validado para chamadas é caller, called e bina. No payload opcional, {{destination}} e {{origin}} são enviados somente com dígitos, sem +.</p>
-                </div>
+                
                 <?php if ($urlWarning && $config['mode'] === 'api' && ($config['provider'] === 'nvoip' || $selectedProvider === 'nvoip')): ?>
                     <div class="flash error"><?= h($urlWarning) ?></div>
                 <?php endif; ?>
-                <div class="script-box">
-                    <strong>Webhook para configurar na Nvoip</strong>
-                    <p><?= h($webhookUrl . ($config['webhook_secret'] ? (str_contains($webhookUrl, '?') ? '&' : '?') . 'secret=' . $config['webhook_secret'] : '')) ?></p>
-                </div>
-                <?php if ($webhookIsLocal): ?>
-                    <div class="flash error">Este webhook esta em localhost. Para a Nvoip enviar status e gravacoes, configure uma URL publica HTTPS do LigFlow.</div>
-                <?php endif; ?>
+                
+                
             </article>
             </div>
+            <?php if ($webhookIsLocal): ?>
+                    <div class="flash error">Este webhook esta em localhost. Para a Nvoip enviar status e gravacoes, configure uma URL publica HTTPS do LigFlow.</div>
+                <?php endif; ?>
             </details>
         </section>
         <?php render_asterisk_settings_section(); ?>
