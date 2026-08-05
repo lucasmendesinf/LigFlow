@@ -7,14 +7,16 @@ $assert = static function (bool $condition, string $message) use (&$tests): void
     if (!$condition) throw new RuntimeException($message);
 };
 
-$effective = static function (int $campaign, int $team, int $tenant): int {
-    return max(1, min($campaign, $team, $tenant, 10));
+$effective = static function (int $campaign, int $team, int $tenant, int $teamInUse, int $tenantInUse, int $eligible): int {
+    return min($campaign, $team, $tenant, 10, max(0, $team - $teamInUse), max(0, $tenant - $tenantInUse), $eligible);
 };
 
-$assert($effective(1, 10, 10) === 1, 'single campaign remains single');
-$assert($effective(5, 3, 8) === 3, 'team limit reduces batch');
-$assert($effective(10, 10, 2) === 2, 'tenant limit reduces batch');
-$assert($effective(12, 20, 20) === 10, 'safety limit is ten');
+$assert($effective(1, 10, 10, 0, 0, 9) === 1, 'single campaign remains single');
+$assert($effective(5, 3, 8, 1, 0, 9) === 2, 'available team channels reduce batch');
+$assert($effective(10, 10, 2, 0, 1, 9) === 1, 'available tenant channels reduce batch');
+$assert($effective(12, 20, 20, 0, 0, 20) === 10, 'safety limit is ten');
+$assert($effective(5, 10, 10, 0, 0, 2) === 2, 'eligible contacts reduce batch');
+$assert($effective(5, 10, 2, 0, 2, 5) === 0, 'no free tenant channel prevents a batch');
 
 $db = new PDO('sqlite::memory:');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);

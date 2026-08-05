@@ -215,7 +215,7 @@ function migrate(PDO $pdo): void
             starts_at TEXT,
             ends_at TEXT,
             call_window TEXT DEFAULT '08:00-18:00',
-            max_attempts INTEGER DEFAULT 3,
+            max_attempts INTEGER DEFAULT 1,
             simultaneous_calls INTEGER NOT NULL DEFAULT 1,
             retry_interval_minutes INTEGER DEFAULT 240,
             priority INTEGER DEFAULT 1,
@@ -2999,7 +2999,7 @@ function handle_post(): void
     if ($action === 'create_campaign' && can('campaigns')) {
         $pdo->prepare("INSERT INTO campaigns (company_id, list_id, team_id, supervisor_id, name, description, dialer_type, caller_id, sip_trunk, script, starts_at, ends_at, call_window, max_attempts, simultaneous_calls, retry_interval_minutes, priority, recording_enabled, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 3)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
+            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
         audit('criou_campanha', 'campaigns:' . $pdo->lastInsertId(), null, $_POST);
         flash('Campanha criada.');
         redirect('?page=campaigns');
@@ -3017,7 +3017,7 @@ function handle_post(): void
         $pdo->prepare("UPDATE campaigns
             SET list_id = ?, team_id = ?, supervisor_id = ?, name = ?, description = ?, dialer_type = ?, caller_id = ?, sip_trunk = ?, script = ?, starts_at = ?, ends_at = ?, call_window = ?, max_attempts = ?, simultaneous_calls = ?, retry_interval_minutes = ?, priority = ?, recording_enabled = ?, status = ?
             WHERE id = ?")
-            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 3)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
+            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
         audit('editou_campanha', 'campaigns:' . $campaignId, $campaign, $_POST);
         flash('Campanha atualizada.');
         redirect('?page=campaigns');
@@ -4912,17 +4912,29 @@ function call_modal_payload(int $callId, int $companyId, int $agentId): ?array
     ];
 }
 
+function campaign_requested_parallelism(array $campaign): int
+{
+    return max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1)));
+}
+
 function campaign_effective_parallelism(array $campaign, int $companyId): int
 {
-    $requested = max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1)));
+    $requested = campaign_requested_parallelism($campaign);
     $company = one('SELECT max_channels FROM companies WHERE id = ?', [$companyId]) ?: [];
-    $companyCap = (int)($company['max_channels'] ?? 1);
-    $teamCap = 10;
+    $companyCap = max(1, (int)($company['max_channels'] ?? 1));
+    $companyInUse = (int)scalar("SELECT COUNT(*) FROM calls WHERE company_id = ? AND status IN (" . live_call_statuses_sql() . ")", [$companyId]);
+    $companyAvailable = max(0, $companyCap - $companyInUse);
+
+    $teamAvailable = 10;
     if (!empty($campaign['team_id'])) {
         $team = one('SELECT max_simultaneous_calls FROM teams WHERE id = ? AND company_id = ?', [(int)$campaign['team_id'], $companyId]) ?: [];
-        $teamCap = (int)($team['max_simultaneous_calls'] ?? 1);
+        $teamCap = max(1, (int)($team['max_simultaneous_calls'] ?? 1));
+        $teamInUse = (int)scalar("SELECT COUNT(*) FROM calls co INNER JOIN campaigns ca ON ca.id = co.campaign_id WHERE co.company_id = ? AND ca.team_id = ? AND co.status IN (" . live_call_statuses_sql() . ")", [$companyId, (int)$campaign['team_id']]);
+        $teamAvailable = max(0, $teamCap - $teamInUse);
     }
-    return max(1, min($requested, 10, max(1, $companyCap), max(1, $teamCap)));
+
+    $eligible = (int)scalar("SELECT COUNT(*) FROM contacts c WHERE c.company_id = ? AND c.list_id = ? AND c.status = 'novo' AND c.attempts = 0 AND c.last_call_at IS NULL AND (c.reservation_expires_at IS NULL OR c.reservation_expires_at < datetime('now')) AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE b.company_id = c.company_id AND b.phone_e164 = c.phone_e164)", [$companyId, (int)$campaign['list_id']]);
+    return min($requested, 10, $companyAvailable, $teamAvailable, $eligible);
 }
 
 function campaign_uses_asterisk_parallelism(array $campaign, int $companyId): bool
@@ -4930,9 +4942,8 @@ function campaign_uses_asterisk_parallelism(array $campaign, int $companyId): bo
     $config = asterisk_config();
     return !empty($config['enabled'])
         && ($config['active_mode'] ?? '') === 'ASTERISK'
-        && campaign_effective_parallelism($campaign, $companyId) > 1;
+        && campaign_requested_parallelism($campaign) > 1;
 }
-
 function active_dial_batch(int $agentId, int $companyId): ?array
 {
     return one("SELECT * FROM dial_batches WHERE company_id = ? AND agent_id = ? AND status IN ('ORIGINATING','RINGING','WINNER','CONNECTED') ORDER BY id DESC LIMIT 1", [$companyId, $agentId]) ?: null;
@@ -4979,6 +4990,7 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     $allowed = telephony_call_allowed($companyId);
     if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
     $limit = campaign_effective_parallelism($campaign, $companyId);
+    if ($limit < 1) { flash('Sem capacidade ou leads elegiveis para iniciar o lote Asterisk.', 'error'); return false; }
     $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
     if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
@@ -7674,7 +7686,7 @@ function render_campaigns(): void
                         <label>Inicio<input name="starts_at" type="datetime-local" value="<?= h(datetime_local((string)$field('starts_at'))) ?>"></label>
                         <label>Fim<input name="ends_at" type="datetime-local" value="<?= h(datetime_local((string)$field('ends_at'))) ?>"></label>
                         <label>Horario<input name="call_window" value="<?= h((string)$field('call_window', '08:00-18:00')) ?>"></label>
-                        <label>Max. tentativas<input name="max_attempts" type="number" min="1" value="<?= h((string)$field('max_attempts', '3')) ?>"></label>
+                        <label>Max. tentativas<input name="max_attempts" type="number" min="1" value="<?= h((string)$field('max_attempts', '1')) ?>"></label>
                         <label>Chamadas simultaneas (Asterisk)<input name="simultaneous_calls" type="number" min="1" max="10" step="1" value="<?= h((string)$field('simultaneous_calls', '1')) ?>"></label>
                         <label>Intervalo min.<input name="retry_interval_minutes" type="number" value="<?= h((string)$field('retry_interval_minutes', '240')) ?>"></label>
                         <label>Prioridade<input name="priority" type="number" value="<?= h((string)$field('priority', '1')) ?>"></label>
