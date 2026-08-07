@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 14;
+const DB_SCHEMA_VERSION = 15;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -215,7 +215,8 @@ function migrate(PDO $pdo): void
             starts_at TEXT,
             ends_at TEXT,
             call_window TEXT DEFAULT '08:00-18:00',
-            max_attempts INTEGER DEFAULT 3,
+            max_attempts INTEGER DEFAULT 1,
+            simultaneous_calls INTEGER NOT NULL DEFAULT 1,
             retry_interval_minutes INTEGER DEFAULT 240,
             priority INTEGER DEFAULT 1,
             recording_enabled INTEGER DEFAULT 0,
@@ -258,6 +259,23 @@ function migrate(PDO $pdo): void
             recording_url TEXT,
             estimated_cost REAL DEFAULT 0,
             confirmed_cost REAL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS dial_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            campaign_id INTEGER NOT NULL,
+            agent_id INTEGER NOT NULL,
+            requested_parallelism INTEGER NOT NULL DEFAULT 1,
+            effective_parallelism INTEGER NOT NULL DEFAULT 1,
+            telephony_mode TEXT NOT NULL,
+            telephony_trunk TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ORIGINATING',
+            winner_call_id INTEGER,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            next_started_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -618,6 +636,9 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'subscription_periods', 'telephony_rate_micros', 'INTEGER');
     ensure_column($pdo, 'subscription_periods', 'telephony_balance_micros', 'INTEGER');
     ensure_column($pdo, 'contact_lists', 'radar_target_leads', 'INTEGER');
+    ensure_column($pdo, 'campaigns', 'simultaneous_calls', 'INTEGER NOT NULL DEFAULT 1');
+    ensure_column($pdo, 'calls', 'dial_batch_id', 'INTEGER');
+    ensure_column($pdo, 'calls', 'race_outcome', 'TEXT');
     $pdo->exec("UPDATE callbacks SET status = CASE
         WHEN status IS NULL OR trim(status) = '' OR lower(trim(status)) = 'pending' THEN 'pendente'
         ELSE lower(trim(status)) END");
@@ -625,6 +646,9 @@ function migrate(PDO $pdo): void
         WHEN length(replace(scheduled_at, 'T', ' ')) = 16 THEN replace(scheduled_at, 'T', ' ') || ':00'
         ELSE replace(scheduled_at, 'T', ' ') END");
     ensure_index($pdo, 'idx_calls_company_campaign_created', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_created ON calls(company_id, campaign_id, created_at DESC)');
+    ensure_index($pdo, 'idx_dial_batches_active_agent', 'CREATE INDEX IF NOT EXISTS idx_dial_batches_active_agent ON dial_batches(company_id, agent_id, status, id DESC)');
+    ensure_index($pdo, 'idx_dial_batches_campaign_created', 'CREATE INDEX IF NOT EXISTS idx_dial_batches_campaign_created ON dial_batches(company_id, campaign_id, created_at DESC)');
+    ensure_index($pdo, 'idx_calls_dial_batch', 'CREATE INDEX IF NOT EXISTS idx_calls_dial_batch ON calls(dial_batch_id, status, id)');
     ensure_index($pdo, 'idx_radar_lead_history_company_list', 'CREATE INDEX IF NOT EXISTS idx_radar_lead_history_company_list ON radar_lead_history(company_id, list_id, created_at DESC)');
     ensure_index($pdo, 'idx_calls_company_campaign_internal_status', 'CREATE INDEX IF NOT EXISTS idx_calls_company_campaign_internal_status ON calls(company_id, campaign_id, internal_status)');
     ensure_index($pdo, 'idx_calls_company_destination_number', 'CREATE INDEX IF NOT EXISTS idx_calls_company_destination_number ON calls(company_id, destination_number)');
@@ -977,6 +1001,7 @@ function access_modules(): array
         'recordings' => 'Gravacoes',
         'costs' => 'Plano e consumo',
         'settings' => 'Integracoes',
+        'asterisk_diagnostics' => 'Diagnostico Asterisk',
         'radar' => 'Radar de Leads',
         'blocklist' => 'Bloqueio',
         'audit' => 'Auditoria',
@@ -987,8 +1012,8 @@ function access_modules(): array
 function default_role_modules(string $role): array
 {
     $matrix = [
-        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
-        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
+        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'asterisk_diagnostics', 'blocklist', 'audit'],
+        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'asterisk_diagnostics', 'blocklist', 'audit'],
         'cliente_admin' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'admin_empresa' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'usuario_operacional' => ['dashboard', 'lists', 'agent', 'reports', 'recordings'],
@@ -1942,6 +1967,48 @@ final class AsteriskProvider implements TelephonyProvider
             throw $e;
         }
     }
+    public function originateParallel(array $campaign, array $contact, array $agent, string $externalId): array
+    {
+        if (empty($this->config['enabled'])) throw new RuntimeException('Asterisk esta desabilitado.');
+        $destination = nvoip_phone_digits((string)($contact['phone_e164'] ?? ''));
+        if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
+        $trunk = $this->safeEndpoint($this->routeTrunk());
+        $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
+            'channelId' => $externalId,
+            'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+            'app' => $this->config['stasis_app'],
+            'appArgs' => 'ligflow,' . $externalId,
+            'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
+            'timeout' => $this->config['originate_timeout_seconds'],
+            'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
+        ]);
+        return [
+            'provider' => 'Asterisk ARI',
+            'external_call_id' => $externalId,
+            'provider_channel_id' => (string)($channel['id'] ?? $externalId),
+            'provider_linked_id' => (string)($channel['connected']['id'] ?? ''),
+            'telephony_mode' => $this->mode(),
+            'telephony_trunk' => $this->trunk(),
+        ];
+    }
+
+    public function connectParallelWinner(array $call, array $agent): array
+    {
+        $channelId = (string)($call['provider_channel_id'] ?? '');
+        if ($channelId === '') throw new RuntimeException('Canal Asterisk indisponivel para conectar o consultor.');
+        $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
+        try {
+            $this->createBridge($bridgeId);
+            $this->addChannelToBridge($bridgeId, $channelId);
+            $consultantEndpoint = preg_replace('/^PJSIP\//i', '', (string)($this->config['consultant_endpoint'] ?? ''));
+            $consultant = $this->connectConsultant($bridgeId, (string)$consultantEndpoint);
+            return ['bridge_id' => $bridgeId, 'consultant_channel_id' => (string)($consultant['id'] ?? '')];
+        } catch (Throwable $e) {
+            try { $this->destroyBridge($bridgeId); } catch (Throwable) { }
+            throw $e;
+        }
+    }
+
     public function hangup(array $call): void
     {
         $channelId = (string)($call['provider_channel_id'] ?? $call['provider_call_id'] ?? '');
@@ -2959,9 +3026,9 @@ function handle_post(): void
     }
 
     if ($action === 'create_campaign' && can('campaigns')) {
-        $pdo->prepare("INSERT INTO campaigns (company_id, list_id, team_id, supervisor_id, name, description, dialer_type, caller_id, sip_trunk, script, starts_at, ends_at, call_window, max_attempts, retry_interval_minutes, priority, recording_enabled, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), post('max_attempts'), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
+        $pdo->prepare("INSERT INTO campaigns (company_id, list_id, team_id, supervisor_id, name, description, dialer_type, caller_id, sip_trunk, script, starts_at, ends_at, call_window, max_attempts, simultaneous_calls, retry_interval_minutes, priority, recording_enabled, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
         audit('criou_campanha', 'campaigns:' . $pdo->lastInsertId(), null, $_POST);
         flash('Campanha criada.');
         redirect('?page=campaigns');
@@ -2977,9 +3044,9 @@ function handle_post(): void
         }
 
         $pdo->prepare("UPDATE campaigns
-            SET list_id = ?, team_id = ?, supervisor_id = ?, name = ?, description = ?, dialer_type = ?, caller_id = ?, sip_trunk = ?, script = ?, starts_at = ?, ends_at = ?, call_window = ?, max_attempts = ?, retry_interval_minutes = ?, priority = ?, recording_enabled = ?, status = ?
+            SET list_id = ?, team_id = ?, supervisor_id = ?, name = ?, description = ?, dialer_type = ?, caller_id = ?, sip_trunk = ?, script = ?, starts_at = ?, ends_at = ?, call_window = ?, max_attempts = ?, simultaneous_calls = ?, retry_interval_minutes = ?, priority = ?, recording_enabled = ?, status = ?
             WHERE id = ?")
-            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), post('max_attempts'), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
+            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
         audit('editou_campanha', 'campaigns:' . $campaignId, $campaign, $_POST);
         flash('Campanha atualizada.');
         redirect('?page=campaigns');
@@ -4271,6 +4338,15 @@ function delete_contact_list(int $listId, int $companyId): void
     flash('Lista excluida.');
 }
 
+function campaign_parallelism_input(mixed $value): int
+{
+    $raw = trim((string)$value);
+    if ($raw === '' || !preg_match('/^(?:[1-9]|10)$/', $raw)) {
+        throw new RuntimeException('Ligacoes simultaneas deve ser um numero inteiro entre 1 e 10.');
+    }
+    return (int)$raw;
+}
+
 function active_call_statuses_sql(): string
 {
     return "'in_progress','calling_origin','ringing','answered','pos_atendimento'";
@@ -4879,6 +4955,163 @@ function call_modal_payload(int $callId, int $companyId, int $agentId): ?array
     ];
 }
 
+function campaign_requested_parallelism(array $campaign): int
+{
+    return max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1)));
+}
+
+function campaign_effective_parallelism(array $campaign, int $companyId): int
+{
+    $requested = campaign_requested_parallelism($campaign);
+    $company = one('SELECT max_channels FROM companies WHERE id = ?', [$companyId]) ?: [];
+    $companyCap = max(1, (int)($company['max_channels'] ?? 1));
+    $companyInUse = (int)scalar("SELECT COUNT(*) FROM calls WHERE company_id = ? AND status IN (" . live_call_statuses_sql() . ")", [$companyId]);
+    $companyAvailable = max(0, $companyCap - $companyInUse);
+
+    $teamAvailable = 10;
+    if (!empty($campaign['team_id'])) {
+        $team = one('SELECT max_simultaneous_calls FROM teams WHERE id = ? AND company_id = ?', [(int)$campaign['team_id'], $companyId]) ?: [];
+        $teamCap = max(1, (int)($team['max_simultaneous_calls'] ?? 1));
+        $teamInUse = (int)scalar("SELECT COUNT(*) FROM calls co INNER JOIN campaigns ca ON ca.id = co.campaign_id WHERE co.company_id = ? AND ca.team_id = ? AND co.status IN (" . live_call_statuses_sql() . ")", [$companyId, (int)$campaign['team_id']]);
+        $teamAvailable = max(0, $teamCap - $teamInUse);
+    }
+
+    $eligible = (int)scalar("SELECT COUNT(*) FROM contacts c WHERE c.company_id = ? AND c.list_id = ? AND c.status = 'novo' AND c.attempts = 0 AND c.last_call_at IS NULL AND (c.reservation_expires_at IS NULL OR c.reservation_expires_at < datetime('now')) AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE b.company_id = c.company_id AND b.phone_e164 = c.phone_e164)", [$companyId, (int)$campaign['list_id']]);
+    return min($requested, 10, $companyAvailable, $teamAvailable, $eligible);
+}
+
+function campaign_uses_asterisk_parallelism(array $campaign, int $companyId): bool
+{
+    $config = asterisk_config();
+    return !empty($config['enabled'])
+        && ($config['active_mode'] ?? '') === 'ASTERISK'
+        && campaign_requested_parallelism($campaign) > 1;
+}
+function active_dial_batch(int $agentId, int $companyId): ?array
+{
+    return one("SELECT * FROM dial_batches WHERE company_id = ? AND agent_id = ? AND status IN ('ORIGINATING','RINGING','WINNER','CONNECTED') ORDER BY id DESC LIMIT 1", [$companyId, $agentId]) ?: null;
+}
+
+function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId, int $limit): array
+{
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        if (active_dial_batch($agentId, $companyId)) { $pdo->commit(); return []; }
+        $candidates = rows("SELECT c.* FROM contacts c WHERE c.company_id = ? AND c.list_id = ? AND c.status = 'novo' AND c.attempts = 0 AND c.last_call_at IS NULL AND (c.reservation_expires_at IS NULL OR c.reservation_expires_at < datetime('now')) AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE b.company_id = c.company_id AND b.phone_e164 = c.phone_e164) ORDER BY c.id ASC LIMIT " . (int)$limit, [$companyId, (int)$campaign['list_id']]);
+        if (!$candidates) { $pdo->commit(); return []; }
+        $config = asterisk_config();
+        $mode = 'ASTERISK';
+        $trunk = (new AsteriskProvider($config))->trunk();
+        $key = 'batch-' . bin2hex(random_bytes(16));
+        $pdo->prepare("INSERT INTO dial_batches (company_id,campaign_id,agent_id,requested_parallelism,effective_parallelism,telephony_mode,telephony_trunk,status,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)")
+            ->execute([$companyId, (int)$campaign['id'], $agentId, max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1))), $limit, $mode, $trunk, 'ORIGINATING', $key]);
+        $batchId = (int)$pdo->lastInsertId();
+        $reserved = [];
+        foreach ($candidates as $contact) {
+            $guard = $pdo->prepare("UPDATE contacts SET reserved_by=?, reserved_at=datetime('now'), reservation_expires_at=datetime('now','+10 minutes'), status='em_ligacao', attempts=attempts+1, last_call_at=datetime('now') WHERE id=? AND company_id=? AND status='novo' AND attempts=0 AND last_call_at IS NULL");
+            $guard->execute([$agentId, (int)$contact['id'], $companyId]);
+            if ($guard->rowCount() !== 1) continue;
+            $externalId = 'ARI-' . bin2hex(random_bytes(12));
+            $pdo->prepare("INSERT INTO calls (company_id,campaign_id,contact_id,agent_id,provider,external_call_id,provider_call_id,destination_number,status,provider_status_raw,internal_status,attempt_number,billing_rate_micros,telephony_period_id,telephony_mode,telephony_trunk,provider_channel_id,dial_batch_id,race_outcome,started_at,ringing_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))")
+                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), (int)(telephony_subscription_state($companyId)['period_id'] ?? 0), 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
+            $contact['call_id'] = (int)$pdo->lastInsertId();
+            $contact['external_call_id'] = $externalId;
+            $reserved[] = $contact;
+        }
+        if (!$reserved) { $pdo->prepare("UPDATE dial_batches SET status='NO_WINNER', updated_at=datetime('now') WHERE id=?")->execute([$batchId]); }
+        $pdo->commit();
+        return ['id' => $batchId, 'contacts' => $reserved, 'trunk' => $trunk];
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+}
+
+function start_asterisk_parallel_batch(array $campaign, int $agentId, int $companyId): bool
+{
+    $allowed = telephony_call_allowed($companyId);
+    if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
+    $limit = campaign_effective_parallelism($campaign, $companyId);
+    if ($limit < 1) { flash('Sem capacidade ou leads elegiveis para iniciar o lote Asterisk.', 'error'); return false; }
+    $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit);
+    if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
+    if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
+    $agent = one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$agentId, $companyId]) ?: [];
+    $provider = telephony_provider_for_company($companyId);
+    if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para este lote.');
+    foreach ($batch['contacts'] as $contact) {
+        try {
+            $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$contact['external_call_id']);
+            db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND dial_batch_id=?")
+                ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$contact['call_id'], (int)$batch['id']]);
+        } catch (Throwable $e) {
+            db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND dial_batch_id=? AND finalized_at IS NULL")
+                ->execute([$e->getMessage(), (int)$contact['call_id'], (int)$batch['id']]);
+            db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=?")->execute([(int)$contact['id']]);
+        }
+    }
+    db()->prepare("UPDATE users SET status='Discando automatico' WHERE id=? AND company_id=?")->execute([$agentId, $companyId]);
+    asterisk_continue_batch_if_exhausted((int)$batch['id']);
+    audit('iniciou_lote_asterisk', 'dial_batches:' . (int)$batch['id'], null, ['parallelism' => $limit]);
+    flash('Lote Asterisk iniciado com ' . count($batch['contacts']) . ' chamadas.');
+    return true;
+}
+
+function asterisk_batch_answered(int $callId): void
+{
+    $pdo = db(); $pdo->beginTransaction();
+    try {
+        $call = one('SELECT * FROM calls WHERE id=?', [$callId]);
+        if (!$call || empty($call['dial_batch_id'])) { $pdo->commit(); return; }
+        $batch = one('SELECT * FROM dial_batches WHERE id=? AND company_id=?', [(int)$call['dial_batch_id'], (int)$call['company_id']]);
+        if (!$batch || !in_array((string)$batch['status'], ['ORIGINATING','RINGING'], true)) { $pdo->commit(); return; }
+        $winner = $pdo->prepare("UPDATE dial_batches SET winner_call_id=?, status='WINNER', updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND status IN ('ORIGINATING','RINGING')");
+        $winner->execute([$callId, (int)$batch['id']]);
+        if ($winner->rowCount() !== 1) {
+            $pdo->prepare("UPDATE calls SET race_outcome='LATE_ANSWERED' WHERE id=?")->execute([$callId]);
+            $pdo->commit();
+            try { telephony_provider_for_company((int)$call['company_id'])->hangup($call); } catch (Throwable) { }
+            return;
+        }
+        $pdo->prepare("UPDATE calls SET race_outcome='WINNER' WHERE id=?")->execute([$callId]);
+        $losers = rows("SELECT * FROM calls WHERE dial_batch_id=? AND id<>? AND finalized_at IS NULL", [(int)$batch['id'], $callId]);
+        $pdo->prepare("UPDATE calls SET race_outcome='LOSER' WHERE dial_batch_id=? AND id<>? AND finalized_at IS NULL")->execute([(int)$batch['id'], $callId]);
+        $pdo->commit();
+        $provider = telephony_provider_for_company((int)$call['company_id']);
+        foreach ($losers as $loser) { try { $provider->hangup($loser); } catch (Throwable) { } }
+        if ($provider instanceof AsteriskProvider) {
+            $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
+            $bridge = $provider->connectParallelWinner($call, $agent);
+            db()->prepare("UPDATE calls SET provider_bridge_id=?, internal_status='conectada', status='connected', connected_at=COALESCE(connected_at,datetime('now')) WHERE id=?")->execute([(string)$bridge['bridge_id'], $callId]);
+            db()->prepare("UPDATE dial_batches SET status='CONNECTED', updated_at=datetime('now') WHERE id=?")->execute([(int)$batch['id']]);
+        }
+    } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
+}
+
+function asterisk_continue_batch_if_exhausted(int $batchId): void
+{
+    $batch = one('SELECT * FROM dial_batches WHERE id=?', [$batchId]);
+    if (!$batch || !empty($batch['winner_call_id'])) return;
+    $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
+    if ($live > 0) return;
+    $updated = db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL");
+    $updated->execute([$batchId]);
+    if ($updated->rowCount() !== 1) return;
+    start_next_progressive_call((int)$batch['campaign_id'], (int)$batch['agent_id'], (int)$batch['company_id']);
+}
+
+function cancel_active_asterisk_batch(int $agentId, int $companyId): void
+{
+    $batch = active_dial_batch($agentId, $companyId);
+    if (!$batch) return;
+    $calls = rows("SELECT * FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL", [(int)$batch['id']]);
+    db()->prepare("UPDATE dial_batches SET status='CANCELLED', updated_at=datetime('now') WHERE id=?")->execute([(int)$batch['id']]);
+    db()->prepare("UPDATE calls SET status='cancelled', internal_status='cancelada', race_outcome=COALESCE(NULLIF(race_outcome,''),'CANCELLED'), ended_at=datetime('now'), finalized_at=datetime('now') WHERE dial_batch_id=? AND finalized_at IS NULL")->execute([(int)$batch['id']]);
+    db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id = ?)")->execute([(int)$batch['id']]);
+    foreach ($calls as $call) { try { telephony_provider_for_company($companyId)->hangup($call); } catch (Throwable) { } }
+}
+
 function next_eligible_contact(array $campaign, int $companyId): ?array
 {
     return one("
@@ -4897,23 +5130,23 @@ function next_eligible_contact(array $campaign, int $companyId): ?array
 
 function start_next_progressive_call(int $campaignId, int $agentId, int $companyId): bool
 {
-    if (get_live_call($agentId, $companyId)) {
-        flash('Ja existe uma chamada ativa para este consultor.', 'error');
-        return false;
-    }
-
     $campaign = one('SELECT * FROM campaigns WHERE id = ? AND company_id = ? AND status = "Ativa"', [$campaignId, $companyId]);
     if (!$campaign) {
         flash('Campanha indisponivel.', 'error');
         return false;
     }
-
+    if (campaign_uses_asterisk_parallelism($campaign, $companyId)) {
+        return start_asterisk_parallel_batch($campaign, $agentId, $companyId);
+    }
+    if (get_live_call($agentId, $companyId)) {
+        flash('Ja existe uma chamada ativa para este consultor.', 'error');
+        return false;
+    }
     $contact = next_eligible_contact($campaign, $companyId);
     if (!$contact) {
         flash('Nao ha numeros novos para ligar nesta lista.', 'error');
         return false;
     }
-
     db()->prepare("UPDATE contacts SET reserved_by = ?, reserved_at = datetime('now'), reservation_expires_at = datetime('now', '+10 minutes'), status = 'reservado' WHERE id = ?")
         ->execute([$agentId, $contact['id']]);
     audit('discador_reservou_contato', 'contacts:' . $contact['id']);
@@ -4923,6 +5156,7 @@ function start_next_progressive_call(int $campaignId, int $agentId, int $company
 
 function stop_agent_operation(int $agentId, int $companyId, string $status): void
 {
+    cancel_active_asterisk_batch($agentId, $companyId);
     $active = get_active_call($agentId, $companyId);
     if ($active) {
         if ((string)$active['status'] !== 'pos_atendimento') {
@@ -5382,6 +5616,174 @@ function is_secure_or_local_request(): bool
     return $https || str_starts_with($host, 'localhost') || str_starts_with($host, '127.0.0.1');
 }
 
+function asterisk_diagnostics_can_access(?array $user = null): bool
+{
+    $user ??= current_user();
+    return $user !== null && (is_platform_admin($user) || can('asterisk_diagnostics'));
+}
+
+function asterisk_diagnostics_company_id(array $user): int
+{
+    $companyId = (int)($user['company_id'] ?? 0);
+    if (is_platform_admin($user) && isset($_GET['company_id']) && (int)$_GET['company_id'] > 0) {
+        $candidate = (int)$_GET['company_id'];
+        if (one('SELECT id FROM companies WHERE id = ?', [$candidate])) {
+            $companyId = $candidate;
+        }
+    }
+    return $companyId;
+}
+
+function asterisk_diagnostics_mask_phone(?string $value): string
+{
+    $digits = preg_replace('/\D+/', '', (string)$value);
+    if ($digits === '') return '-';
+    return str_repeat('*', max(0, strlen($digits) - 4)) . substr($digits, -4);
+}
+
+function asterisk_diagnostics_duration(int $seconds): string
+{
+    $seconds = max(0, $seconds);
+    return sprintf('%02d:%02d:%02d', intdiv($seconds, 3600), intdiv($seconds % 3600, 60), $seconds % 60);
+}
+
+function asterisk_diagnostics_filters(): array
+{
+    $status = strtoupper(trim((string)($_GET['status'] ?? '')));
+    $allowed = ['ORIGINATING', 'RINGING', 'WINNER', 'CONNECTED', 'NO_WINNER', 'CANCELLED'];
+    return [
+        'campaign_id' => max(0, (int)($_GET['campaign_id'] ?? 0)),
+        'agent_id' => max(0, (int)($_GET['agent_id'] ?? 0)),
+        'batch_id' => max(0, (int)($_GET['batch_id'] ?? 0)),
+        'status' => in_array($status, $allowed, true) ? $status : '',
+        'from' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)($_GET['from'] ?? '')) ? (string)$_GET['from'] : '',
+        'to' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)($_GET['to'] ?? '')) ? (string)$_GET['to'] : '',
+        'page' => max(1, (int)($_GET['batch_page'] ?? 1)),
+    ];
+}
+
+function asterisk_diagnostics_is_stale(?string $value, int $seconds): bool
+{
+    if (!$value) return true;
+    try {
+        $at = new DateTimeImmutable((string)$value, new DateTimeZone('UTC'));
+        return time() - $at->getTimestamp() > $seconds;
+    } catch (Throwable) {
+        return true;
+    }
+}
+
+function asterisk_diagnostics_payload(int $companyId, array $filters): array
+{
+    $where = ['b.company_id = ?'];
+    $params = [$companyId];
+    foreach (['campaign_id', 'agent_id', 'batch_id'] as $field) {
+        if (!empty($filters[$field])) {
+            $where[] = 'b.' . $field . ' = ?';
+            $params[] = (int)$filters[$field];
+        }
+    }
+    if ($filters['status'] !== '') { $where[] = 'b.status = ?'; $params[] = $filters['status']; }
+    if ($filters['from'] !== '') { $where[] = 'b.created_at >= ?'; $params[] = $filters['from'] . ' 00:00:00'; }
+    if ($filters['to'] !== '') { $where[] = "b.created_at < datetime(?, '+1 day')"; $params[] = $filters['to'] . ' 00:00:00'; }
+    $whereSql = implode(' AND ', $where);
+    $perPage = 10;
+    $offset = ($filters['page'] - 1) * $perPage;
+    $total = (int)scalar('SELECT COUNT(*) FROM dial_batches b WHERE ' . $whereSql, $params);
+    $sql = "SELECT b.id, b.campaign_id, b.agent_id, b.requested_parallelism, b.effective_parallelism, b.telephony_mode, b.telephony_trunk, b.status, b.winner_call_id, b.next_started_at, b.created_at, b.updated_at, co.trade_name AS tenant_name, cp.name AS campaign_name, u.name AS agent_name,
+        COUNT(ca.id) AS originated_count,
+        SUM(CASE WHEN ca.status IN ('in_progress','calling_origin','ringing','answered','connected') AND ca.finalized_at IS NULL THEN 1 ELSE 0 END) AS active_count,
+        SUM(CASE WHEN ca.finalized_at IS NOT NULL OR ca.status IN ('completed','failed','cancelled','busy','no_answer') THEN 1 ELSE 0 END) AS finalized_count,
+        SUM(CASE WHEN ca.race_outcome = 'WINNER' THEN 1 ELSE 0 END) AS winner_count,
+        SUM(CASE WHEN ca.race_outcome = 'LOSER' THEN 1 ELSE 0 END) AS loser_count,
+        SUM(CASE WHEN ca.race_outcome = 'LATE_ANSWERED' THEN 1 ELSE 0 END) AS late_answered_count,
+        SUM(CASE WHEN ca.race_outcome IN ('LOSER','LATE_ANSWERED') AND ca.finalized_at IS NULL AND ca.status IN ('in_progress','calling_origin','ringing','answered','connected') THEN 1 ELSE 0 END) AS active_loser_count,
+        MAX(COALESCE(ca.last_event_at, ca.updated_at, ca.created_at)) AS last_call_event_at,
+        wc.provider_bridge_id AS winner_bridge_id
+        FROM dial_batches b
+        JOIN companies co ON co.id = b.company_id
+        LEFT JOIN campaigns cp ON cp.id = b.campaign_id AND cp.company_id = b.company_id
+        LEFT JOIN users u ON u.id = b.agent_id AND u.company_id = b.company_id
+        LEFT JOIN calls ca ON ca.dial_batch_id = b.id AND ca.company_id = b.company_id
+        LEFT JOIN calls wc ON wc.id = b.winner_call_id AND wc.company_id = b.company_id
+        WHERE {$whereSql}
+        GROUP BY b.id
+        ORDER BY b.id DESC LIMIT {$perPage} OFFSET {$offset}";
+    $batches = rows($sql, $params);
+    $activeStatuses = "'ORIGINATING','RINGING','WINNER','CONNECTED'";
+    $duplicateAgents = rows("SELECT agent_id, COUNT(*) total FROM dial_batches WHERE company_id = ? AND status IN ({$activeStatuses}) GROUP BY agent_id HAVING COUNT(*) > 1", [$companyId]);
+    $duplicateAgentIds = array_flip(array_map(static fn(array $row): int => (int)$row['agent_id'], $duplicateAgents));
+    $lastWorkerEvent = one("SELECT MAX(e.created_at) AS created_at FROM asterisk_ari_events e JOIN calls ca ON ca.id = e.call_id WHERE ca.company_id = ?", [$companyId]);
+    $workerAt = (string)($lastWorkerEvent['created_at'] ?? '');
+    $activeCount = (int)scalar("SELECT COUNT(*) FROM dial_batches WHERE company_id = ? AND status IN ({$activeStatuses})", [$companyId]);
+    $config = asterisk_config();
+    $alerts = [];
+    if ($activeCount > 0 && asterisk_diagnostics_is_stale($workerAt ?: null, 120)) {
+        $alerts[] = ['level' => 'warning', 'message' => 'Worker ARI sem evento recente para lote ativo.'];
+    }
+    foreach ($batches as &$batch) {
+        $batch['originated_count'] = (int)$batch['originated_count'];
+        $batch['active_count'] = (int)$batch['active_count'];
+        $batch['finalized_count'] = (int)$batch['finalized_count'];
+        $batch['winner_count'] = (int)$batch['winner_count'];
+        $batch['loser_count'] = (int)$batch['loser_count'];
+        $batch['late_answered_count'] = (int)$batch['late_answered_count'];
+        $batch['active_loser_count'] = (int)$batch['active_loser_count'];
+        if ((int)$batch['effective_parallelism'] < (int)$batch['requested_parallelism']) $alerts[] = ['level' => 'warning', 'batch_id' => (int)$batch['id'], 'message' => 'Paralelismo efetivo menor que o solicitado.'];
+        if (isset($duplicateAgentIds[(int)$batch['agent_id']])) $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Mais de um lote ativo para este consultor.'];
+        if ((int)$batch['winner_call_id'] > 0 && trim((string)$batch['winner_bridge_id']) === '') $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Vencedora sem bridge conhecida.'];
+        if ((int)$batch['active_loser_count'] > 0) $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Perdedora ainda ativa apos a eleicao.'];
+        if (in_array((string)$batch['status'], ['ORIGINATING', 'RINGING', 'WINNER', 'CONNECTED'], true) && asterisk_diagnostics_is_stale((string)($batch['last_call_event_at'] ?: $batch['updated_at']), 90)) $alerts[] = ['level' => 'warning', 'batch_id' => (int)$batch['id'], 'message' => 'Lote ativo sem atualizacao recente.'];
+    }
+    unset($batch);
+    return [
+        'health' => [
+            'ari' => ['configured' => $config['ari_url'] !== '' && $config['ari_username'] !== '' && $config['ari_password'] !== '', 'last_event_at' => $workerAt ?: null, 'state' => $workerAt !== '' && !asterisk_diagnostics_is_stale($workerAt, 120) ? 'Atividade recente' : 'Sem evento recente'],
+            'worker' => ['last_event_at' => $workerAt ?: null, 'state' => $activeCount === 0 ? 'Sem lote ativo' : (asterisk_diagnostics_is_stale($workerAt ?: null, 120) ? 'Sem atividade recente' : 'Ativo')],
+            'webrtc' => ['endpoint' => (string)$config['consultant_endpoint'], 'state' => $config['sip_wss_url'] !== '' && $config['sip_domain'] !== '' ? 'Configurado' : 'Configuracao incompleta'],
+        ],
+        'batches' => $batches,
+        'alerts' => $alerts,
+        'pagination' => ['page' => $filters['page'], 'per_page' => $perPage, 'total' => $total, 'pages' => max(1, (int)ceil($total / $perPage))],
+    ];
+}
+
+function asterisk_diagnostics_batch_calls(int $companyId, int $batchId, int $page = 1): array
+{
+    $perPage = 10; $page = max(1, $page); $offset = ($page - 1) * $perPage;
+    $batch = one('SELECT id FROM dial_batches WHERE id = ? AND company_id = ?', [$batchId, $companyId]);
+    if (!$batch) return ['calls' => [], 'pagination' => ['page' => 1, 'pages' => 1, 'total' => 0]];
+    $total = (int)scalar('SELECT COUNT(*) FROM calls WHERE company_id = ? AND dial_batch_id = ?', [$companyId, $batchId]);
+    $calls = rows("SELECT ca.id, ca.provider_channel_id, ca.provider_linked_id, ca.provider_bridge_id, ca.status, ca.internal_status, ca.race_outcome, ca.started_at, ca.ringing_at, ca.answered_at, ca.connected_at, ca.ended_at, ca.finalized_at, ca.duration_seconds, ca.billable_seconds, ca.destination_number, ct.name AS lead_name
+        FROM calls ca LEFT JOIN contacts ct ON ct.id = ca.contact_id AND ct.company_id = ca.company_id
+        WHERE ca.company_id = ? AND ca.dial_batch_id = ? ORDER BY ca.id ASC LIMIT {$perPage} OFFSET {$offset}", [$companyId, $batchId]);
+    foreach ($calls as &$call) {
+        $call['phone_masked'] = asterisk_diagnostics_mask_phone((string)$call['destination_number']);
+        unset($call['destination_number']);
+        $call['hangup_requested'] = in_array((string)$call['race_outcome'], ['LOSER', 'LATE_ANSWERED', 'CANCELLED'], true);
+        $call['hangup_confirmed'] = !empty($call['ended_at']) || !empty($call['finalized_at']);
+    }
+    unset($call);
+    return ['calls' => $calls, 'pagination' => ['page' => $page, 'per_page' => $perPage, 'total' => $total, 'pages' => max(1, (int)ceil($total / $perPage))]];
+}
+
+function handle_asterisk_diagnostics_data(): never
+{
+    require_login();
+    header('Content-Type: application/json; charset=utf-8');
+    $user = current_user();
+    if (!asterisk_diagnostics_can_access($user)) {
+        http_response_code(403);
+        echo json_encode_safe(['ok' => false, 'error' => 'Sem permissao para diagnostico Asterisk.']);
+        exit;
+    }
+    $companyId = asterisk_diagnostics_company_id($user);
+    $filters = asterisk_diagnostics_filters();
+    $payload = asterisk_diagnostics_payload($companyId, $filters);
+    if ($filters['batch_id'] > 0) $payload['detail'] = asterisk_diagnostics_batch_calls($companyId, $filters['batch_id'], max(1, (int)($_GET['call_page'] ?? 1)));
+    echo json_encode_safe(['ok' => true, 'company_id' => $companyId] + $payload);
+    exit;
+}
 function handle_sip_config(): never
 {
     require_login();
@@ -5985,6 +6387,10 @@ if (($_GET['page'] ?? '') === 'recording_file') {
     handle_recording_file();
 }
 
+if (($_GET['page'] ?? '') === 'asterisk_diagnostics_data') {
+    handle_asterisk_diagnostics_data();
+}
+
 if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_template'])) {
     download_csv_template();
 }
@@ -6058,6 +6464,7 @@ function asterisk_handle_event(array $event): void
         $pdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, ?, ?, ?)")
             ->execute([(int)$call['company_id'], (int)$call['id'], 'asterisk.' . strtolower($eventType), (string)$call['status'], $status, json_encode_safe($event)]);
         $pdo->commit();
+        if ($internal === 'atendida' && !empty($call['dial_batch_id'])) asterisk_batch_answered((int)$call['id']);
         if ($isFinal) {
             $updated = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)$call['id'], (int)$call['company_id']]);
             if ($updated) {
@@ -6070,6 +6477,7 @@ function asterisk_handle_event(array $event): void
                 telephony_record_call_debit($updated, $billing, (int)$updated['agent_id']);
             }
         }
+        if ($isFinal && !empty($call['dial_batch_id'])) asterisk_continue_batch_if_exhausted((int)$call['dial_batch_id']);
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         throw $e;
@@ -6168,6 +6576,7 @@ function layout(string $page, callable $content): void
         'users' => 'Acessos e consultores',
         'lists' => 'Contatos e Listas',
         'settings' => 'Integracoes',
+        'asterisk_diagnostics' => 'Diagnostico Asterisk',
         'agent' => 'Discador',
         'campaigns' => 'Campanhas',
         'radar' => 'Radar de Leads',
@@ -6207,6 +6616,7 @@ function layout(string $page, callable $content): void
                 'reports' => 'Relatorios',
                 'costs' => 'Plano e consumo',
                 'settings' => 'Integracoes',
+                'asterisk_diagnostics' => 'Diagnostico Asterisk',
                 'blocklist' => 'Bloqueio',
                 'audit' => 'Auditoria',
                 'account' => 'Minha conta',
@@ -7455,7 +7865,7 @@ function render_campaigns(): void
         $lists = rows("SELECT id, name FROM contact_lists WHERE {$clause} ORDER BY name", $params);
         $teams = rows("SELECT id, name FROM teams WHERE {$clause} ORDER BY name", $params);
         $supervisors = rows("SELECT id, name FROM users WHERE {$clause} AND role IN ('supervisor','admin_empresa') ORDER BY name", $params);
-        $campaignRows = rows("SELECT ca.id, ca.name, ca.dialer_type, ca.status, COALESCE(l.name, '-') lista, COALESCE(t.name, '-') equipe, ca.max_attempts, COUNT(co.id) chamadas
+        $campaignRows = rows("SELECT ca.id, ca.name, ca.dialer_type, ca.status, COALESCE(l.name, '-') lista, COALESCE(t.name, '-') equipe, ca.max_attempts, ca.simultaneous_calls, COUNT(co.id) chamadas
             FROM campaigns ca
             LEFT JOIN contact_lists l ON l.id = ca.list_id
             LEFT JOIN teams t ON t.id = ca.team_id
@@ -7482,7 +7892,7 @@ function render_campaigns(): void
                     <p class="empty">Nenhuma campanha encontrada.</p>
                 <?php else: ?>
                     <div class="table-wrap"><table>
-                        <thead><tr><th>Nome</th><th>Tipo</th><th>Status</th><th>Lista</th><th>Equipe</th><th>Tentativas</th><th>Acoes</th></tr></thead>
+                        <thead><tr><th>Nome</th><th>Tipo</th><th>Status</th><th>Lista</th><th>Equipe</th><th>Tentativas</th><th>Simultaneas</th><th>Acoes</th></tr></thead>
                         <tbody><?php foreach ($campaignRows as $row): ?><tr>
                             <td><?= h($row['name']) ?></td>
                             <td><?= h($row['dialer_type']) ?></td>
@@ -7490,6 +7900,7 @@ function render_campaigns(): void
                             <td><?= h($row['lista']) ?></td>
                             <td><?= h($row['equipe']) ?></td>
                             <td><?= h((string)$row['max_attempts']) ?></td>
+                            <td><?= h((string)($row['simultaneous_calls'] ?? 1)) ?></td>
                             <td class="actions">
                                 <a class="button secondary" href="?page=campaigns&edit_campaign=<?= (int)$row['id'] ?>">Editar</a>
                                 <?php if ((int)$row['chamadas'] === 0): ?>
@@ -7529,7 +7940,8 @@ function render_campaigns(): void
                         <label>Inicio<input name="starts_at" type="datetime-local" value="<?= h(datetime_local((string)$field('starts_at'))) ?>"></label>
                         <label>Fim<input name="ends_at" type="datetime-local" value="<?= h(datetime_local((string)$field('ends_at'))) ?>"></label>
                         <label>Horario<input name="call_window" value="<?= h((string)$field('call_window', '08:00-18:00')) ?>"></label>
-                        <label>Max. tentativas<input name="max_attempts" type="number" value="<?= h((string)$field('max_attempts', '3')) ?>"></label>
+                        <label>Max. tentativas<input name="max_attempts" type="number" min="1" value="<?= h((string)$field('max_attempts', '1')) ?>"></label>
+                        <label>Chamadas simultaneas (Asterisk)<input name="simultaneous_calls" type="number" min="1" max="10" step="1" value="<?= h((string)$field('simultaneous_calls', '1')) ?>"></label>
                         <label>Intervalo min.<input name="retry_interval_minutes" type="number" value="<?= h((string)$field('retry_interval_minutes', '240')) ?>"></label>
                         <label>Prioridade<input name="priority" type="number" value="<?= h((string)$field('priority', '1')) ?>"></label>
                         <label>Status<select name="status"><?php foreach (['Ativa', 'Rascunho', 'Agendada', 'Pausada', 'Finalizada'] as $status): ?><option <?= (string)$field('status', 'Ativa') === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
@@ -7630,12 +8042,15 @@ function render_agent(): void
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ?', [$campaignId]) : null;
         $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
         $usage = monthly_usage((int)$user['company_id']);
+        $activeBatch = $isAutoDialing ? active_dial_batch((int)$user['id'], (int)$user['company_id']) : null;
         $activeCall = $isAutoDialing && $campaignId
             ? one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND campaign_id = ? AND status IN (" . active_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [(int)$user['id'], (int)$user['company_id'], $campaignId])
             : get_active_call((int)$user['id'], (int)$user['company_id']);
-        $isCallLive = $activeCall && in_array((string)$activeCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
+        $isBatchWaitingForWinner = $activeBatch && empty($activeBatch['winner_call_id']);
+        if ($isBatchWaitingForWinner) $activeCall = null;
+        $isCallLive = $isBatchWaitingForWinner || ($activeCall && in_array((string)$activeCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true));
         $reserved = $activeCall ? one('SELECT * FROM contacts WHERE id = ? AND company_id = ?', [$activeCall['contact_id'], $activeCall['company_id']]) : null;
-        if (!$reserved && $campaign) {
+        if (!$reserved && $campaign && !$isBatchWaitingForWinner) {
             $reserved = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$campaign['company_id'], $campaign['list_id'], $user['id']]);
         }
         $autoNextPhone = (string)($_SESSION['auto_next_phone'] ?? '');
@@ -7737,6 +8152,9 @@ function render_agent(): void
                     <button name="status" value="Pausa" class="button secondary" data-pause-operation>Pausa</button>
                     <button type="button" class="button danger" data-floating-stop-call <?= $isCallLive ? '' : 'hidden' ?>>Parar ligacao</button>
                 </form>
+                <?php if ($isBatchWaitingForWinner): ?>
+                    <p class="muted">Lote Asterisk em andamento: aguardando a primeira chamada atendida.</p>
+                <?php endif; ?>
                 <?php if ($campaign): ?>
                     <div class="script-box"><strong>Roteiro</strong><p><?= nl2br(h($campaign['script'])) ?></p></div>
                 <?php endif; ?>
@@ -9112,6 +9530,76 @@ function render_account(): void
     <?php });
 }
 
+function render_asterisk_diagnostics(): void
+{
+    layout('asterisk_diagnostics', function () {
+        $user = current_user();
+        if (!asterisk_diagnostics_can_access($user)) {
+            flash('Voce nao tem permissao para acessar esta area.', 'error');
+            redirect('?page=dashboard');
+        }
+        $companyId = asterisk_diagnostics_company_id($user);
+        $filters = asterisk_diagnostics_filters();
+        $data = asterisk_diagnostics_payload($companyId, $filters);
+        $campaigns = rows('SELECT id, name FROM campaigns WHERE company_id = ? ORDER BY name', [$companyId]);
+        $agents = rows('SELECT id, name FROM users WHERE company_id = ? ORDER BY name', [$companyId]);
+        $detail = $filters['batch_id'] > 0 ? asterisk_diagnostics_batch_calls($companyId, $filters['batch_id'], max(1, (int)($_GET['call_page'] ?? 1))) : null;
+        ?>
+        <section class="panel" data-asterisk-diagnostics>
+            <div class="section-heading">
+                <div><h2>Diagnostico Asterisk</h2><p class="hint">Monitoramento somente leitura dos lotes Asterisk. Atualizacao adaptativa a cada 5 segundos.</p></div>
+                <span class="status-badge" data-asterisk-refresh-status>Atualizando</span>
+            </div>
+            <div class="stats-grid" data-asterisk-health>
+                <article class="stat-card"><span>ARI</span><strong data-health-ari><?= h($data['health']['ari']['state']) ?></strong><small><?= h($data['health']['ari']['configured'] ? 'Configurado' : 'Configuracao incompleta') ?></small></article>
+                <article class="stat-card"><span>Worker</span><strong data-health-worker><?= h($data['health']['worker']['state']) ?></strong><small data-health-worker-at><?= h($data['health']['worker']['last_event_at'] ? datetime_utc_display($data['health']['worker']['last_event_at']) : '-') ?></small></article>
+                <article class="stat-card"><span>WebRTC do consultor</span><strong data-health-webrtc><?= h($data['health']['webrtc']['state']) ?></strong><small data-health-endpoint><?= h($data['health']['webrtc']['endpoint'] ?: '-') ?></small></article>
+            </div>
+        </section>
+
+        <form class="panel form-grid" method="get">
+            <input type="hidden" name="page" value="asterisk_diagnostics">
+            <h2>Filtros</h2>
+            <label>Campanha<select name="campaign_id"><option value="">Todas</option><?php foreach ($campaigns as $campaign): ?><option value="<?= (int)$campaign['id'] ?>" <?= $filters['campaign_id'] === (int)$campaign['id'] ? 'selected' : '' ?>><?= h($campaign['name']) ?></option><?php endforeach; ?></select></label>
+            <label>Consultor<select name="agent_id"><option value="">Todos</option><?php foreach ($agents as $agent): ?><option value="<?= (int)$agent['id'] ?>" <?= $filters['agent_id'] === (int)$agent['id'] ? 'selected' : '' ?>><?= h($agent['name']) ?></option><?php endforeach; ?></select></label>
+            <label>Status<select name="status"><option value="">Todos</option><?php foreach (['ORIGINATING','RINGING','WINNER','CONNECTED','NO_WINNER','CANCELLED'] as $status): ?><option value="<?= h($status) ?>" <?= $filters['status'] === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
+            <label>Batch ID<input name="batch_id" inputmode="numeric" value="<?= $filters['batch_id'] ?: '' ?>"></label>
+            <label>De<input type="date" name="from" value="<?= h($filters['from']) ?>"></label>
+            <label>Ate<input type="date" name="to" value="<?= h($filters['to']) ?>"></label>
+            <button class="button secondary" type="submit">Aplicar filtros</button>
+        </form>
+
+        <section class="panel" data-asterisk-alerts>
+            <h2>Alertas operacionais</h2>
+            <div data-asterisk-alert-list>
+                <?php if (!$data['alerts']): ?><p class="hint">Nenhum alerta para os lotes exibidos.</p><?php endif; ?>
+                <?php foreach ($data['alerts'] as $alert): ?><p class="alert <?= h($alert['level'] === 'error' ? 'error' : 'warning') ?>"><?= h(($alert['batch_id'] ?? null) ? 'Batch #' . (int)$alert['batch_id'] . ': ' : '') ?><?= h($alert['message']) ?></p><?php endforeach; ?>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="section-heading"><div><h2>Lotes Asterisk</h2><p class="hint">Lotes ativos e recentes do tenant selecionado.</p></div><span data-asterisk-total><?= (int)$data['pagination']['total'] ?> lote(s)</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Tenant</th><th>Campanha</th><th>Consultor</th><th>Status</th><th>Paralelismo</th><th>Rota</th><th>Inicio</th><th>Duracao</th><th>Orig./Ativ./Fim.</th><th>WIN/LOS/LATE</th><th>Continuacao</th></tr></thead><tbody data-asterisk-batches>
+                <?php foreach ($data['batches'] as $batch): ?>
+                    <tr><td><a href="?page=asterisk_diagnostics&amp;batch_id=<?= (int)$batch['id'] ?>">#<?= (int)$batch['id'] ?></a></td><td><?= h($batch['tenant_name']) ?></td><td><?= h($batch['campaign_name'] ?: '-') ?></td><td><?= h($batch['agent_name'] ?: '-') ?></td><td><?= h($batch['status']) ?></td><td><?= (int)$batch['requested_parallelism'] ?> / <?= (int)$batch['effective_parallelism'] ?></td><td><?= h(($batch['telephony_mode'] ?: '-') . ' / ' . ($batch['telephony_trunk'] ?: '-')) ?></td><td><?= h(datetime_utc_display((string)$batch['created_at'])) ?></td><td><?= h(asterisk_diagnostics_duration(max(0, time() - strtotime((string)$batch['created_at'])))) ?></td><td><?= (int)$batch['originated_count'] ?> / <?= (int)$batch['active_count'] ?> / <?= (int)$batch['finalized_count'] ?></td><td><?= (int)$batch['winner_count'] ?> / <?= (int)$batch['loser_count'] ?> / <?= (int)$batch['late_answered_count'] ?></td><td><?= !empty($batch['next_started_at']) ? h(datetime_utc_display((string)$batch['next_started_at'])) : '-' ?></td></tr>
+                <?php endforeach; ?>
+                <?php if (!$data['batches']): ?><tr><td colspan="12" class="empty">Nenhum lote encontrado.</td></tr><?php endif; ?>
+            </tbody></table></div>
+            <?php if ($data['pagination']['pages'] > 1): ?><p class="pagination">Pagina <?= (int)$data['pagination']['page'] ?> de <?= (int)$data['pagination']['pages'] ?></p><?php endif; ?>
+        </section>
+
+        <?php if ($detail !== null): ?>
+        <section class="panel">
+            <div class="section-heading"><div><h2>Chamadas do lote #<?= (int)$filters['batch_id'] ?></h2><p class="hint">Telefones mascarados e dados tecnicos disponiveis apenas para suporte.</p></div><a class="button secondary" href="?page=asterisk_diagnostics">Fechar detalhes</a></div>
+            <div class="table-wrap"><table><thead><tr><th>Lead</th><th>Telefone</th><th>Channel ID</th><th>Status tecnico</th><th>Race outcome</th><th>Inicio / toque / atendida</th><th>Encerramento</th><th>Hangup</th><th>Duracao</th></tr></thead><tbody>
+                <?php foreach ($detail['calls'] as $call): ?><tr><td><?= h($call['lead_name'] ?: '-') ?></td><td><?= h($call['phone_masked']) ?></td><td><?= h($call['provider_channel_id'] ?: '-') ?></td><td><?= h($call['status'] . ' / ' . ($call['internal_status'] ?: '-')) ?></td><td><?= h($call['race_outcome'] ?: '-') ?></td><td><?= h(datetime_utc_display((string)$call['started_at'])) ?> / <?= h(datetime_utc_display((string)$call['ringing_at'])) ?> / <?= h(datetime_utc_display((string)$call['answered_at'])) ?></td><td><?= h(datetime_utc_display((string)($call['ended_at'] ?: $call['finalized_at']))) ?></td><td><?= $call['hangup_requested'] ? 'Solicitado' : '-' ?><?= $call['hangup_confirmed'] ? ' / Confirmado' : '' ?></td><td><?= h(asterisk_diagnostics_duration((int)($call['duration_seconds'] ?: $call['billable_seconds'] ?: 0))) ?></td></tr><?php endforeach; ?>
+                <?php if (!$detail['calls']): ?><tr><td colspan="9" class="empty">Nenhuma chamada encontrada.</td></tr><?php endif; ?>
+            </tbody></table></div>
+        </section>
+        <?php endif; ?>
+        <?php
+    });
+}
 function render_audit(): void
 {
     layout('audit', function () {
@@ -9146,6 +9634,7 @@ match ($page) {
     'recordings' => render_recordings(),
     'costs' => render_costs(),
     'settings' => render_settings(),
+    'asterisk_diagnostics' => render_asterisk_diagnostics(),
     'sip_diagnostic' => render_sip_diagnostic(),
     'blocklist' => render_blocklist(),
     'account' => render_account(),
