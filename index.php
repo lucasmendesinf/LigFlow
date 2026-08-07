@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 15;
+const DB_SCHEMA_VERSION = 16;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -496,6 +496,18 @@ function migrate(PDO $pdo): void
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS asterisk_user_extensions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            asterisk_server_id INTEGER NOT NULL DEFAULT 1,
+            extension TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Ativo',
+            provisioning_status TEXT NOT NULL DEFAULT 'Pendente',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            deactivated_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS asterisk_ari_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_key TEXT NOT NULL UNIQUE,
@@ -619,6 +631,24 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'hangup_cause', 'TEXT');
     ensure_column($pdo, 'asterisk_settings', 'webrtc_password_encrypted', 'TEXT');
     ensure_column($pdo, 'asterisk_settings', 'webrtc_context', 'TEXT');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS asterisk_user_extensions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        asterisk_server_id INTEGER NOT NULL DEFAULT 1,
+        extension TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Ativo',
+        provisioning_status TEXT NOT NULL DEFAULT 'Pendente',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        deactivated_at TEXT
+    )");
+    $pdo->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_asterisk_user_extensions_active_extension
+        ON asterisk_user_extensions(company_id, asterisk_server_id, extension)
+        WHERE status = 'Ativo'");
+    $pdo->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_asterisk_user_extensions_active_user
+        ON asterisk_user_extensions(company_id, user_id, asterisk_server_id)
+        WHERE status = 'Ativo'");
     ensure_column($pdo, 'callbacks', 'call_id', 'INTEGER');
     ensure_column($pdo, 'callbacks', 'completed_at', 'TEXT');
     ensure_column($pdo, 'plans', 'monthly_price', 'REAL DEFAULT 0');
@@ -2929,6 +2959,7 @@ function handle_post(): void
             redirect('?page=users');
         }
         try {
+            $pdo->beginTransaction();
             $accessProfileId = (int)post('access_profile_id');
             $profileRole = '';
             if ($accessProfileId > 0 && !one('SELECT id FROM access_profiles WHERE id = ? AND company_id = ?', [$accessProfileId, $companyId])) {
@@ -2941,10 +2972,14 @@ function handle_post(): void
             $pdo->prepare("INSERT INTO users (company_id, team_id, access_profile_id, name, email, password_hash, role, allowed_modules_json, phone, extension, status, work_hours, created_by)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 ->execute([$companyId, post('team_id') ?: null, $accessProfileId ?: null, post('name'), $email, password_hash((string)post('password', 'admin123'), PASSWORD_DEFAULT), $role, selected_modules_json(post('modules', [])), post('phone'), post('extension'), post('status'), post('work_hours'), $user['id']]);
-            audit('criou_usuario', 'users:' . $pdo->lastInsertId(), null, $_POST);
+            $newUserId = (int)$pdo->lastInsertId();
+            sync_user_asterisk_extension($companyId, $newUserId, (string)post('asterisk_extension'), (string)post('status'));
+            $pdo->commit();
+            audit('criou_usuario', 'users:' . $newUserId, null, $_POST);
             flash('Usuario cadastrado. Senha inicial: ' . h((string)post('password', 'admin123')));
-        } catch (PDOException $e) {
-            flash('Nao foi possivel cadastrar o acesso. Confira se o e-mail ainda nao esta em uso.', 'error');
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            flash($e instanceof InvalidArgumentException ? $e->getMessage() : 'Nao foi possivel cadastrar o acesso. Confira se o e-mail ainda nao esta em uso.', 'error');
         }
         redirect('?page=users');
     }
@@ -4086,6 +4121,51 @@ function update_client_account(int $clientId): void
     flash('Cliente atualizado.');
 }
 
+function asterisk_extension_is_active_for_user_status(string $userStatus): bool
+{
+    return !in_array(trim($userStatus), ['Bloqueado', 'Desconectado', 'Inativo', 'Excluido'], true);
+}
+
+function sync_user_asterisk_extension(int $companyId, int $userId, string $extension, string $userStatus): void
+{
+    $extension = trim($extension);
+    if ($extension !== '' && (preg_match('/^[0-9]{1,32}$/', $extension) !== 1)) {
+        throw new InvalidArgumentException('O ramal Asterisk deve conter somente numeros.');
+    }
+
+    $pdo = db();
+    $serverId = 1;
+    $active = $extension !== '' && asterisk_extension_is_active_for_user_status($userStatus);
+    if (!$active) {
+        $pdo->prepare("UPDATE asterisk_user_extensions
+            SET status = 'Inativo', deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+            WHERE user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'")
+            ->execute([$userId, $serverId]);
+        return;
+    }
+
+    $duplicate = one("SELECT user_id FROM asterisk_user_extensions
+        WHERE company_id = ? AND asterisk_server_id = ? AND extension = ? AND status = 'Ativo' AND user_id <> ?", [$companyId, $serverId, $extension, $userId]);
+    if ($duplicate) {
+        throw new InvalidArgumentException('Este ramal Asterisk ja esta vinculado a outro usuario deste cliente.');
+    }
+
+    $pdo->prepare("UPDATE asterisk_user_extensions
+        SET status = 'Inativo', deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+        WHERE user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'
+          AND (company_id <> ? OR extension <> ?)")
+        ->execute([$userId, $serverId, $companyId, $extension]);
+    $current = one("SELECT id FROM asterisk_user_extensions
+        WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND extension = ? AND status = 'Ativo'", [$companyId, $userId, $serverId, $extension]);
+    if ($current) {
+        $pdo->prepare("UPDATE asterisk_user_extensions SET updated_at = datetime('now') WHERE id = ?")->execute([(int)$current['id']]);
+        return;
+    }
+    $pdo->prepare("INSERT INTO asterisk_user_extensions
+        (company_id, user_id, asterisk_server_id, extension, status, provisioning_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', datetime('now'), datetime('now'))")
+        ->execute([$companyId, $userId, $serverId, $extension]);
+}
 function update_user_access(int $userId, int $companyId): void
 {
     $current = current_user();
@@ -4105,6 +4185,10 @@ function update_user_access(int $userId, int $companyId): void
         flash('Ja existe outro usuario com este e-mail.', 'error');
         return;
     }
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
 
     $newCompanyId = is_platform_admin($current) && post('company_id') ? (int)post('company_id') : (int)$target['company_id'];
     $accessProfileId = is_platform_admin($current) && post('access_profile_id') ? (int)post('access_profile_id') : (int)($target['access_profile_id'] ?? 0);
@@ -4137,8 +4221,14 @@ function update_user_access(int $userId, int $companyId): void
         db()->prepare("INSERT INTO consultant_profiles (company_id, user_id, team_id, display_name, internal_code, status, goal) VALUES (?, ?, ?, ?, ?, ?, ?)")
             ->execute([$newCompanyId, $userId, post('team_id') ?: null, post('consultant_display_name') ?: post('name'), post('consultant_code') ?: post('extension'), post('consultant_status', 'Ativo'), (int)post('consultant_goal', '0')]);
     }
+    sync_user_asterisk_extension($newCompanyId, $userId, (string)post('asterisk_extension'), (string)post('status'));
+    $pdo->commit();
     audit('editou_usuario', 'users:' . $userId, $target, $_POST);
     flash('Acesso atualizado.');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        flash($e instanceof InvalidArgumentException ? $e->getMessage() : 'Nao foi possivel atualizar o acesso.', 'error');
+    }
 }
 
 function save_access_profile(int $profileId, int $companyId, int $userId): int
@@ -5754,8 +5844,11 @@ function asterisk_diagnostics_batch_calls(int $companyId, int $batchId, int $pag
     $batch = one('SELECT id FROM dial_batches WHERE id = ? AND company_id = ?', [$batchId, $companyId]);
     if (!$batch) return ['calls' => [], 'pagination' => ['page' => 1, 'pages' => 1, 'total' => 0]];
     $total = (int)scalar('SELECT COUNT(*) FROM calls WHERE company_id = ? AND dial_batch_id = ?', [$companyId, $batchId]);
-    $calls = rows("SELECT ca.id, ca.provider_channel_id, ca.provider_linked_id, ca.provider_bridge_id, ca.status, ca.internal_status, ca.race_outcome, ca.started_at, ca.ringing_at, ca.answered_at, ca.connected_at, ca.ended_at, ca.finalized_at, ca.duration_seconds, ca.billable_seconds, ca.destination_number, ct.name AS lead_name
-        FROM calls ca LEFT JOIN contacts ct ON ct.id = ca.contact_id AND ct.company_id = ca.company_id
+    $calls = rows("SELECT ca.id, ca.agent_id, ca.provider_channel_id, ca.provider_linked_id, ca.provider_bridge_id, ca.status, ca.internal_status, ca.race_outcome, ca.started_at, ca.ringing_at, ca.answered_at, ca.connected_at, ca.ended_at, ca.finalized_at, ca.duration_seconds, ca.billable_seconds, ca.destination_number, ct.name AS lead_name, u.name AS resolved_agent_name, axe.extension AS asterisk_extension
+        FROM calls ca
+        LEFT JOIN contacts ct ON ct.id = ca.contact_id AND ct.company_id = ca.company_id
+        LEFT JOIN users u ON u.id = ca.agent_id AND u.company_id = ca.company_id
+        LEFT JOIN asterisk_user_extensions axe ON axe.company_id = ca.company_id AND axe.user_id = ca.agent_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo'
         WHERE ca.company_id = ? AND ca.dial_batch_id = ? ORDER BY ca.id ASC LIMIT {$perPage} OFFSET {$offset}", [$companyId, $batchId]);
     foreach ($calls as &$call) {
         $call['phone_masked'] = asterisk_diagnostics_mask_phone((string)$call['destination_number']);
@@ -6401,6 +6494,50 @@ function asterisk_event_key(array $event): string
     return hash('sha256', implode('|', [(string)($event['timestamp'] ?? ''), (string)($event['type'] ?? ''), $channelId, json_encode_safe($event)]));
 }
 
+function asterisk_extension_from_identifier(mixed $identifier): string
+{
+    if (!is_string($identifier) && !is_numeric($identifier)) return '';
+    $value = trim((string)$identifier);
+    if ($value === '') return '';
+    if (preg_match('/^PJSIP\/([0-9]{1,32})(?:[-@\/]|$)/i', $value, $matches) === 1) return $matches[1];
+    if (preg_match('/^([0-9]{1,32})(?:[-@]|$)/', $value, $matches) === 1) return $matches[1];
+    return '';
+}
+
+function asterisk_event_extension(array $event): string
+{
+    $endpoint = $event['endpoint'] ?? null;
+    $candidates = [
+        $event['channel']['name'] ?? null,
+        is_array($endpoint) ? ($endpoint['resource'] ?? null) : $endpoint,
+    ];
+    foreach ($candidates as $candidate) {
+        $extension = asterisk_extension_from_identifier($candidate);
+        if ($extension !== '') return $extension;
+    }
+    return '';
+}
+
+function asterisk_associate_call_user(PDO $pdo, array $call, string $extension): ?int
+{
+    if ($extension === '') return null;
+    $companyId = (int)$call['company_id'];
+    $currentUserId = (int)($call['agent_id'] ?? 0);
+    if ($currentUserId > 0 && one('SELECT id FROM users WHERE id = ? AND company_id = ?', [$currentUserId, $companyId])) return $currentUserId;
+
+    // The current architecture has one configured Asterisk server, represented by ID 1.
+    $link = one("SELECT user_id FROM asterisk_user_extensions WHERE company_id = ? AND asterisk_server_id = 1 AND extension = ? AND status = 'Ativo' LIMIT 1", [$companyId, $extension]);
+    if (!$link) return null;
+    $userId = (int)$link['user_id'];
+    $pdo->prepare('UPDATE calls SET agent_id = ? WHERE id = ? AND company_id = ? AND (agent_id IS NULL OR agent_id = 0)')
+        ->execute([$userId, (int)$call['id'], $companyId]);
+    if (!empty($call['dial_batch_id'])) {
+        $pdo->prepare('UPDATE dial_batches SET agent_id = ? WHERE id = ? AND company_id = ? AND (agent_id IS NULL OR agent_id = 0)')
+            ->execute([$userId, (int)$call['dial_batch_id'], $companyId]);
+    }
+    return $userId;
+}
+
 function asterisk_normalized_event_status(array $event): array
 {
     $type = (string)($event['type'] ?? '');
@@ -6439,6 +6576,7 @@ function asterisk_handle_event(array $event): void
     $eventKey = asterisk_event_key($event);
     $channelId = (string)($event['channel']['id'] ?? '');
     $linkedId = (string)($event['channel']['linkedid'] ?? '');
+    $detectedExtension = asterisk_event_extension($event);
     $eventType = (string)($event['type'] ?? 'unknown');
     $pdo = db();
     $pdo->beginTransaction();
@@ -6449,6 +6587,11 @@ function asterisk_handle_event(array $event): void
         $call = $channelId !== '' ? one('SELECT * FROM calls WHERE provider_channel_id = ? ORDER BY id DESC LIMIT 1', [$channelId]) : null;
         if (!$call && $linkedId !== '') $call = one('SELECT * FROM calls WHERE provider_linked_id = ? ORDER BY id DESC LIMIT 1', [$linkedId]);
         if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') { $pdo->commit(); return; }
+        $resolvedUserId = asterisk_associate_call_user($pdo, $call, $detectedExtension);
+        if ($detectedExtension !== '' || $resolvedUserId !== null) {
+            $event['_ligflow'] = ['detected_extension' => $detectedExtension, 'resolved_user_id' => $resolvedUserId];
+            $pdo->prepare('UPDATE asterisk_ari_events SET payload_json = ? WHERE event_key = ?')->execute([json_encode_safe($event), $eventKey]);
+        }
         $pdo->prepare('UPDATE asterisk_ari_events SET call_id = ? WHERE event_key = ?')->execute([(int)$call['id'], $eventKey]);
         $terminal = !empty($call['finalized_at']);
         [$status, $internal, $isFinal] = asterisk_event_transition($event, $call);
@@ -7307,11 +7450,11 @@ function render_users(): void
         $editProfile = $editProfileId ? one('SELECT * FROM access_profiles WHERE id = ? AND company_id = ?', [$editProfileId, $profileCompanyId]) : null;
         $showProfileModal = $isPlatformAdmin && (isset($_GET['new_profile']) || $editProfile);
         $editUserId = (int)($_GET['edit_user'] ?? 0);
-        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id WHERE u.id = ? AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
+        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
         $userProfileCompanyId = $editUser ? (int)$editUser['company_id'] : $profileCompanyId;
         $userProfiles = rows('SELECT * FROM access_profiles WHERE company_id = ? ORDER BY role_key, name', [$userProfileCompanyId]);
         $showCreateModal = $isPlatformAdmin && isset($_GET['new_user']);
-        $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id WHERE {$userClause} ORDER BY u.id DESC", $userParams);
+        $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} ORDER BY u.id DESC", $userParams);
         ?>
         <?php if ($showProfileModal): ?>
             <?php
@@ -7379,6 +7522,7 @@ function render_users(): void
                     <label>Status<select name="status"><?php foreach (['Ativo','Disponivel','Em pausa','Desconectado','Bloqueado'] as $status): ?><option <?= $editUser['status'] === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
                     <label>Nome de consultor<input name="consultant_display_name" value="<?= h($editUser['consultant_display_name'] ?: $editUser['name']) ?>"></label>
                     <label>Identificacao<input name="extension" value="<?= h($editUser['extension']) ?>" placeholder="Opcional"></label>
+                    <label>Ramal Asterisk<input name="asterisk_extension" value="<?= h((string)($editUser['asterisk_extension'] ?? '')) ?>" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"><small><?= h((string)($editUser['asterisk_extension_status'] ?? 'Sem ramal')) ?><?= !empty($editUser['asterisk_provisioning_status']) ? ' - ' . h((string)$editUser['asterisk_provisioning_status']) : '' ?></small></label>
                     <?php if ($isPlatformAdmin): ?>
                         <h3 class="wide">Modulos deste usuario</h3>
                         <?= module_checkboxes(modules_for_user($editUser)) ?>
@@ -7405,7 +7549,7 @@ function render_users(): void
             <?php else: ?>
                 <div class="table-wrap">
                     <table>
-                        <thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Equipe</th><th>Status</th><th>Identificacao</th><th></th></tr></thead>
+                        <thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Equipe</th><th>Status</th><th>Identificacao</th><th>Ramal Asterisk</th><th></th></tr></thead>
                         <tbody>
                         <?php foreach ($accessRows as $access): ?>
                             <tr>
@@ -7415,6 +7559,7 @@ function render_users(): void
                                 <td><?= h($access['equipe']) ?></td>
                                 <td><?= h($access['status']) ?></td>
                                 <td><?= h($access['identificacao']) ?></td>
+                                <td><?= h($access['asterisk_extension']) ?><small><?= h($access['asterisk_extension_status']) ?></small></td>
                                 <td><a class="mini-link" href="?page=users&edit_user=<?= (int)$access['id'] ?>">Editar</a></td>
                             </tr>
                         <?php endforeach; ?>
@@ -7454,6 +7599,7 @@ function render_users(): void
                             <?php endforeach; ?>
                         </select></label>
                         <label>Telefone<input name="phone" data-phone-mask inputmode="tel" placeholder="Ex: (41) 99631-0725"></label>
+                        <label>Ramal Asterisk<input name="asterisk_extension" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"></label>
                         <h3 class="wide">Modulos deste usuario</h3>
                         <?= module_checkboxes(default_role_modules('usuario_operacional')) ?>
                         <button class="button">Cadastrar</button>
@@ -9591,9 +9737,9 @@ function render_asterisk_diagnostics(): void
         <?php if ($detail !== null): ?>
         <section class="panel">
             <div class="section-heading"><div><h2>Chamadas do lote #<?= (int)$filters['batch_id'] ?></h2><p class="hint">Telefones mascarados e dados tecnicos disponiveis apenas para suporte.</p></div><a class="button secondary" href="?page=asterisk_diagnostics">Fechar detalhes</a></div>
-            <div class="table-wrap"><table><thead><tr><th>Lead</th><th>Telefone</th><th>Channel ID</th><th>Status tecnico</th><th>Race outcome</th><th>Inicio / toque / atendida</th><th>Encerramento</th><th>Hangup</th><th>Duracao</th></tr></thead><tbody>
-                <?php foreach ($detail['calls'] as $call): ?><tr><td><?= h($call['lead_name'] ?: '-') ?></td><td><?= h($call['phone_masked']) ?></td><td><?= h($call['provider_channel_id'] ?: '-') ?></td><td><?= h($call['status'] . ' / ' . ($call['internal_status'] ?: '-')) ?></td><td><?= h($call['race_outcome'] ?: '-') ?></td><td><?= h(datetime_utc_display((string)$call['started_at'])) ?> / <?= h(datetime_utc_display((string)$call['ringing_at'])) ?> / <?= h(datetime_utc_display((string)$call['answered_at'])) ?></td><td><?= h(datetime_utc_display((string)($call['ended_at'] ?: $call['finalized_at']))) ?></td><td><?= $call['hangup_requested'] ? 'Solicitado' : '-' ?><?= $call['hangup_confirmed'] ? ' / Confirmado' : '' ?></td><td><?= h(asterisk_diagnostics_duration((int)($call['duration_seconds'] ?: $call['billable_seconds'] ?: 0))) ?></td></tr><?php endforeach; ?>
-                <?php if (!$detail['calls']): ?><tr><td colspan="9" class="empty">Nenhuma chamada encontrada.</td></tr><?php endif; ?>
+            <div class="table-wrap"><table><thead><tr><th>Lead</th><th>Telefone</th><th>Ramal / consultor</th><th>Channel ID</th><th>Status tecnico</th><th>Race outcome</th><th>Inicio / toque / atendida</th><th>Encerramento</th><th>Hangup</th><th>Duracao</th></tr></thead><tbody>
+                <?php foreach ($detail['calls'] as $call): ?><tr><td><?= h($call['lead_name'] ?: '-') ?></td><td><?= h($call['phone_masked']) ?></td><td><?= h(($call['asterisk_extension'] ?: '-') . ' / ' . ($call['resolved_agent_name'] ?: '-')) ?></td><td><?= h($call['provider_channel_id'] ?: '-') ?></td><td><?= h($call['status'] . ' / ' . ($call['internal_status'] ?: '-')) ?></td><td><?= h($call['race_outcome'] ?: '-') ?></td><td><?= h(datetime_utc_display((string)$call['started_at'])) ?> / <?= h(datetime_utc_display((string)$call['ringing_at'])) ?> / <?= h(datetime_utc_display((string)$call['answered_at'])) ?></td><td><?= h(datetime_utc_display((string)($call['ended_at'] ?: $call['finalized_at']))) ?></td><td><?= $call['hangup_requested'] ? 'Solicitado' : '-' ?><?= $call['hangup_confirmed'] ? ' / Confirmado' : '' ?></td><td><?= h(asterisk_diagnostics_duration((int)($call['duration_seconds'] ?: $call['billable_seconds'] ?: 0))) ?></td></tr><?php endforeach; ?>
+                <?php if (!$detail['calls']): ?><tr><td colspan="10" class="empty">Nenhuma chamada encontrada.</td></tr><?php endif; ?>
             </tbody></table></div>
         </section>
         <?php endif; ?>
