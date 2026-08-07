@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 11;
+const DB_SCHEMA_VERSION = 14;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -469,7 +469,9 @@ function migrate(PDO $pdo): void
             sip_domain TEXT,
             consultant_endpoint TEXT,
             nvoip_trunk TEXT NOT NULL DEFAULT 'NVOIP_TRUNK',
-            directcall_trunk TEXT NOT NULL DEFAULT 'DIRECTCALL_TRUNK',
+            directcall_trunk TEXT NOT NULL DEFAULT 'directcall',
+            webrtc_password_encrypted TEXT,
+            webrtc_context TEXT,
             nvoip_trunk_config_json TEXT DEFAULT '{}',
             directcall_trunk_config_json TEXT DEFAULT '{}',
             updated_by INTEGER,
@@ -597,6 +599,8 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'connected_at', 'TEXT');
     ensure_column($pdo, 'calls', 'finalized_at', 'TEXT');
     ensure_column($pdo, 'calls', 'hangup_cause', 'TEXT');
+    ensure_column($pdo, 'asterisk_settings', 'webrtc_password_encrypted', 'TEXT');
+    ensure_column($pdo, 'asterisk_settings', 'webrtc_context', 'TEXT');
     ensure_column($pdo, 'callbacks', 'call_id', 'INTEGER');
     ensure_column($pdo, 'callbacks', 'completed_at', 'TEXT');
     ensure_column($pdo, 'plans', 'monthly_price', 'REAL DEFAULT 0');
@@ -1769,6 +1773,28 @@ interface TelephonyProvider
     public function health(): array;
 }
 
+function valid_asterisk_trunk_identifier(string $value): bool
+{
+    return preg_match('/^[A-Za-z0-9_-]+$/', $value) === 1;
+}
+
+function valid_asterisk_webrtc_domain(string $domain): bool
+{
+    return preg_match('/^[A-Za-z0-9.-]+$/', $domain) === 1 && !str_contains($domain, '..') && !str_starts_with($domain, '.') && !str_ends_with($domain, '.');
+}
+function valid_asterisk_webrtc_endpoint(string $endpoint): bool
+{
+    return preg_match('/^(?:PJSIP\\/)?[A-Za-z0-9_.-]+$/i', $endpoint) === 1;
+}
+function valid_asterisk_webrtc_wss_url(string $url): bool
+{
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
+    $parts = parse_url($url);
+    $scheme = strtolower((string)($parts['scheme'] ?? ''));
+    $host = strtolower((string)($parts['host'] ?? ''));
+    if ($scheme === 'wss') return true;
+    return $scheme === 'ws' && in_array($host, ['localhost', '127.0.0.1', '::1'], true);
+}
 function asterisk_config(): array
 {
     $row = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
@@ -1791,8 +1817,10 @@ function asterisk_config(): array
         'sip_wss_url' => (string)($row['sip_wss_url'] ?? ''),
         'sip_domain' => (string)($row['sip_domain'] ?? ''),
         'consultant_endpoint' => trim((string)($row['consultant_endpoint'] ?? '')),
+        'webrtc_password' => !empty($row['webrtc_password_encrypted']) ? decrypt_secret((string)$row['webrtc_password_encrypted']) : '',
+        'webrtc_context' => trim((string)($row['webrtc_context'] ?? '')),
         'nvoip_trunk' => trim((string)($row['nvoip_trunk'] ?? 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK',
-        'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'DIRECTCALL_TRUNK')) ?: 'DIRECTCALL_TRUNK',
+        'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'directcall')) ?: 'directcall',
     ];
 }
 
@@ -3006,25 +3034,39 @@ function handle_post(): void
         }
         $mode = strtoupper((string)post('active_mode', 'NVOIP_DIRECT'));
         $route = strtoupper((string)post('active_route', 'NVOIP_TRUNK'));
-        if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) {
-            flash('Modo ou rota Asterisk invalida.', 'error'); redirect('?page=settings#asterisk');
-        }
+        $environment = strtolower((string)post('environment', 'test'));
         $ariUrl = trim((string)post('ari_url'));
         $ariWsUrl = trim((string)post('ari_ws_url'));
-        if ((int)post('enabled') === 1 && (!filter_var($ariUrl, FILTER_VALIDATE_URL) || !filter_var($ariWsUrl, FILTER_VALIDATE_URL))) {
-            flash('Informe URLs ARI e WebSocket validas para habilitar o Asterisk.', 'error'); redirect('?page=settings#asterisk');
+        $sipWssUrl = trim((string)post('sip_wss_url'));
+        $sipDomain = trim((string)post('sip_domain'));
+        $consultantEndpoint = trim((string)post('consultant_endpoint'));
+        $webrtcContext = trim((string)post('webrtc_context'));
+        $directcallTrunk = trim((string)post('directcall_trunk'));
+        if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true) || !in_array($environment, ['test', 'production'], true)) {
+            flash('Modo, rota ou ambiente Asterisk invalido.', 'error'); redirect('?page=settings#asterisk');
         }
-        $password = trim((string)post('ari_password'));
-        $encrypted = $password !== '' ? encrypt_secret($password) : (string)($existing['ari_password_encrypted'] ?? '');
-        db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, updated_by, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
-            ->execute([(int)post('enabled'), (string)post('environment', 'test'), $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $encrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), trim((string)post('sip_wss_url')), trim((string)post('sip_domain')), trim((string)post('consultant_endpoint')), trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', trim((string)post('directcall_trunk', 'DIRECTCALL_TRUNK')) ?: 'DIRECTCALL_TRUNK', trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', (int)$user['id']]);
-        audit('atualizou_asterisk', 'asterisk_settings:1');
+        if ($directcallTrunk === '' || !valid_asterisk_trunk_identifier($directcallTrunk) || ($webrtcContext !== '' && !valid_asterisk_trunk_identifier($webrtcContext))) {
+            flash('Contexto WebRTC ou tronco DirectCall invalido. Use apenas letras, numeros, hifen e underscore.', 'error'); redirect('?page=settings#asterisk');
+        }
+        if (($sipWssUrl !== '' && !valid_asterisk_webrtc_wss_url($sipWssUrl)) || ($sipDomain !== '' && !valid_asterisk_webrtc_domain($sipDomain)) || ($consultantEndpoint !== '' && !valid_asterisk_webrtc_endpoint($consultantEndpoint))) {
+            flash('Configuracao SIP/WebRTC invalida. Informe WSS (ou WS apenas em localhost), dominio sem protocolo e endpoint PJSIP valido.', 'error'); redirect('?page=settings#asterisk');
+        }
+        if ((int)post('enabled') === 1 && (!filter_var($ariUrl, FILTER_VALIDATE_URL) || !filter_var($ariWsUrl, FILTER_VALIDATE_URL) || !valid_asterisk_webrtc_wss_url($sipWssUrl) || !valid_asterisk_webrtc_domain($sipDomain) || !valid_asterisk_webrtc_endpoint($consultantEndpoint) || $webrtcContext === '')) {
+            flash('Informe ARI, WebSocket, WSS SIP, dominio, endpoint e contexto WebRTC validos para habilitar o Asterisk.', 'error'); redirect('?page=settings#asterisk');
+        }
+        $ariPassword = trim((string)post('ari_password'));
+        $ariPasswordEncrypted = $ariPassword !== '' ? encrypt_secret($ariPassword) : (string)($existing['ari_password_encrypted'] ?? '');
+        $webrtcPassword = trim((string)post('webrtc_password'));
+        $webrtcPasswordEncrypted = $webrtcPassword !== '' ? encrypt_secret($webrtcPassword) : (string)($existing['webrtc_password_encrypted'] ?? '');
+        $webrtcPasswordChange = $webrtcPassword !== '' ? (!empty($existing['webrtc_password_encrypted']) ? 'substituida' : 'criada') : 'preservada';
+        db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, updated_by, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
+            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', (int)$user['id']]);
+        audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? '')]);
         flash('Configuracao Asterisk salva. O modo atual para novas chamadas e ' . $mode . '.');
         redirect('?page=settings#asterisk');
     }
-
 
     if (($action === 'save_integration_settings' || $action === 'save_nvoip_settings') && can('settings')) {
         $provider = integration_provider_key((string)post('provider'));
@@ -5352,6 +5394,43 @@ function handle_sip_config(): never
     if (!is_secure_or_local_request()) {
         http_response_code(426);
         echo json_encode(['ok' => false, 'error' => 'Use HTTPS para registrar o webphone SIP/WebRTC. Em desenvolvimento, localhost e permitido.']);
+        exit;
+    }
+
+    $asterisk = asterisk_config();
+    if ($asterisk['active_mode'] === 'ASTERISK') {
+        $sipUsername = preg_replace('/^PJSIP\//i', '', (string)$asterisk['consultant_endpoint']);
+        $sipPassword = trim((string)$asterisk['webrtc_password']);
+        if ($sipPassword === '') $sipPassword = trim((string)env_value('ASTERISK_WEBRTC_PASSWORD'));
+        $isComplete = $asterisk['enabled']
+            && valid_asterisk_webrtc_wss_url((string)$asterisk['sip_wss_url'])
+            && valid_asterisk_webrtc_domain((string)$asterisk['sip_domain'])
+            && valid_asterisk_webrtc_endpoint((string)$asterisk['consultant_endpoint'])
+            && valid_asterisk_trunk_identifier((string)$asterisk['webrtc_context'])
+            && $sipUsername !== ''
+            && $sipPassword !== '';
+        if (!$isComplete) {
+            http_response_code(422);
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store, private');
+            echo json_encode(['ok' => false, 'error' => 'Configuracao SIP/WebRTC do Asterisk incompleta. Revise WSS, dominio, endpoint, contexto e senha WebRTC.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        audit('consultou_config_sip', 'users:' . $user['id'], null, ['provider' => 'ASTERISK', 'has_sip_user' => true, 'has_sip_password' => true]);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, private');
+        echo json_encode([
+            'ok' => true,
+            'wssUrl' => $asterisk['sip_wss_url'],
+            'domain' => $asterisk['sip_domain'],
+            'sipUsername' => $sipUsername,
+            'sipPassword' => $sipPassword,
+            'provider' => 'ASTERISK',
+            'providerLabel' => 'Asterisk WebRTC',
+            'autoAnswer' => false,
+            'callbackTimeoutSeconds' => max(10, (int)$asterisk['originate_timeout_seconds']),
+            'secureContext' => is_secure_or_local_request(),
+        ], JSON_UNESCAPED_UNICODE);
         exit;
     }
 
@@ -8661,9 +8740,9 @@ function render_settings(): void
             </div>
         </details>
         <details class="panel import-history-disclosure" id="mercado-pago">
-            <summary><span>Mercado Pago</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+            <summary><span>Metodo de pagamento</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
-            <div class="section-head"><div><h2>Mercado Pago</h2><p>Configuracao global de cobranca dos planos LigFlow.</p></div><span class="status-badge <?= $mpConfig['active'] ? 'called' : '' ?>"><?= $mpConfig['active'] ? 'Ativa' : 'Inativa' ?></span></div>
+            <div class="section-head"><div><h2>Metodo de pagamento</h2><p>Configuracao global de cobranca dos planos LigFlow.</p></div><span class="status-badge <?= $mpConfig['active'] ? 'called' : '' ?>"><?= $mpConfig['active'] ? 'Ativa' : 'Inativa' ?></span></div>
             <form method="post" class="form-grid">
                 <input type="hidden" name="action" value="save_mercado_pago_settings">
                 <label class="check"><input type="checkbox" name="active" <?= $mpConfig['active']?'checked':'' ?>> Integracao ativa</label>
@@ -8734,7 +8813,7 @@ function render_settings(): void
         </details>
         <section>
             <details class="panel import-history-disclosure" <?= isset($_GET['new']) || isset($_GET['provider']) ? 'open' : '' ?>>
-                <summary><span><?= $isNew ? 'Nova integracao' : 'Configuracao e status da integracao' ?></span><span class="import-history-chevron" aria-hidden="true"></span></summary>
+                <summary><span><?= $isNew ? 'Nova integracao' : 'Integracao Nvoip nativa' ?></span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="grid two import-history-content">
             <form class="form-grid" method="post">
                 <input type="hidden" name="action" value="save_integration_settings">
@@ -8821,6 +8900,13 @@ function render_asterisk_settings_section(): void
     $saved = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
     $config = asterisk_config();
     $hasPassword = !empty($saved['ari_password_encrypted']);
+    $hasWebrtcPassword = !empty($saved['webrtc_password_encrypted']);
+    $webrtcPasswordSource = $hasWebrtcPassword ? 'Painel' : (trim((string)env_value('ASTERISK_WEBRTC_PASSWORD')) !== '' ? 'Variavel de ambiente' : 'Ausente');
+    $webrtcReady = valid_asterisk_webrtc_wss_url((string)$config['sip_wss_url'])
+        && valid_asterisk_webrtc_domain((string)$config['sip_domain'])
+        && valid_asterisk_webrtc_endpoint((string)$config['consultant_endpoint'])
+        && valid_asterisk_trunk_identifier((string)$config['webrtc_context'])
+        && $webrtcPasswordSource !== 'Ausente';
     ?>
     <section>
         <details class="panel import-history-disclosure" id="asterisk">
@@ -8839,6 +8925,9 @@ function render_asterisk_settings_section(): void
                 <label>Senha ARI<input name="ari_password" type="password" placeholder="<?= $hasPassword ? 'Senha salva (deixe vazio para manter)' : 'Senha ARI' ?>"></label>
                 <label>Aplicacao Stasis<input name="stasis_app" value="<?= h($config['stasis_app']) ?>"></label>
                 <label>Ramal/endpoint do consultor<input name="consultant_endpoint" value="<?= h($config['consultant_endpoint']) ?>" placeholder="PJSIP/1001"></label>
+                <label>Senha SIP/WebRTC<input name="webrtc_password" type="password" autocomplete="new-password" placeholder="<?= $hasWebrtcPassword ? 'Senha salva (deixe vazio para manter)' : 'Senha SIP/WebRTC' ?>"></label>
+                <label>Contexto WebRTC<input name="webrtc_context" value="<?= h($config['webrtc_context']) ?>" pattern="[A-Za-z0-9_-]+" placeholder="from-ligflow-webrtc"></label>
+                <p class="hint wide">A senha ARI e a senha SIP/WebRTC sao independentes.</p>
                 <label>Timeout de originacao (segundos)<input name="originate_timeout_seconds" type="number" min="5" value="<?= (int)$config['originate_timeout_seconds'] ?>"></label>
                 <label>Timeout de bridge (segundos)<input name="bridge_timeout_seconds" type="number" min="5" value="<?= (int)$config['bridge_timeout_seconds'] ?>"></label>
                 <label>Reconexao inicial (segundos)<input name="reconnect_initial_seconds" type="number" min="1" value="<?= (int)$config['reconnect_initial_seconds'] ?>"></label>
@@ -8846,10 +8935,11 @@ function render_asterisk_settings_section(): void
                 <label>WSS SIP/WebRTC<input name="sip_wss_url" type="url" value="<?= h($config['sip_wss_url']) ?>"></label>
                 <label>Dominio SIP/WebRTC<input name="sip_domain" value="<?= h($config['sip_domain']) ?>"></label>
                 <label>Tronco Nvoip<input name="nvoip_trunk" value="<?= h($config['nvoip_trunk']) ?>" readonly></label>
-                <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" readonly></label>
+                <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" pattern="[A-Za-z0-9_-]+"></label>
+                <?php if (strcasecmp($config['directcall_trunk'], 'DIRECTCALL_TRUNK') === 0): ?><p class="hint wide">O tronco salvo parece ser o nome logico anterior. Confira o endpoint PJSIP real no Asterisk antes de salvar.</p><?php endif; ?>
                 <label class="wide">Configuracao operacional Nvoip (JSON)<textarea name="nvoip_trunk_config_json" rows="2"><?= h((string)($saved['nvoip_trunk_config_json'] ?? '{}')) ?></textarea></label>
                 <label class="wide">Configuracao operacional DirectCall (JSON)<textarea name="directcall_trunk_config_json" rows="2"><?= h((string)($saved['directcall_trunk_config_json'] ?? '{}')) ?></textarea></label>
-                <div class="script-box wide"><strong>Saude configurada</strong><p>Servidor/ARI: <?= $config['ari_url'] && $config['ari_username'] && $hasPassword ? 'configurado' : 'pendente' ?>; WebSocket: <?= $config['ari_ws_url'] ? 'configurado' : 'pendente' ?>; WebRTC: <?= $config['sip_wss_url'] && $config['sip_domain'] ? 'configurado' : 'pendente' ?>; NVOIP_TRUNK e DIRECTCALL_TRUNK: configuracao separada pronta. Use Testar conexao para validar o ARI.</p></div>
+                <div class="script-box wide"><strong>Saude configurada</strong><p>Servidor/ARI: <?= $config['ari_url'] && $config['ari_username'] && $hasPassword ? 'configurado' : 'pendente' ?>; WebSocket: <?= $config['ari_ws_url'] ? 'configurado' : 'pendente' ?>; WebRTC: <?= $webrtcReady ? 'configurado' : 'pendente' ?>; senha WebRTC: <?= h($webrtcPasswordSource) ?>. Use Testar conexao para validar o ARI.</p></div>
                 <div class="button-row wide"><button class="button">Salvar Asterisk</button><button class="button secondary" name="action" value="test_asterisk_connection">Testar conexao</button></div>
             </form>
         </details>
