@@ -815,3 +815,87 @@ document.addEventListener('keydown', (event) => {
         input.closest('form').requestSubmit();
     }
 });
+
+(() => {
+    const root = document.querySelector('[data-asterisk-diagnostics]');
+    if (!root) return;
+
+    const batchesTarget = document.querySelector('[data-asterisk-batches]');
+    const alertsTarget = document.querySelector('[data-asterisk-alert-list]');
+    const refreshStatus = document.querySelector('[data-asterisk-refresh-status]');
+    const totalTarget = document.querySelector('[data-asterisk-total]');
+    let timer = null;
+    let busy = false;
+    let delay = 5000;
+    const maxDelay = 30000;
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#039;', '"': '&quot;' }[char]));
+    const displayDate = (value) => {
+        if (!value) return '-';
+        const parsed = new Date(`${String(value).replace(' ', 'T')}Z`);
+        return Number.isNaN(parsed.getTime()) ? '-' : new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', dateStyle: 'short', timeStyle: 'medium' }).format(parsed);
+    };
+    const duration = (value) => {
+        const seconds = Math.max(0, Number(value || 0));
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remaining = seconds % 60;
+        return [hours, minutes, remaining].map((item) => String(item).padStart(2, '0')).join(':');
+    };
+    const schedule = () => {
+        window.clearTimeout(timer);
+        if (!document.hidden && navigator.onLine) timer = window.setTimeout(refresh, delay);
+    };
+    const render = (data) => {
+        const health = data.health || {};
+        const set = (selector, value) => { const element = document.querySelector(selector); if (element) element.textContent = value; };
+        set('[data-health-ari]', health.ari?.state || '-');
+        set('[data-health-worker]', health.worker?.state || '-');
+        set('[data-health-worker-at]', displayDate(health.worker?.last_event_at));
+        set('[data-health-webrtc]', health.webrtc?.state || '-');
+        set('[data-health-endpoint]', health.webrtc?.endpoint || '-');
+        if (totalTarget) totalTarget.textContent = `${data.pagination?.total || 0} lote(s)`;
+        if (alertsTarget) {
+            const alerts = data.alerts || [];
+            alertsTarget.innerHTML = alerts.length
+                ? alerts.map((alert) => `<p class="alert ${alert.level === 'error' ? 'error' : 'warning'}">${alert.batch_id ? `Batch #${Number(alert.batch_id)}: ` : ''}${escapeHtml(alert.message)}</p>`).join('')
+                : '<p class="hint">Nenhum alerta para os lotes exibidos.</p>';
+        }
+        if (batchesTarget) {
+            const batches = data.batches || [];
+            batchesTarget.innerHTML = batches.length ? batches.map((batch) => {
+                const started = batch.created_at ? Math.floor((Date.now() - new Date(`${String(batch.created_at).replace(' ', 'T')}Z`).getTime()) / 1000) : 0;
+                return `<tr><td><a href="?page=asterisk_diagnostics&batch_id=${Number(batch.id)}">#${Number(batch.id)}</a></td><td>${escapeHtml(batch.tenant_name || '-')}</td><td>${escapeHtml(batch.campaign_name || '-')}</td><td>${escapeHtml(batch.agent_name || '-')}</td><td>${escapeHtml(batch.status || '-')}</td><td>${Number(batch.requested_parallelism || 0)} / ${Number(batch.effective_parallelism || 0)}</td><td>${escapeHtml(`${batch.telephony_mode || '-'} / ${batch.telephony_trunk || '-'}`)}</td><td>${displayDate(batch.created_at)}</td><td>${duration(started)}</td><td>${Number(batch.originated_count || 0)} / ${Number(batch.active_count || 0)} / ${Number(batch.finalized_count || 0)}</td><td>${Number(batch.winner_count || 0)} / ${Number(batch.loser_count || 0)} / ${Number(batch.late_answered_count || 0)}</td><td>${displayDate(batch.next_started_at)}</td></tr>`;
+            }).join('') : '<tr><td colspan="12" class="empty">Nenhum lote encontrado.</td></tr>';
+        }
+    };
+    const refresh = async () => {
+        if (busy || document.hidden || !navigator.onLine) return;
+        busy = true;
+        try {
+            const params = new URLSearchParams(window.location.search);
+            params.set('page', 'asterisk_diagnostics_data');
+            params.delete('call_page');
+            const response = await fetch(`?${params.toString()}`, { headers: { Accept: 'application/json' } });
+            const body = await response.text();
+            const data = body.trim() ? JSON.parse(body) : null;
+            if (!response.ok || !data?.ok) throw new Error(data?.error || 'Falha ao atualizar diagnostico.');
+            render(data);
+            delay = 5000;
+            if (refreshStatus) refreshStatus.textContent = `Atualizado ${new Date().toLocaleTimeString('pt-BR')}`;
+        } catch (error) {
+            delay = Math.min(maxDelay, delay * 2);
+            if (refreshStatus) refreshStatus.textContent = 'Atualizacao indisponivel';
+        } finally {
+            busy = false;
+            schedule();
+        }
+    };
+    schedule();
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return window.clearTimeout(timer);
+        delay = 5000;
+        refresh();
+    });
+    window.addEventListener('online', () => { delay = 5000; refresh(); });
+    window.addEventListener('offline', () => window.clearTimeout(timer));
+})();

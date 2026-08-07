@@ -997,6 +997,7 @@ function access_modules(): array
         'recordings' => 'Gravacoes',
         'costs' => 'Plano e consumo',
         'settings' => 'Integracoes',
+        'asterisk_diagnostics' => 'Diagnostico Asterisk',
         'radar' => 'Radar de Leads',
         'blocklist' => 'Bloqueio',
         'audit' => 'Auditoria',
@@ -1007,8 +1008,8 @@ function access_modules(): array
 function default_role_modules(string $role): array
 {
     $matrix = [
-        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
-        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'blocklist', 'audit'],
+        'admin_plataforma' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'asterisk_diagnostics', 'blocklist', 'audit'],
+        'admin_geral' => ['dashboard', 'companies', 'plans', 'users', 'lists', 'campaigns', 'radar', 'agent', 'supervisor', 'reports', 'recordings', 'costs', 'settings', 'asterisk_diagnostics', 'blocklist', 'audit'],
         'cliente_admin' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'admin_empresa' => ['dashboard', 'users', 'lists', 'campaigns', 'radar', 'agent', 'reports', 'recordings', 'costs', 'blocklist'],
         'usuario_operacional' => ['dashboard', 'lists', 'agent', 'reports', 'recordings'],
@@ -5573,6 +5574,174 @@ function is_secure_or_local_request(): bool
     return $https || str_starts_with($host, 'localhost') || str_starts_with($host, '127.0.0.1');
 }
 
+function asterisk_diagnostics_can_access(?array $user = null): bool
+{
+    $user ??= current_user();
+    return $user !== null && (is_platform_admin($user) || can('asterisk_diagnostics'));
+}
+
+function asterisk_diagnostics_company_id(array $user): int
+{
+    $companyId = (int)($user['company_id'] ?? 0);
+    if (is_platform_admin($user) && isset($_GET['company_id']) && (int)$_GET['company_id'] > 0) {
+        $candidate = (int)$_GET['company_id'];
+        if (one('SELECT id FROM companies WHERE id = ?', [$candidate])) {
+            $companyId = $candidate;
+        }
+    }
+    return $companyId;
+}
+
+function asterisk_diagnostics_mask_phone(?string $value): string
+{
+    $digits = preg_replace('/\D+/', '', (string)$value);
+    if ($digits === '') return '-';
+    return str_repeat('*', max(0, strlen($digits) - 4)) . substr($digits, -4);
+}
+
+function asterisk_diagnostics_duration(int $seconds): string
+{
+    $seconds = max(0, $seconds);
+    return sprintf('%02d:%02d:%02d', intdiv($seconds, 3600), intdiv($seconds % 3600, 60), $seconds % 60);
+}
+
+function asterisk_diagnostics_filters(): array
+{
+    $status = strtoupper(trim((string)($_GET['status'] ?? '')));
+    $allowed = ['ORIGINATING', 'RINGING', 'WINNER', 'CONNECTED', 'NO_WINNER', 'CANCELLED'];
+    return [
+        'campaign_id' => max(0, (int)($_GET['campaign_id'] ?? 0)),
+        'agent_id' => max(0, (int)($_GET['agent_id'] ?? 0)),
+        'batch_id' => max(0, (int)($_GET['batch_id'] ?? 0)),
+        'status' => in_array($status, $allowed, true) ? $status : '',
+        'from' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)($_GET['from'] ?? '')) ? (string)$_GET['from'] : '',
+        'to' => preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)($_GET['to'] ?? '')) ? (string)$_GET['to'] : '',
+        'page' => max(1, (int)($_GET['batch_page'] ?? 1)),
+    ];
+}
+
+function asterisk_diagnostics_is_stale(?string $value, int $seconds): bool
+{
+    if (!$value) return true;
+    try {
+        $at = new DateTimeImmutable((string)$value, new DateTimeZone('UTC'));
+        return time() - $at->getTimestamp() > $seconds;
+    } catch (Throwable) {
+        return true;
+    }
+}
+
+function asterisk_diagnostics_payload(int $companyId, array $filters): array
+{
+    $where = ['b.company_id = ?'];
+    $params = [$companyId];
+    foreach (['campaign_id', 'agent_id', 'batch_id'] as $field) {
+        if (!empty($filters[$field])) {
+            $where[] = 'b.' . $field . ' = ?';
+            $params[] = (int)$filters[$field];
+        }
+    }
+    if ($filters['status'] !== '') { $where[] = 'b.status = ?'; $params[] = $filters['status']; }
+    if ($filters['from'] !== '') { $where[] = 'b.created_at >= ?'; $params[] = $filters['from'] . ' 00:00:00'; }
+    if ($filters['to'] !== '') { $where[] = "b.created_at < datetime(?, '+1 day')"; $params[] = $filters['to'] . ' 00:00:00'; }
+    $whereSql = implode(' AND ', $where);
+    $perPage = 10;
+    $offset = ($filters['page'] - 1) * $perPage;
+    $total = (int)scalar('SELECT COUNT(*) FROM dial_batches b WHERE ' . $whereSql, $params);
+    $sql = "SELECT b.id, b.campaign_id, b.agent_id, b.requested_parallelism, b.effective_parallelism, b.telephony_mode, b.telephony_trunk, b.status, b.winner_call_id, b.next_started_at, b.created_at, b.updated_at, co.trade_name AS tenant_name, cp.name AS campaign_name, u.name AS agent_name,
+        COUNT(ca.id) AS originated_count,
+        SUM(CASE WHEN ca.status IN ('in_progress','calling_origin','ringing','answered','connected') AND ca.finalized_at IS NULL THEN 1 ELSE 0 END) AS active_count,
+        SUM(CASE WHEN ca.finalized_at IS NOT NULL OR ca.status IN ('completed','failed','cancelled','busy','no_answer') THEN 1 ELSE 0 END) AS finalized_count,
+        SUM(CASE WHEN ca.race_outcome = 'WINNER' THEN 1 ELSE 0 END) AS winner_count,
+        SUM(CASE WHEN ca.race_outcome = 'LOSER' THEN 1 ELSE 0 END) AS loser_count,
+        SUM(CASE WHEN ca.race_outcome = 'LATE_ANSWERED' THEN 1 ELSE 0 END) AS late_answered_count,
+        SUM(CASE WHEN ca.race_outcome IN ('LOSER','LATE_ANSWERED') AND ca.finalized_at IS NULL AND ca.status IN ('in_progress','calling_origin','ringing','answered','connected') THEN 1 ELSE 0 END) AS active_loser_count,
+        MAX(COALESCE(ca.last_event_at, ca.updated_at, ca.created_at)) AS last_call_event_at,
+        wc.provider_bridge_id AS winner_bridge_id
+        FROM dial_batches b
+        JOIN companies co ON co.id = b.company_id
+        LEFT JOIN campaigns cp ON cp.id = b.campaign_id AND cp.company_id = b.company_id
+        LEFT JOIN users u ON u.id = b.agent_id AND u.company_id = b.company_id
+        LEFT JOIN calls ca ON ca.dial_batch_id = b.id AND ca.company_id = b.company_id
+        LEFT JOIN calls wc ON wc.id = b.winner_call_id AND wc.company_id = b.company_id
+        WHERE {$whereSql}
+        GROUP BY b.id
+        ORDER BY b.id DESC LIMIT {$perPage} OFFSET {$offset}";
+    $batches = rows($sql, $params);
+    $activeStatuses = "'ORIGINATING','RINGING','WINNER','CONNECTED'";
+    $duplicateAgents = rows("SELECT agent_id, COUNT(*) total FROM dial_batches WHERE company_id = ? AND status IN ({$activeStatuses}) GROUP BY agent_id HAVING COUNT(*) > 1", [$companyId]);
+    $duplicateAgentIds = array_flip(array_map(static fn(array $row): int => (int)$row['agent_id'], $duplicateAgents));
+    $lastWorkerEvent = one("SELECT MAX(e.created_at) AS created_at FROM asterisk_ari_events e JOIN calls ca ON ca.id = e.call_id WHERE ca.company_id = ?", [$companyId]);
+    $workerAt = (string)($lastWorkerEvent['created_at'] ?? '');
+    $activeCount = (int)scalar("SELECT COUNT(*) FROM dial_batches WHERE company_id = ? AND status IN ({$activeStatuses})", [$companyId]);
+    $config = asterisk_config();
+    $alerts = [];
+    if ($activeCount > 0 && asterisk_diagnostics_is_stale($workerAt ?: null, 120)) {
+        $alerts[] = ['level' => 'warning', 'message' => 'Worker ARI sem evento recente para lote ativo.'];
+    }
+    foreach ($batches as &$batch) {
+        $batch['originated_count'] = (int)$batch['originated_count'];
+        $batch['active_count'] = (int)$batch['active_count'];
+        $batch['finalized_count'] = (int)$batch['finalized_count'];
+        $batch['winner_count'] = (int)$batch['winner_count'];
+        $batch['loser_count'] = (int)$batch['loser_count'];
+        $batch['late_answered_count'] = (int)$batch['late_answered_count'];
+        $batch['active_loser_count'] = (int)$batch['active_loser_count'];
+        if ((int)$batch['effective_parallelism'] < (int)$batch['requested_parallelism']) $alerts[] = ['level' => 'warning', 'batch_id' => (int)$batch['id'], 'message' => 'Paralelismo efetivo menor que o solicitado.'];
+        if (isset($duplicateAgentIds[(int)$batch['agent_id']])) $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Mais de um lote ativo para este consultor.'];
+        if ((int)$batch['winner_call_id'] > 0 && trim((string)$batch['winner_bridge_id']) === '') $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Vencedora sem bridge conhecida.'];
+        if ((int)$batch['active_loser_count'] > 0) $alerts[] = ['level' => 'error', 'batch_id' => (int)$batch['id'], 'message' => 'Perdedora ainda ativa apos a eleicao.'];
+        if (in_array((string)$batch['status'], ['ORIGINATING', 'RINGING', 'WINNER', 'CONNECTED'], true) && asterisk_diagnostics_is_stale((string)($batch['last_call_event_at'] ?: $batch['updated_at']), 90)) $alerts[] = ['level' => 'warning', 'batch_id' => (int)$batch['id'], 'message' => 'Lote ativo sem atualizacao recente.'];
+    }
+    unset($batch);
+    return [
+        'health' => [
+            'ari' => ['configured' => $config['ari_url'] !== '' && $config['ari_username'] !== '' && $config['ari_password'] !== '', 'last_event_at' => $workerAt ?: null, 'state' => $workerAt !== '' && !asterisk_diagnostics_is_stale($workerAt, 120) ? 'Atividade recente' : 'Sem evento recente'],
+            'worker' => ['last_event_at' => $workerAt ?: null, 'state' => $activeCount === 0 ? 'Sem lote ativo' : (asterisk_diagnostics_is_stale($workerAt ?: null, 120) ? 'Sem atividade recente' : 'Ativo')],
+            'webrtc' => ['endpoint' => (string)$config['consultant_endpoint'], 'state' => $config['sip_wss_url'] !== '' && $config['sip_domain'] !== '' ? 'Configurado' : 'Configuracao incompleta'],
+        ],
+        'batches' => $batches,
+        'alerts' => $alerts,
+        'pagination' => ['page' => $filters['page'], 'per_page' => $perPage, 'total' => $total, 'pages' => max(1, (int)ceil($total / $perPage))],
+    ];
+}
+
+function asterisk_diagnostics_batch_calls(int $companyId, int $batchId, int $page = 1): array
+{
+    $perPage = 10; $page = max(1, $page); $offset = ($page - 1) * $perPage;
+    $batch = one('SELECT id FROM dial_batches WHERE id = ? AND company_id = ?', [$batchId, $companyId]);
+    if (!$batch) return ['calls' => [], 'pagination' => ['page' => 1, 'pages' => 1, 'total' => 0]];
+    $total = (int)scalar('SELECT COUNT(*) FROM calls WHERE company_id = ? AND dial_batch_id = ?', [$companyId, $batchId]);
+    $calls = rows("SELECT ca.id, ca.provider_channel_id, ca.provider_linked_id, ca.provider_bridge_id, ca.status, ca.internal_status, ca.race_outcome, ca.started_at, ca.ringing_at, ca.answered_at, ca.connected_at, ca.ended_at, ca.finalized_at, ca.duration_seconds, ca.billable_seconds, ca.destination_number, ct.name AS lead_name
+        FROM calls ca LEFT JOIN contacts ct ON ct.id = ca.contact_id AND ct.company_id = ca.company_id
+        WHERE ca.company_id = ? AND ca.dial_batch_id = ? ORDER BY ca.id ASC LIMIT {$perPage} OFFSET {$offset}", [$companyId, $batchId]);
+    foreach ($calls as &$call) {
+        $call['phone_masked'] = asterisk_diagnostics_mask_phone((string)$call['destination_number']);
+        unset($call['destination_number']);
+        $call['hangup_requested'] = in_array((string)$call['race_outcome'], ['LOSER', 'LATE_ANSWERED', 'CANCELLED'], true);
+        $call['hangup_confirmed'] = !empty($call['ended_at']) || !empty($call['finalized_at']);
+    }
+    unset($call);
+    return ['calls' => $calls, 'pagination' => ['page' => $page, 'per_page' => $perPage, 'total' => $total, 'pages' => max(1, (int)ceil($total / $perPage))]];
+}
+
+function handle_asterisk_diagnostics_data(): never
+{
+    require_login();
+    header('Content-Type: application/json; charset=utf-8');
+    $user = current_user();
+    if (!asterisk_diagnostics_can_access($user)) {
+        http_response_code(403);
+        echo json_encode_safe(['ok' => false, 'error' => 'Sem permissao para diagnostico Asterisk.']);
+        exit;
+    }
+    $companyId = asterisk_diagnostics_company_id($user);
+    $filters = asterisk_diagnostics_filters();
+    $payload = asterisk_diagnostics_payload($companyId, $filters);
+    if ($filters['batch_id'] > 0) $payload['detail'] = asterisk_diagnostics_batch_calls($companyId, $filters['batch_id'], max(1, (int)($_GET['call_page'] ?? 1)));
+    echo json_encode_safe(['ok' => true, 'company_id' => $companyId] + $payload);
+    exit;
+}
 function handle_sip_config(): never
 {
     require_login();
@@ -6139,6 +6308,10 @@ if (($_GET['page'] ?? '') === 'recording_file') {
     handle_recording_file();
 }
 
+if (($_GET['page'] ?? '') === 'asterisk_diagnostics_data') {
+    handle_asterisk_diagnostics_data();
+}
+
 if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_template'])) {
     download_csv_template();
 }
@@ -6324,6 +6497,7 @@ function layout(string $page, callable $content): void
         'users' => 'Acessos e consultores',
         'lists' => 'Contatos e Listas',
         'settings' => 'Integracoes',
+        'asterisk_diagnostics' => 'Diagnostico Asterisk',
         'agent' => 'Discador',
         'campaigns' => 'Campanhas',
         'radar' => 'Radar de Leads',
@@ -6363,6 +6537,7 @@ function layout(string $page, callable $content): void
                 'reports' => 'Relatorios',
                 'costs' => 'Plano e consumo',
                 'settings' => 'Integracoes',
+                'asterisk_diagnostics' => 'Diagnostico Asterisk',
                 'blocklist' => 'Bloqueio',
                 'audit' => 'Auditoria',
                 'account' => 'Minha conta',
@@ -9265,6 +9440,76 @@ function render_account(): void
     <?php });
 }
 
+function render_asterisk_diagnostics(): void
+{
+    layout('asterisk_diagnostics', function () {
+        $user = current_user();
+        if (!asterisk_diagnostics_can_access($user)) {
+            flash('Voce nao tem permissao para acessar esta area.', 'error');
+            redirect('?page=dashboard');
+        }
+        $companyId = asterisk_diagnostics_company_id($user);
+        $filters = asterisk_diagnostics_filters();
+        $data = asterisk_diagnostics_payload($companyId, $filters);
+        $campaigns = rows('SELECT id, name FROM campaigns WHERE company_id = ? ORDER BY name', [$companyId]);
+        $agents = rows('SELECT id, name FROM users WHERE company_id = ? ORDER BY name', [$companyId]);
+        $detail = $filters['batch_id'] > 0 ? asterisk_diagnostics_batch_calls($companyId, $filters['batch_id'], max(1, (int)($_GET['call_page'] ?? 1))) : null;
+        ?>
+        <section class="panel" data-asterisk-diagnostics>
+            <div class="section-heading">
+                <div><h2>Diagnostico Asterisk</h2><p class="hint">Monitoramento somente leitura dos lotes Asterisk. Atualizacao adaptativa a cada 5 segundos.</p></div>
+                <span class="status-badge" data-asterisk-refresh-status>Atualizando</span>
+            </div>
+            <div class="stats-grid" data-asterisk-health>
+                <article class="stat-card"><span>ARI</span><strong data-health-ari><?= h($data['health']['ari']['state']) ?></strong><small><?= h($data['health']['ari']['configured'] ? 'Configurado' : 'Configuracao incompleta') ?></small></article>
+                <article class="stat-card"><span>Worker</span><strong data-health-worker><?= h($data['health']['worker']['state']) ?></strong><small data-health-worker-at><?= h($data['health']['worker']['last_event_at'] ? datetime_utc_display($data['health']['worker']['last_event_at']) : '-') ?></small></article>
+                <article class="stat-card"><span>WebRTC do consultor</span><strong data-health-webrtc><?= h($data['health']['webrtc']['state']) ?></strong><small data-health-endpoint><?= h($data['health']['webrtc']['endpoint'] ?: '-') ?></small></article>
+            </div>
+        </section>
+
+        <form class="panel form-grid" method="get">
+            <input type="hidden" name="page" value="asterisk_diagnostics">
+            <h2>Filtros</h2>
+            <label>Campanha<select name="campaign_id"><option value="">Todas</option><?php foreach ($campaigns as $campaign): ?><option value="<?= (int)$campaign['id'] ?>" <?= $filters['campaign_id'] === (int)$campaign['id'] ? 'selected' : '' ?>><?= h($campaign['name']) ?></option><?php endforeach; ?></select></label>
+            <label>Consultor<select name="agent_id"><option value="">Todos</option><?php foreach ($agents as $agent): ?><option value="<?= (int)$agent['id'] ?>" <?= $filters['agent_id'] === (int)$agent['id'] ? 'selected' : '' ?>><?= h($agent['name']) ?></option><?php endforeach; ?></select></label>
+            <label>Status<select name="status"><option value="">Todos</option><?php foreach (['ORIGINATING','RINGING','WINNER','CONNECTED','NO_WINNER','CANCELLED'] as $status): ?><option value="<?= h($status) ?>" <?= $filters['status'] === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
+            <label>Batch ID<input name="batch_id" inputmode="numeric" value="<?= $filters['batch_id'] ?: '' ?>"></label>
+            <label>De<input type="date" name="from" value="<?= h($filters['from']) ?>"></label>
+            <label>Ate<input type="date" name="to" value="<?= h($filters['to']) ?>"></label>
+            <button class="button secondary" type="submit">Aplicar filtros</button>
+        </form>
+
+        <section class="panel" data-asterisk-alerts>
+            <h2>Alertas operacionais</h2>
+            <div data-asterisk-alert-list>
+                <?php if (!$data['alerts']): ?><p class="hint">Nenhum alerta para os lotes exibidos.</p><?php endif; ?>
+                <?php foreach ($data['alerts'] as $alert): ?><p class="alert <?= h($alert['level'] === 'error' ? 'error' : 'warning') ?>"><?= h(($alert['batch_id'] ?? null) ? 'Batch #' . (int)$alert['batch_id'] . ': ' : '') ?><?= h($alert['message']) ?></p><?php endforeach; ?>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="section-heading"><div><h2>Lotes Asterisk</h2><p class="hint">Lotes ativos e recentes do tenant selecionado.</p></div><span data-asterisk-total><?= (int)$data['pagination']['total'] ?> lote(s)</span></div>
+            <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Tenant</th><th>Campanha</th><th>Consultor</th><th>Status</th><th>Paralelismo</th><th>Rota</th><th>Inicio</th><th>Duracao</th><th>Orig./Ativ./Fim.</th><th>WIN/LOS/LATE</th><th>Continuacao</th></tr></thead><tbody data-asterisk-batches>
+                <?php foreach ($data['batches'] as $batch): ?>
+                    <tr><td><a href="?page=asterisk_diagnostics&amp;batch_id=<?= (int)$batch['id'] ?>">#<?= (int)$batch['id'] ?></a></td><td><?= h($batch['tenant_name']) ?></td><td><?= h($batch['campaign_name'] ?: '-') ?></td><td><?= h($batch['agent_name'] ?: '-') ?></td><td><?= h($batch['status']) ?></td><td><?= (int)$batch['requested_parallelism'] ?> / <?= (int)$batch['effective_parallelism'] ?></td><td><?= h(($batch['telephony_mode'] ?: '-') . ' / ' . ($batch['telephony_trunk'] ?: '-')) ?></td><td><?= h(datetime_utc_display((string)$batch['created_at'])) ?></td><td><?= h(asterisk_diagnostics_duration(max(0, time() - strtotime((string)$batch['created_at'])))) ?></td><td><?= (int)$batch['originated_count'] ?> / <?= (int)$batch['active_count'] ?> / <?= (int)$batch['finalized_count'] ?></td><td><?= (int)$batch['winner_count'] ?> / <?= (int)$batch['loser_count'] ?> / <?= (int)$batch['late_answered_count'] ?></td><td><?= !empty($batch['next_started_at']) ? h(datetime_utc_display((string)$batch['next_started_at'])) : '-' ?></td></tr>
+                <?php endforeach; ?>
+                <?php if (!$data['batches']): ?><tr><td colspan="12" class="empty">Nenhum lote encontrado.</td></tr><?php endif; ?>
+            </tbody></table></div>
+            <?php if ($data['pagination']['pages'] > 1): ?><p class="pagination">Pagina <?= (int)$data['pagination']['page'] ?> de <?= (int)$data['pagination']['pages'] ?></p><?php endif; ?>
+        </section>
+
+        <?php if ($detail !== null): ?>
+        <section class="panel">
+            <div class="section-heading"><div><h2>Chamadas do lote #<?= (int)$filters['batch_id'] ?></h2><p class="hint">Telefones mascarados e dados tecnicos disponiveis apenas para suporte.</p></div><a class="button secondary" href="?page=asterisk_diagnostics">Fechar detalhes</a></div>
+            <div class="table-wrap"><table><thead><tr><th>Lead</th><th>Telefone</th><th>Channel ID</th><th>Status tecnico</th><th>Race outcome</th><th>Inicio / toque / atendida</th><th>Encerramento</th><th>Hangup</th><th>Duracao</th></tr></thead><tbody>
+                <?php foreach ($detail['calls'] as $call): ?><tr><td><?= h($call['lead_name'] ?: '-') ?></td><td><?= h($call['phone_masked']) ?></td><td><?= h($call['provider_channel_id'] ?: '-') ?></td><td><?= h($call['status'] . ' / ' . ($call['internal_status'] ?: '-')) ?></td><td><?= h($call['race_outcome'] ?: '-') ?></td><td><?= h(datetime_utc_display((string)$call['started_at'])) ?> / <?= h(datetime_utc_display((string)$call['ringing_at'])) ?> / <?= h(datetime_utc_display((string)$call['answered_at'])) ?></td><td><?= h(datetime_utc_display((string)($call['ended_at'] ?: $call['finalized_at']))) ?></td><td><?= $call['hangup_requested'] ? 'Solicitado' : '-' ?><?= $call['hangup_confirmed'] ? ' / Confirmado' : '' ?></td><td><?= h(asterisk_diagnostics_duration((int)($call['duration_seconds'] ?: $call['billable_seconds'] ?: 0))) ?></td></tr><?php endforeach; ?>
+                <?php if (!$detail['calls']): ?><tr><td colspan="9" class="empty">Nenhuma chamada encontrada.</td></tr><?php endif; ?>
+            </tbody></table></div>
+        </section>
+        <?php endif; ?>
+        <?php
+    });
+}
 function render_audit(): void
 {
     layout('audit', function () {
@@ -9299,6 +9544,7 @@ match ($page) {
     'recordings' => render_recordings(),
     'costs' => render_costs(),
     'settings' => render_settings(),
+    'asterisk_diagnostics' => render_asterisk_diagnostics(),
     'sip_diagnostic' => render_sip_diagnostic(),
     'blocklist' => render_blocklist(),
     'account' => render_account(),
