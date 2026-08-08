@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 17;
+const DB_SCHEMA_VERSION = 18;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -492,6 +492,11 @@ function migrate(PDO $pdo): void
             webrtc_context TEXT,
             nvoip_trunk_config_json TEXT DEFAULT '{}',
             directcall_trunk_config_json TEXT DEFAULT '{}',
+            extension_start INTEGER NOT NULL DEFAULT 1000,
+            extension_end INTEGER NOT NULL DEFAULT 9999,
+            provisioning_agent_url TEXT,
+            provisioning_agent_secret_encrypted TEXT,
+            provisioning_agent_timeout_seconds INTEGER NOT NULL DEFAULT 10,
             updated_by INTEGER,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -653,6 +658,11 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'hangup_cause', 'TEXT');
     ensure_column($pdo, 'asterisk_settings', 'webrtc_password_encrypted', 'TEXT');
     ensure_column($pdo, 'asterisk_settings', 'webrtc_context', 'TEXT');
+    ensure_column($pdo, 'asterisk_settings', 'extension_start', 'INTEGER NOT NULL DEFAULT 1000');
+    ensure_column($pdo, 'asterisk_settings', 'extension_end', 'INTEGER NOT NULL DEFAULT 9999');
+    ensure_column($pdo, 'asterisk_settings', 'provisioning_agent_url', 'TEXT');
+    ensure_column($pdo, 'asterisk_settings', 'provisioning_agent_secret_encrypted', 'TEXT');
+    ensure_column($pdo, 'asterisk_settings', 'provisioning_agent_timeout_seconds', 'INTEGER NOT NULL DEFAULT 10');
     $pdo->exec("CREATE TABLE IF NOT EXISTS asterisk_user_extensions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         company_id INTEGER NOT NULL,
@@ -670,6 +680,8 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'asterisk_user_extensions', 'last_provision_error', 'TEXT');
     ensure_column($pdo, 'asterisk_user_extensions', 'provisioning_version', 'INTEGER NOT NULL DEFAULT 1');
     ensure_column($pdo, 'asterisk_user_extensions', 'released_at', 'TEXT');
+    ensure_column($pdo, 'asterisk_user_extensions', 'sip_password_encrypted', 'TEXT');
+    ensure_column($pdo, 'asterisk_provisioning_jobs', 'response_json', 'TEXT');
     $pdo->exec("CREATE TABLE IF NOT EXISTS asterisk_provisioning_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         company_id INTEGER NOT NULL,
@@ -1923,6 +1935,11 @@ function asterisk_config(): array
         'webrtc_context' => trim((string)($row['webrtc_context'] ?? '')),
         'nvoip_trunk' => trim((string)($row['nvoip_trunk'] ?? 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK',
         'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'directcall')) ?: 'directcall',
+        'extension_start' => (int)($row['extension_start'] ?? 1000),
+        'extension_end' => (int)($row['extension_end'] ?? 9999),
+        'provisioning_agent_url' => trim((string)($row['provisioning_agent_url'] ?? '')),
+        'provisioning_agent_secret' => !empty($row['provisioning_agent_secret_encrypted']) ? decrypt_secret((string)$row['provisioning_agent_secret_encrypted']) : '',
+        'provisioning_agent_timeout_seconds' => max(3, min(60, (int)($row['provisioning_agent_timeout_seconds'] ?? 10))),
     ];
 }
 
@@ -3212,10 +3229,22 @@ function handle_post(): void
         $webrtcPassword = trim((string)post('webrtc_password'));
         $webrtcPasswordEncrypted = $webrtcPassword !== '' ? encrypt_secret($webrtcPassword) : (string)($existing['webrtc_password_encrypted'] ?? '');
         $webrtcPasswordChange = $webrtcPassword !== '' ? (!empty($existing['webrtc_password_encrypted']) ? 'substituida' : 'criada') : 'preservada';
-        db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, updated_by, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
-            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', (int)$user['id']]);
+        $extensionStart = (int)post('extension_start', 1000);
+        $extensionEnd = (int)post('extension_end', 9999);
+        $agentUrl = trim((string)post('provisioning_agent_url'));
+        $agentSecret = trim((string)post('provisioning_agent_secret'));
+        $agentSecretEncrypted = $agentSecret !== '' ? encrypt_secret($agentSecret) : (string)($existing['provisioning_agent_secret_encrypted'] ?? '');
+        $agentTimeout = max(3, min(60, (int)post('provisioning_agent_timeout_seconds', 10)));
+        if ($extensionStart < 1 || $extensionEnd < $extensionStart || $extensionEnd > 999999999999999999) {
+            flash('Faixa de ramais Asterisk invalida.', 'error'); redirect('?page=settings#asterisk');
+        }
+        if ($agentUrl !== '' && !valid_asterisk_provisioning_agent_url($agentUrl)) {
+            flash('URL do agente de provisionamento invalida.', 'error'); redirect('?page=settings#asterisk');
+        }
+        db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, extension_start, extension_end, provisioning_agent_url, provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds, updated_by, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, extension_start=excluded.extension_start, extension_end=excluded.extension_end, provisioning_agent_url=excluded.provisioning_agent_url, provisioning_agent_secret_encrypted=excluded.provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds=excluded.provisioning_agent_timeout_seconds, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
+            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
         audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? '')]);
         flash('Configuracao Asterisk salva. O modo atual para novas chamadas e ' . $mode . '.');
         redirect('?page=settings#asterisk');
@@ -4187,9 +4216,23 @@ function asterisk_new_users_use_provisioning(): bool
     return strtoupper((string)(asterisk_config()['active_mode'] ?? 'NVOIP_DIRECT')) === 'ASTERISK';
 }
 
-function asterisk_extension_allocation_range(): array
+function asterisk_server_config(int $serverId): array
 {
-    return [1000, 9999];
+    if ($serverId !== asterisk_default_server_id()) {
+        throw new InvalidArgumentException('Servidor Asterisk nao configurado.');
+    }
+    return asterisk_config();
+}
+
+function asterisk_extension_allocation_range(?int $serverId = null): array
+{
+    $config = asterisk_server_config($serverId ?? asterisk_default_server_id());
+    $start = (int)($config['extension_start'] ?? 1000);
+    $end = (int)($config['extension_end'] ?? 9999);
+    if ($start < 1 || $end < $start || $end > 999999999999999999) {
+        throw new RuntimeException('Faixa de ramais Asterisk invalida.');
+    }
+    return [$start, $end];
 }
 
 function asterisk_reserved_extension(): string
@@ -4208,7 +4251,7 @@ function asterisk_extension_lifecycle_occupies_number(string $lifecycle): bool
 
 function asterisk_next_available_extension(PDO $pdo, int $companyId, int $serverId): string
 {
-    [$start, $end] = asterisk_extension_allocation_range();
+    [$start, $end] = asterisk_extension_allocation_range($serverId);
     $used = [];
     $statement = $pdo->prepare("SELECT extension, lifecycle_status, status FROM asterisk_user_extensions
         WHERE company_id = ? AND asterisk_server_id = ?");
@@ -4274,6 +4317,8 @@ function asterisk_reserve_user_extension(PDO $pdo, int $companyId, int $userId, 
         VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', 'RESERVED', 1, datetime('now'), datetime('now'))")
         ->execute([$companyId, $userId, $serverId, $extension]);
     $extensionId = (int)$pdo->lastInsertId();
+    $sipPassword = bin2hex(random_bytes(18));
+    $pdo->prepare("UPDATE asterisk_user_extensions SET sip_password_encrypted = ? WHERE id = ?")->execute([encrypt_secret($sipPassword), $extensionId]);
     $jobId = asterisk_create_provisioning_job($pdo, $companyId, $userId, $extensionId, $serverId, $extension);
     return ['id' => $extensionId, 'extension' => $extension, 'job_id' => $jobId];
 }
@@ -6830,6 +6875,114 @@ final class AsteriskAriWebSocket
         return is_array($event) ? $event : null;
     }
     public function close(): void { if (is_resource($this->socket)) fclose($this->socket); $this->socket = null; }
+}
+function valid_asterisk_provisioning_agent_url(string $url): bool
+{
+    if (!filter_var($url, FILTER_VALIDATE_URL)) return false;
+    $parts = parse_url($url);
+    $scheme = strtolower((string)($parts['scheme'] ?? ''));
+    $host = strtolower((string)($parts['host'] ?? ''));
+    return $scheme === 'https' || ($scheme === 'http' && in_array($host, ['localhost', '127.0.0.1', '::1'], true));
+}
+
+function asterisk_provisioning_safe_error(string $message): string
+{
+    $message = preg_replace('/(?:password|secret|authorization|token)\s*[:=]\s*\S+/i', '[redacted]', $message) ?? 'provisioning_failed';
+    return substr(trim($message), 0, 300);
+}
+
+function asterisk_agent_create_extension(array $config, array $job, array $extension): array
+{
+    $url = (string)($config['provisioning_agent_url'] ?? '');
+    $secret = (string)($config['provisioning_agent_secret'] ?? '');
+    $sipPassword = decrypt_secret((string)($extension['sip_password_encrypted'] ?? ''));
+    if (!valid_asterisk_provisioning_agent_url($url) || $secret === '' || $sipPassword === '') {
+        throw new RuntimeException('Agente de provisionamento ou credencial SIP nao configurados.');
+    }
+    if (!function_exists('curl_init')) throw new RuntimeException('A extensao cURL e obrigatoria para provisionar ramais.');
+    $payload = json_encode_safe([
+        'operation' => 'CREATE_EXTENSION',
+        'idempotency_key' => (string)$job['idempotency_key'],
+        'asterisk_server_id' => (int)$job['asterisk_server_id'],
+        'asterisk_user_extension_id' => (int)$job['asterisk_user_extension_id'],
+        'extension' => (string)$extension['extension'],
+        'sip_password' => $sipPassword,
+    ]);
+    $timestamp = (string)time();
+    $nonce = bin2hex(random_bytes(16));
+    $signature = hash_hmac('sha256', $timestamp . '.' . $nonce . '.' . $payload, $secret);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true, CURLOPT_POSTFIELDS => $payload, CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => min(10, (int)$config['provisioning_agent_timeout_seconds']),
+        CURLOPT_TIMEOUT => (int)$config['provisioning_agent_timeout_seconds'],
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-LigFlow-Timestamp: ' . $timestamp, 'X-LigFlow-Nonce: ' . $nonce, 'X-LigFlow-Signature: ' . $signature],
+    ]);
+    $body = curl_exec($ch); $error = curl_error($ch); $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
+    if ($body === false || $error !== '') throw new RuntimeException('Falha de comunicacao com o agente.');
+    $response = json_decode((string)$body, true);
+    if (!is_array($response)) throw new RuntimeException('Resposta invalida do agente.');
+    return ['http_status' => $status, 'body' => $response];
+}
+
+function asterisk_claim_next_provisioning_job(PDO $pdo): ?array
+{
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $pdo->prepare("UPDATE asterisk_provisioning_jobs SET status = 'PENDING', processing_started_at = NULL, updated_at = datetime('now') WHERE status = 'PROCESSING' AND processing_started_at < datetime('now', '-5 minutes')")->execute();
+        $job = $pdo->query("SELECT * FROM asterisk_provisioning_jobs WHERE operation = 'CREATE' AND status = 'PENDING' ORDER BY id ASC LIMIT 1")->fetch();
+        if (!$job) { $pdo->exec('COMMIT'); return null; }
+        $claim = $pdo->prepare("UPDATE asterisk_provisioning_jobs SET status = 'PROCESSING', attempts = attempts + 1, processing_started_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND status = 'PENDING'");
+        $claim->execute([(int)$job['id']]);
+        if ($claim->rowCount() !== 1) { $pdo->exec('COMMIT'); return null; }
+        $pdo->exec('COMMIT');
+        $job['attempts'] = (int)$job['attempts'] + 1;
+        return $job;
+    } catch (Throwable $error) { if ($pdo->inTransaction()) $pdo->exec('ROLLBACK'); throw $error; }
+}
+
+function asterisk_finalize_provisioning_job(PDO $pdo, array $job, bool $success, string $error = '', array $response = []): void
+{
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $extension = $pdo->prepare('SELECT * FROM asterisk_user_extensions WHERE id = ? AND company_id = ? AND user_id = ? AND asterisk_server_id = ?');
+        $extension->execute([(int)$job['asterisk_user_extension_id'], (int)$job['company_id'], (int)$job['user_id'], (int)$job['asterisk_server_id']]);
+        $link = $extension->fetch();
+        if (!$link) throw new RuntimeException('Vinculo de ramal nao encontrado.');
+        $safeResponse = json_encode_safe(['ok' => !empty($response['ok']), 'extension' => (string)($response['extension'] ?? $link['extension']), 'endpoint_confirmed' => !empty($response['endpoint_confirmed'])]);
+        if ($success && strtoupper((string)$link['lifecycle_status']) === 'RESERVED') {
+            $pdo->prepare("UPDATE asterisk_user_extensions SET lifecycle_status = 'ACTIVE', provisioning_status = 'Concluido', provisioned_at = datetime('now'), last_provision_error = NULL, updated_at = datetime('now') WHERE id = ?")->execute([(int)$link['id']]);
+            $pdo->prepare("UPDATE asterisk_provisioning_jobs SET status = 'SUCCESS', last_error = NULL, response_json = ?, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")->execute([$safeResponse, (int)$job['id']]);
+        } else {
+            $safeError = asterisk_provisioning_safe_error($error ?: 'provisioning_failed');
+            $pdo->prepare("UPDATE asterisk_user_extensions SET provisioning_status = 'Falhou', last_provision_error = ?, updated_at = datetime('now') WHERE id = ?")->execute([$safeError, (int)$link['id']]);
+            $pdo->prepare("UPDATE asterisk_provisioning_jobs SET status = 'FAILED', last_error = ?, response_json = ?, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")->execute([$safeError, $safeResponse, (int)$job['id']]);
+        }
+        $pdo->exec('COMMIT');
+    } catch (Throwable $error) { if ($pdo->inTransaction()) $pdo->exec('ROLLBACK'); throw $error; }
+}
+
+function asterisk_process_pending_provisioning_jobs(int $limit = 10): int
+{
+    $pdo = db(); $processed = 0;
+    while ($processed < max(1, min(100, $limit))) {
+        $job = asterisk_claim_next_provisioning_job($pdo);
+        if (!$job) break;
+        try {
+            $extension = one('SELECT * FROM asterisk_user_extensions WHERE id = ? AND company_id = ? AND user_id = ?', [(int)$job['asterisk_user_extension_id'], (int)$job['company_id'], (int)$job['user_id']]);
+            if (!$extension || strtoupper((string)$extension['lifecycle_status']) !== 'RESERVED') throw new RuntimeException('Vinculo nao esta reservado para provisionamento.');
+            $result = asterisk_agent_create_extension(asterisk_server_config((int)$job['asterisk_server_id']), $job, $extension);
+            if ((int)$result['http_status'] >= 200 && (int)$result['http_status'] < 300 && !empty($result['body']['ok']) && !empty($result['body']['endpoint_confirmed'])) {
+                asterisk_finalize_provisioning_job($pdo, $job, true, '', $result['body']);
+            } else {
+                asterisk_finalize_provisioning_job($pdo, $job, false, (string)($result['body']['error'] ?? 'agent_rejected'), $result['body']);
+            }
+        } catch (Throwable $error) {
+            asterisk_finalize_provisioning_job($pdo, $job, false, $error->getMessage());
+        }
+        $processed++;
+    }
+    return $processed;
 }
 if (!defined('LIGFLOW_ARI_WORKER')) {
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
@@ -9654,6 +9807,11 @@ function render_asterisk_settings_section(): void
                 <label>Dominio SIP/WebRTC<input name="sip_domain" value="<?= h($config['sip_domain']) ?>"></label>
                 <label>Tronco Nvoip<input name="nvoip_trunk" value="<?= h($config['nvoip_trunk']) ?>" readonly></label>
                 <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" pattern="[A-Za-z0-9_-]+"></label>
+                <label>Inicio da faixa de ramais<input name="extension_start" type="number" min="1" value="<?= (int)$config['extension_start'] ?>"></label>
+                <label>Fim da faixa de ramais<input name="extension_end" type="number" min="1" value="<?= (int)$config['extension_end'] ?>"></label>
+                <label>URL do agente de provisionamento<input name="provisioning_agent_url" type="url" value="<?= h($config['provisioning_agent_url']) ?>" placeholder="https://agente.exemplo/asterisk"></label>
+                <label>Segredo do agente<input name="provisioning_agent_secret" type="password" placeholder="<?= !empty($saved['provisioning_agent_secret_encrypted']) ? 'Segredo salvo (deixe vazio para manter)' : 'Segredo HMAC' ?>"></label>
+                <label>Timeout do agente (segundos)<input name="provisioning_agent_timeout_seconds" type="number" min="3" max="60" value="<?= (int)$config['provisioning_agent_timeout_seconds'] ?>"></label>
                 <?php if (strcasecmp($config['directcall_trunk'], 'DIRECTCALL_TRUNK') === 0): ?><p class="hint wide">O tronco salvo parece ser o nome logico anterior. Confira o endpoint PJSIP real no Asterisk antes de salvar.</p><?php endif; ?>
                 <label class="wide">Configuracao operacional Nvoip (JSON)<textarea name="nvoip_trunk_config_json" rows="2"><?= h((string)($saved['nvoip_trunk_config_json'] ?? '{}')) ?></textarea></label>
                 <label class="wide">Configuracao operacional DirectCall (JSON)<textarea name="directcall_trunk_config_json" rows="2"><?= h((string)($saved['directcall_trunk_config_json'] ?? '{}')) ?></textarea></label>
