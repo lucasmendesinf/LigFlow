@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 16;
+const DB_SCHEMA_VERSION = 17;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -504,9 +504,31 @@ function migrate(PDO $pdo): void
             extension TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'Ativo',
             provisioning_status TEXT NOT NULL DEFAULT 'Pendente',
+            lifecycle_status TEXT NOT NULL DEFAULT 'ACTIVE',
+            provisioned_at TEXT,
+            last_provision_error TEXT,
+            provisioning_version INTEGER NOT NULL DEFAULT 1,
+            released_at TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             deactivated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS asterisk_provisioning_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            asterisk_user_extension_id INTEGER NOT NULL,
+            asterisk_server_id INTEGER NOT NULL DEFAULT 1,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            idempotency_key TEXT NOT NULL UNIQUE,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            processing_started_at TEXT,
+            completed_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS asterisk_ari_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -643,12 +665,37 @@ function migrate(PDO $pdo): void
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         deactivated_at TEXT
     )");
+    ensure_column($pdo, 'asterisk_user_extensions', 'lifecycle_status', "TEXT NOT NULL DEFAULT 'ACTIVE'");
+    ensure_column($pdo, 'asterisk_user_extensions', 'provisioned_at', 'TEXT');
+    ensure_column($pdo, 'asterisk_user_extensions', 'last_provision_error', 'TEXT');
+    ensure_column($pdo, 'asterisk_user_extensions', 'provisioning_version', 'INTEGER NOT NULL DEFAULT 1');
+    ensure_column($pdo, 'asterisk_user_extensions', 'released_at', 'TEXT');
+    $pdo->exec("CREATE TABLE IF NOT EXISTS asterisk_provisioning_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        asterisk_user_extension_id INTEGER NOT NULL,
+        asterisk_server_id INTEGER NOT NULL DEFAULT 1,
+        operation TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        idempotency_key TEXT NOT NULL UNIQUE,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        processing_started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )");
     $pdo->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_asterisk_user_extensions_active_extension
         ON asterisk_user_extensions(company_id, asterisk_server_id, extension)
         WHERE status = 'Ativo'");
     $pdo->exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_asterisk_user_extensions_active_user
         ON asterisk_user_extensions(company_id, user_id, asterisk_server_id)
         WHERE status = 'Ativo'");
+    ensure_index($pdo, 'idx_asterisk_user_extensions_lifecycle', 'CREATE INDEX IF NOT EXISTS idx_asterisk_user_extensions_lifecycle ON asterisk_user_extensions(company_id, asterisk_server_id, lifecycle_status, extension)');
+    ensure_index($pdo, 'idx_asterisk_provisioning_jobs_extension_status', 'CREATE INDEX IF NOT EXISTS idx_asterisk_provisioning_jobs_extension_status ON asterisk_provisioning_jobs(asterisk_user_extension_id, status, id DESC)');
+    ensure_index($pdo, 'idx_asterisk_provisioning_jobs_company_user', 'CREATE INDEX IF NOT EXISTS idx_asterisk_provisioning_jobs_company_user ON asterisk_provisioning_jobs(company_id, user_id, id DESC)');
     ensure_column($pdo, 'callbacks', 'call_id', 'INTEGER');
     ensure_column($pdo, 'callbacks', 'completed_at', 'TEXT');
     ensure_column($pdo, 'plans', 'monthly_price', 'REAL DEFAULT 0');
@@ -2959,7 +3006,7 @@ function handle_post(): void
             redirect('?page=users');
         }
         try {
-            $pdo->beginTransaction();
+            $pdo->exec('BEGIN IMMEDIATE');
             $accessProfileId = (int)post('access_profile_id');
             $profileRole = '';
             if ($accessProfileId > 0 && !one('SELECT id FROM access_profiles WHERE id = ? AND company_id = ?', [$accessProfileId, $companyId])) {
@@ -2973,12 +3020,16 @@ function handle_post(): void
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                 ->execute([$companyId, post('team_id') ?: null, $accessProfileId ?: null, post('name'), $email, password_hash((string)post('password', 'admin123'), PASSWORD_DEFAULT), $role, selected_modules_json(post('modules', [])), post('phone'), post('extension'), post('status'), post('work_hours'), $user['id']]);
             $newUserId = (int)$pdo->lastInsertId();
-            sync_user_asterisk_extension($companyId, $newUserId, (string)post('asterisk_extension'), (string)post('status'));
-            $pdo->commit();
+            if (asterisk_new_users_use_provisioning()) {
+                asterisk_reserve_user_extension($pdo, $companyId, $newUserId, (string)post('asterisk_extension'), (string)post('status'));
+            } else {
+                sync_user_asterisk_extension($companyId, $newUserId, (string)post('asterisk_extension'), (string)post('status'));
+            }
+            $pdo->exec('COMMIT');
             audit('criou_usuario', 'users:' . $newUserId, null, $_POST);
             flash('Usuario cadastrado. Senha inicial: ' . h((string)post('password', 'admin123')));
         } catch (Throwable $e) {
-            if ($pdo->inTransaction()) $pdo->rollBack();
+            try { $pdo->exec('ROLLBACK'); } catch (Throwable) { }
             flash($e instanceof InvalidArgumentException ? $e->getMessage() : 'Nao foi possivel cadastrar o acesso. Confira se o e-mail ainda nao esta em uso.', 'error');
         }
         redirect('?page=users');
@@ -4126,6 +4177,107 @@ function asterisk_extension_is_active_for_user_status(string $userStatus): bool
     return !in_array(trim($userStatus), ['Bloqueado', 'Desconectado', 'Inativo', 'Excluido'], true);
 }
 
+function asterisk_default_server_id(): int
+{
+    return 1;
+}
+
+function asterisk_new_users_use_provisioning(): bool
+{
+    return strtoupper((string)(asterisk_config()['active_mode'] ?? 'NVOIP_DIRECT')) === 'ASTERISK';
+}
+
+function asterisk_extension_allocation_range(): array
+{
+    return [1000, 9999];
+}
+
+function asterisk_reserved_extension(): string
+{
+    $configured = trim((string)(asterisk_config()['consultant_endpoint'] ?? ''));
+    if (preg_match('/^(?:PJSIP\/)?([0-9]{1,32})$/i', $configured, $matches) === 1) {
+        return $matches[1];
+    }
+    return '';
+}
+
+function asterisk_extension_lifecycle_occupies_number(string $lifecycle): bool
+{
+    return in_array($lifecycle, ['RESERVED', 'ACTIVE', 'RELEASING'], true);
+}
+
+function asterisk_next_available_extension(PDO $pdo, int $companyId, int $serverId): string
+{
+    [$start, $end] = asterisk_extension_allocation_range();
+    $used = [];
+    $statement = $pdo->prepare("SELECT extension, lifecycle_status, status FROM asterisk_user_extensions
+        WHERE company_id = ? AND asterisk_server_id = ?");
+    $statement->execute([$companyId, $serverId]);
+    foreach ($statement->fetchAll() as $row) {
+        $lifecycle = strtoupper((string)($row['lifecycle_status'] ?? 'ACTIVE'));
+        if ((string)($row['status'] ?? '') === 'Ativo' || asterisk_extension_lifecycle_occupies_number($lifecycle)) {
+            $used[(string)$row['extension']] = true;
+        }
+    }
+    $reserved = asterisk_reserved_extension();
+    if ($reserved !== '') $used[$reserved] = true;
+    for ($extension = $start; $extension <= $end; $extension++) {
+        if (!isset($used[(string)$extension])) return (string)$extension;
+    }
+    throw new RuntimeException('Nao ha ramais disponiveis na faixa configurada.');
+}
+
+function asterisk_create_provisioning_job(PDO $pdo, int $companyId, int $userId, int $extensionId, int $serverId, string $extension): int
+{
+    $idempotencyKey = bin2hex(random_bytes(16));
+    $payload = json_encode_safe([
+        'extension' => $extension,
+        'lifecycle_status' => 'RESERVED',
+        'provisioning_version' => 1,
+    ]);
+    $pdo->prepare("INSERT INTO asterisk_provisioning_jobs
+        (company_id, user_id, asterisk_user_extension_id, asterisk_server_id, operation, status, idempotency_key, attempts, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'CREATE', 'PENDING', ?, 0, ?, datetime('now'), datetime('now'))")
+        ->execute([$companyId, $userId, $extensionId, $serverId, $idempotencyKey, $payload]);
+    return (int)$pdo->lastInsertId();
+}
+
+function asterisk_reserve_user_extension(PDO $pdo, int $companyId, int $userId, string $requestedExtension, string $userStatus): ?array
+{
+    if (!asterisk_extension_is_active_for_user_status($userStatus)) return null;
+    $requestedExtension = trim($requestedExtension);
+    if ($requestedExtension !== '' && preg_match('/^[0-9]{1,32}$/', $requestedExtension) !== 1) {
+        throw new InvalidArgumentException('O ramal Asterisk deve conter somente numeros.');
+    }
+
+    $serverId = asterisk_default_server_id();
+    $extension = $requestedExtension !== '' ? $requestedExtension : asterisk_next_available_extension($pdo, $companyId, $serverId);
+    if ($extension === asterisk_reserved_extension()) {
+        throw new InvalidArgumentException('O ramal configurado para o webphone nao pode ser reservado automaticamente.');
+    }
+    $duplicateStatement = $pdo->prepare("SELECT id FROM asterisk_user_extensions
+        WHERE company_id = ? AND asterisk_server_id = ? AND extension = ?
+          AND (status = 'Ativo' OR lifecycle_status IN ('RESERVED', 'ACTIVE', 'RELEASING'))
+        LIMIT 1");
+    $duplicateStatement->execute([$companyId, $serverId, $extension]);
+    if ($duplicateStatement->fetch()) {
+        throw new InvalidArgumentException('Este ramal Asterisk ja esta reservado ou vinculado a outro usuario deste cliente.');
+    }
+
+    $pdo->prepare("UPDATE asterisk_user_extensions
+        SET status = 'Inativo', lifecycle_status = 'RELEASED', released_at = COALESCE(released_at, datetime('now')),
+            deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+        WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'")
+        ->execute([$companyId, $userId, $serverId]);
+    $pdo->prepare("INSERT INTO asterisk_user_extensions
+        (company_id, user_id, asterisk_server_id, extension, status, provisioning_status, lifecycle_status, provisioning_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', 'RESERVED', 1, datetime('now'), datetime('now'))")
+        ->execute([$companyId, $userId, $serverId, $extension]);
+    $extensionId = (int)$pdo->lastInsertId();
+    $jobId = asterisk_create_provisioning_job($pdo, $companyId, $userId, $extensionId, $serverId, $extension);
+    return ['id' => $extensionId, 'extension' => $extension, 'job_id' => $jobId];
+}
+
 function sync_user_asterisk_extension(int $companyId, int $userId, string $extension, string $userStatus): void
 {
     $extension = trim($extension);
@@ -4134,11 +4286,12 @@ function sync_user_asterisk_extension(int $companyId, int $userId, string $exten
     }
 
     $pdo = db();
-    $serverId = 1;
+    $serverId = asterisk_default_server_id();
     $active = $extension !== '' && asterisk_extension_is_active_for_user_status($userStatus);
     if (!$active) {
         $pdo->prepare("UPDATE asterisk_user_extensions
-            SET status = 'Inativo', deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+            SET status = 'Inativo', lifecycle_status = 'RELEASED', released_at = COALESCE(released_at, datetime('now')),
+                deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
             WHERE user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'")
             ->execute([$userId, $serverId]);
         return;
@@ -4151,19 +4304,20 @@ function sync_user_asterisk_extension(int $companyId, int $userId, string $exten
     }
 
     $pdo->prepare("UPDATE asterisk_user_extensions
-        SET status = 'Inativo', deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+        SET status = 'Inativo', lifecycle_status = 'RELEASED', released_at = COALESCE(released_at, datetime('now')),
+            deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
         WHERE user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'
           AND (company_id <> ? OR extension <> ?)")
         ->execute([$userId, $serverId, $companyId, $extension]);
     $current = one("SELECT id FROM asterisk_user_extensions
         WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND extension = ? AND status = 'Ativo'", [$companyId, $userId, $serverId, $extension]);
     if ($current) {
-        $pdo->prepare("UPDATE asterisk_user_extensions SET updated_at = datetime('now') WHERE id = ?")->execute([(int)$current['id']]);
+        $pdo->prepare("UPDATE asterisk_user_extensions SET lifecycle_status = CASE WHEN lifecycle_status = 'RESERVED' THEN 'RESERVED' ELSE 'ACTIVE' END, updated_at = datetime('now') WHERE id = ?")->execute([(int)$current['id']]);
         return;
     }
     $pdo->prepare("INSERT INTO asterisk_user_extensions
-        (company_id, user_id, asterisk_server_id, extension, status, provisioning_status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', datetime('now'), datetime('now'))")
+        (company_id, user_id, asterisk_server_id, extension, status, provisioning_status, lifecycle_status, provisioning_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', 'ACTIVE', 1, datetime('now'), datetime('now'))")
         ->execute([$companyId, $userId, $serverId, $extension]);
 }
 function update_user_access(int $userId, int $companyId): void
@@ -6526,7 +6680,7 @@ function asterisk_associate_call_user(PDO $pdo, array $call, string $extension):
     if ($currentUserId > 0 && one('SELECT id FROM users WHERE id = ? AND company_id = ?', [$currentUserId, $companyId])) return $currentUserId;
 
     // The current architecture has one configured Asterisk server, represented by ID 1.
-    $link = one("SELECT user_id FROM asterisk_user_extensions WHERE company_id = ? AND asterisk_server_id = 1 AND extension = ? AND status = 'Ativo' LIMIT 1", [$companyId, $extension]);
+    $link = one("SELECT user_id FROM asterisk_user_extensions WHERE company_id = ? AND asterisk_server_id = 1 AND extension = ? AND status = 'Ativo' AND COALESCE(lifecycle_status, 'ACTIVE') = 'ACTIVE' LIMIT 1", [$companyId, $extension]);
     if (!$link) return null;
     $userId = (int)$link['user_id'];
     $pdo->prepare('UPDATE calls SET agent_id = ? WHERE id = ? AND company_id = ? AND (agent_id IS NULL OR agent_id = 0)')
@@ -7450,11 +7604,11 @@ function render_users(): void
         $editProfile = $editProfileId ? one('SELECT * FROM access_profiles WHERE id = ? AND company_id = ?', [$editProfileId, $profileCompanyId]) : null;
         $showProfileModal = $isPlatformAdmin && (isset($_GET['new_profile']) || $editProfile);
         $editUserId = (int)($_GET['edit_user'] ?? 0);
-        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
+        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.lifecycle_status asterisk_lifecycle_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
         $userProfileCompanyId = $editUser ? (int)$editUser['company_id'] : $profileCompanyId;
         $userProfiles = rows('SELECT * FROM access_profiles WHERE company_id = ? ORDER BY role_key, name', [$userProfileCompanyId]);
         $showCreateModal = $isPlatformAdmin && isset($_GET['new_user']);
-        $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} ORDER BY u.id DESC", $userParams);
+        $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.lifecycle_status, axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} ORDER BY u.id DESC", $userParams);
         ?>
         <?php if ($showProfileModal): ?>
             <?php
@@ -7522,7 +7676,7 @@ function render_users(): void
                     <label>Status<select name="status"><?php foreach (['Ativo','Disponivel','Em pausa','Desconectado','Bloqueado'] as $status): ?><option <?= $editUser['status'] === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
                     <label>Nome de consultor<input name="consultant_display_name" value="<?= h($editUser['consultant_display_name'] ?: $editUser['name']) ?>"></label>
                     <label>Identificacao<input name="extension" value="<?= h($editUser['extension']) ?>" placeholder="Opcional"></label>
-                    <label>Ramal Asterisk<input name="asterisk_extension" value="<?= h((string)($editUser['asterisk_extension'] ?? '')) ?>" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"><small><?= h((string)($editUser['asterisk_extension_status'] ?? 'Sem ramal')) ?><?= !empty($editUser['asterisk_provisioning_status']) ? ' - ' . h((string)$editUser['asterisk_provisioning_status']) : '' ?></small></label>
+                    <label>Ramal Asterisk<input name="asterisk_extension" value="<?= h((string)($editUser['asterisk_extension'] ?? '')) ?>" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"><small><?= h((string)($editUser['asterisk_lifecycle_status'] ?? $editUser['asterisk_extension_status'] ?? 'Sem ramal')) ?><?= !empty($editUser['asterisk_provisioning_status']) ? ' - ' . h((string)$editUser['asterisk_provisioning_status']) : '' ?></small></label>
                     <?php if ($isPlatformAdmin): ?>
                         <h3 class="wide">Modulos deste usuario</h3>
                         <?= module_checkboxes(modules_for_user($editUser)) ?>

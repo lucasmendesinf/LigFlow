@@ -25,7 +25,8 @@ $db->exec("CREATE TABLE asterisk_user_extensions (
     user_id INTEGER NOT NULL,
     asterisk_server_id INTEGER NOT NULL,
     extension TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    lifecycle_status TEXT NOT NULL DEFAULT 'ACTIVE'
 );");
 $db->exec("CREATE TABLE calls (id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, agent_id INTEGER, dial_batch_id INTEGER);");
 $db->exec("CREATE TABLE dial_batches (id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL, agent_id INTEGER);");
@@ -36,7 +37,7 @@ $db->exec("INSERT INTO asterisk_user_extensions(company_id,user_id,asterisk_serv
     (1,99,1,'1004','Inativo');");
 
 $resolve = static function (PDO $db, int $companyId, string $extension): ?int {
-    $stmt = $db->prepare("SELECT user_id FROM asterisk_user_extensions WHERE company_id = ? AND asterisk_server_id = 1 AND extension = ? AND status = 'Ativo' LIMIT 1");
+    $stmt = $db->prepare("SELECT user_id FROM asterisk_user_extensions WHERE company_id = ? AND asterisk_server_id = 1 AND extension = ? AND status = 'Ativo' AND COALESCE(lifecycle_status, 'ACTIVE') = 'ACTIVE' LIMIT 1");
     $stmt->execute([$companyId, $extension]);
     $id = $stmt->fetchColumn();
     return $id === false ? null : (int)$id;
@@ -67,6 +68,9 @@ $assert($resolve($db, 1, '1003') === 10, 'resolves extension to user in its tena
 $assert($resolve($db, 2, '1003') === 11, 'isolates identical extensions between tenants');
 $assert($resolve($db, 1, '1004') === null, 'does not resolve inactive extension');
 $assert($resolve($db, 1, '9999') === null, 'missing extension is harmless');
+
+$db->exec("INSERT INTO asterisk_user_extensions(company_id,user_id,asterisk_server_id,extension,status,lifecycle_status) VALUES (1,98,1,'1005','Ativo','RESERVED')");
+$assert($resolve($db, 1, '1005') === null, 'reserved extension does not resolve before provisioning is active');
 
 $db->exec('INSERT INTO calls(id,company_id,agent_id) VALUES (1,1,NULL),(2,1,99);');
 $call = ['id' => 1, 'company_id' => 1, 'agent_id' => null];
