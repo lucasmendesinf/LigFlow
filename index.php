@@ -2595,6 +2595,13 @@ function one(string $sql, array $params = []): ?array
     return $row ?: null;
 }
 
+function scalar(string $sql, array $params = []): mixed
+{
+    $stmt = db()->prepare($sql);
+    $stmt->execute($params);
+    return $stmt->fetchColumn();
+}
+
 function first_payload_value(array $payload, array $keys): ?string
 {
     foreach ($payload as $key => $value) {
@@ -3242,7 +3249,7 @@ function handle_post(): void
             flash('URL do agente de provisionamento invalida.', 'error'); redirect('?page=settings#asterisk');
         }
         db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, extension_start, extension_end, provisioning_agent_url, provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds, updated_by, updated_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, extension_start=excluded.extension_start, extension_end=excluded.extension_end, provisioning_agent_url=excluded.provisioning_agent_url, provisioning_agent_secret_encrypted=excluded.provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds=excluded.provisioning_agent_timeout_seconds, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
             ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, trim((string)post('nvoip_trunk', 'NVOIP_TRUNK')) ?: 'NVOIP_TRUNK', $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
         audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? '')]);
