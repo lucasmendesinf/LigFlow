@@ -39,5 +39,9 @@ $assert(str_contains($source, "Vencedora sem bridge conhecida."), 'winner bridge
 $assert(str_contains($source, "Perdedora ainda ativa apos a eleicao."), 'active loser alert exists');
 $assert(str_contains($source, "Mais de um lote ativo para este consultor."), 'duplicate active batch alert exists');
 $assert(str_contains($source, "Paralelismo efetivo menor que o solicitado."), 'parallelism alert exists');
+$assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'requested_parallelism'"), 'legacy dial batches gain requested parallelism');
+$assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'effective_parallelism'"), 'legacy dial batches gain effective parallelism');
+$assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'telephony_trunk'"), 'legacy dial batches gain telephony trunk');
+$assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'next_started_at'"), 'legacy dial batches gain continuation timestamp');
 
 echo "OK - {$tests} tests\n";

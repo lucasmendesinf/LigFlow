@@ -147,6 +147,9 @@ $assert($held['extension'] !== $afterLock['extension'], 'serialized reservations
 
 $source = file_get_contents(dirname(__DIR__) . '/index.php');
 $assert(str_contains($source, 'function asterisk_reserve_user_extension'), 'production reservation helper exists');
+$assert(str_contains($source, 'function asterisk_update_user_extension'), 'production update helper uses the provisioning lifecycle');
+$assert(str_contains($source, "last_error = 'reservation_replaced'"), 'replacement cancels a pending CREATE job before reserving another extension');
+$assert(str_contains($source, 'asterisk_extension_allocation_range($serverId)'), 'manual extension reservations are constrained to the configured range');
 $assert(str_contains($source, "asterisk_provisioning_jobs"), 'production provisioning outbox exists');
 $assert(str_contains($source, "COALESCE(lifecycle_status, 'ACTIVE') = 'ACTIVE'"), 'reserved links are excluded from automatic call association');
 

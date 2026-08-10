@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 18;
+const DB_SCHEMA_VERSION = 19;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -728,6 +728,23 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'campaigns', 'simultaneous_calls', 'INTEGER NOT NULL DEFAULT 1');
     ensure_column($pdo, 'calls', 'dial_batch_id', 'INTEGER');
     ensure_column($pdo, 'calls', 'race_outcome', 'TEXT');
+    $dialBatchColumns = array_column($pdo->query('PRAGMA table_info(dial_batches)')->fetchAll(), 'name');
+    ensure_column($pdo, 'dial_batches', 'requested_parallelism', 'INTEGER NOT NULL DEFAULT 1');
+    ensure_column($pdo, 'dial_batches', 'effective_parallelism', 'INTEGER NOT NULL DEFAULT 1');
+    ensure_column($pdo, 'dial_batches', 'telephony_trunk', "TEXT NOT NULL DEFAULT ''");
+    ensure_column($pdo, 'dial_batches', 'next_started_at', 'TEXT');
+    if (in_array('requested_calls', $dialBatchColumns, true)) {
+        $pdo->exec('UPDATE dial_batches SET requested_parallelism = requested_calls WHERE requested_calls > 0');
+    }
+    if (in_array('effective_calls', $dialBatchColumns, true)) {
+        $pdo->exec('UPDATE dial_batches SET effective_parallelism = effective_calls WHERE effective_calls > 0');
+    }
+    if (in_array('trunk_route', $dialBatchColumns, true)) {
+        $pdo->exec("UPDATE dial_batches SET telephony_trunk = trunk_route WHERE trim(COALESCE(trunk_route, '')) <> ''");
+    }
+    if (in_array('continuation_started_at', $dialBatchColumns, true)) {
+        $pdo->exec('UPDATE dial_batches SET next_started_at = continuation_started_at WHERE next_started_at IS NULL AND continuation_started_at IS NOT NULL');
+    }
     $pdo->exec("UPDATE callbacks SET status = CASE
         WHEN status IS NULL OR trim(status) = '' OR lower(trim(status)) = 'pending' THEN 'pendente'
         ELSE lower(trim(status)) END");
@@ -4302,6 +4319,10 @@ function asterisk_reserve_user_extension(PDO $pdo, int $companyId, int $userId, 
 
     $serverId = asterisk_default_server_id();
     $extension = $requestedExtension !== '' ? $requestedExtension : asterisk_next_available_extension($pdo, $companyId, $serverId);
+    [$rangeStart, $rangeEnd] = asterisk_extension_allocation_range($serverId);
+    if ((int)$extension < $rangeStart || (int)$extension > $rangeEnd) {
+        throw new InvalidArgumentException('O ramal Asterisk deve estar dentro da faixa configurada para este servidor.');
+    }
     if ($extension === asterisk_reserved_extension()) {
         throw new InvalidArgumentException('O ramal configurado para o webphone nao pode ser reservado automaticamente.');
     }
@@ -4314,6 +4335,17 @@ function asterisk_reserve_user_extension(PDO $pdo, int $companyId, int $userId, 
         throw new InvalidArgumentException('Este ramal Asterisk ja esta reservado ou vinculado a outro usuario deste cliente.');
     }
 
+    $previousLinks = $pdo->prepare("SELECT id FROM asterisk_user_extensions
+        WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'");
+    $previousLinks->execute([$companyId, $userId, $serverId]);
+    $previousIds = array_map(static fn(array $row): int => (int)$row['id'], $previousLinks->fetchAll());
+    if ($previousIds) {
+        $placeholders = implode(',', array_fill(0, count($previousIds), '?'));
+        $pdo->prepare("UPDATE asterisk_provisioning_jobs
+            SET status = 'FAILED', last_error = 'reservation_replaced', completed_at = datetime('now'), updated_at = datetime('now')
+            WHERE operation = 'CREATE' AND status = 'PENDING' AND asterisk_user_extension_id IN ({$placeholders})")
+            ->execute($previousIds);
+    }
     $pdo->prepare("UPDATE asterisk_user_extensions
         SET status = 'Inativo', lifecycle_status = 'RELEASED', released_at = COALESCE(released_at, datetime('now')),
             deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
@@ -4330,6 +4362,37 @@ function asterisk_reserve_user_extension(PDO $pdo, int $companyId, int $userId, 
     return ['id' => $extensionId, 'extension' => $extension, 'job_id' => $jobId];
 }
 
+function asterisk_update_user_extension(PDO $pdo, int $companyId, int $userId, string $requestedExtension, string $userStatus): ?array
+{
+    $serverId = asterisk_default_server_id();
+    $activeLinks = $pdo->prepare("SELECT id FROM asterisk_user_extensions
+        WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'");
+    $activeLinks->execute([$companyId, $userId, $serverId]);
+    $ids = array_map(static fn(array $row): int => (int)$row['id'], $activeLinks->fetchAll());
+    if (!asterisk_extension_is_active_for_user_status($userStatus)) {
+        if ($ids) {
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $pdo->prepare("UPDATE asterisk_provisioning_jobs
+                SET status = 'FAILED', last_error = 'reservation_released', completed_at = datetime('now'), updated_at = datetime('now')
+                WHERE operation = 'CREATE' AND status = 'PENDING' AND asterisk_user_extension_id IN ({$placeholders})")
+                ->execute($ids);
+        }
+        $pdo->prepare("UPDATE asterisk_user_extensions
+            SET status = 'Inativo', lifecycle_status = 'RELEASED', released_at = COALESCE(released_at, datetime('now')),
+                deactivated_at = COALESCE(deactivated_at, datetime('now')), updated_at = datetime('now')
+            WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'")
+            ->execute([$companyId, $userId, $serverId]);
+        return null;
+    }
+    $requestedExtension = trim($requestedExtension);
+    $current = one("SELECT id, extension FROM asterisk_user_extensions
+        WHERE company_id = ? AND user_id = ? AND asterisk_server_id = ? AND status = 'Ativo'
+        ORDER BY id DESC LIMIT 1", [$companyId, $userId, $serverId]);
+    if ($current && $requestedExtension !== '' && (string)$current['extension'] === $requestedExtension) {
+        return ['id' => (int)$current['id'], 'extension' => (string)$current['extension'], 'job_id' => null];
+    }
+    return asterisk_reserve_user_extension($pdo, $companyId, $userId, $requestedExtension, $userStatus);
+}
 function sync_user_asterisk_extension(int $companyId, int $userId, string $extension, string $userStatus): void
 {
     $extension = trim($extension);
@@ -4427,7 +4490,11 @@ function update_user_access(int $userId, int $companyId): void
         db()->prepare("INSERT INTO consultant_profiles (company_id, user_id, team_id, display_name, internal_code, status, goal) VALUES (?, ?, ?, ?, ?, ?, ?)")
             ->execute([$newCompanyId, $userId, post('team_id') ?: null, post('consultant_display_name') ?: post('name'), post('consultant_code') ?: post('extension'), post('consultant_status', 'Ativo'), (int)post('consultant_goal', '0')]);
     }
-    sync_user_asterisk_extension($newCompanyId, $userId, (string)post('asterisk_extension'), (string)post('status'));
+    if (asterisk_new_users_use_provisioning()) {
+        asterisk_update_user_extension($pdo, $newCompanyId, $userId, (string)post('asterisk_extension'), (string)post('status'));
+    } else {
+        sync_user_asterisk_extension($newCompanyId, $userId, (string)post('asterisk_extension'), (string)post('status'));
+    }
     $pdo->commit();
     audit('editou_usuario', 'users:' . $userId, $target, $_POST);
     flash('Acesso atualizado.');
