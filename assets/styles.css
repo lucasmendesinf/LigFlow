@@ -994,7 +994,7 @@ body.light-theme .button.secondary:hover {
 .danger-link {
     border: 0;
     background: transparent;
-    color: var(--primary-text);
+    color: var(--danger);
     cursor: pointer;
     padding: 0;
     font: inherit;

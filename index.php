@@ -3081,6 +3081,11 @@ function handle_post(): void
         redirect('?page=users');
     }
 
+    if ($action === 'delete_user_access' && can('users')) {
+        delete_user_access((int)post('user_id'), $companyId);
+        redirect('?page=users');
+    }
+
     if ($action === 'update_my_account' && can('account')) {
         update_my_account((int)$user['id']);
         redirect('?page=account');
@@ -4434,6 +4439,105 @@ function sync_user_asterisk_extension(int $companyId, int $userId, string $exten
         (company_id, user_id, asterisk_server_id, extension, status, provisioning_status, lifecycle_status, provisioning_version, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'Ativo', 'Pendente', 'ACTIVE', 1, datetime('now'), datetime('now'))")
         ->execute([$companyId, $userId, $serverId, $extension]);
+}
+
+function user_access_blocking_relation_counts(int $userId, int $companyId): array
+{
+    $checks = [
+        'users' => ['SELECT COUNT(*) total FROM users WHERE created_by = ? AND id <> ?', [$userId, $userId]],
+        'teams' => ['SELECT COUNT(*) total FROM teams WHERE company_id = ? AND supervisor_id = ?', [$companyId, $userId]],
+        'contact_lists' => ['SELECT COUNT(*) total FROM contact_lists WHERE company_id = ? AND created_by = ?', [$companyId, $userId]],
+        'contacts' => ['SELECT COUNT(*) total FROM contacts WHERE company_id = ? AND reserved_by = ?', [$companyId, $userId]],
+        'import_batches' => ['SELECT COUNT(*) total FROM import_batches WHERE company_id = ? AND created_by = ?', [$companyId, $userId]],
+        'campaigns' => ['SELECT COUNT(*) total FROM campaigns WHERE company_id = ? AND supervisor_id = ?', [$companyId, $userId]],
+        'calls' => ['SELECT COUNT(*) total FROM calls WHERE company_id = ? AND agent_id = ?', [$companyId, $userId]],
+        'dial_batches' => ['SELECT COUNT(*) total FROM dial_batches WHERE company_id = ? AND agent_id = ?', [$companyId, $userId]],
+        'callbacks' => ['SELECT COUNT(*) total FROM callbacks WHERE company_id = ? AND agent_id = ?', [$companyId, $userId]],
+        'blocklist' => ['SELECT COUNT(*) total FROM blocklist WHERE company_id = ? AND responsible_user_id = ?', [$companyId, $userId]],
+        'agent_sessions' => ['SELECT COUNT(*) total FROM agent_sessions WHERE company_id = ? AND agent_id = ?', [$companyId, $userId]],
+        'audit_logs' => ['SELECT COUNT(*) total FROM audit_logs WHERE user_id = ?', [$userId]],
+        'payment_settings' => ['SELECT COUNT(*) total FROM payment_settings WHERE updated_by = ?', [$userId]],
+        'google_places_settings' => ['SELECT COUNT(*) total FROM google_places_settings WHERE updated_by = ?', [$userId]],
+        'radar_lead_history' => ['SELECT COUNT(*) total FROM radar_lead_history WHERE company_id = ? AND created_by = ?', [$companyId, $userId]],
+        'asterisk_settings' => ['SELECT COUNT(*) total FROM asterisk_settings WHERE updated_by = ?', [$userId]],
+        'asterisk_user_extensions' => ["SELECT COUNT(*) total
+            FROM asterisk_user_extensions axe
+            WHERE axe.company_id = ? AND axe.user_id = ?
+              AND (
+                axe.status <> 'Ativo'
+                OR axe.provisioned_at IS NOT NULL
+                OR EXISTS (SELECT 1 FROM asterisk_provisioning_jobs apj WHERE apj.asterisk_user_extension_id = axe.id)
+              )", [$companyId, $userId]],
+        'asterisk_provisioning_jobs' => ['SELECT COUNT(*) total FROM asterisk_provisioning_jobs WHERE company_id = ? AND user_id = ?', [$companyId, $userId]],
+        'payments' => ['SELECT COUNT(*) total FROM payments WHERE company_id = ? AND user_id = ?', [$companyId, $userId]],
+        'telephony_ledger' => ['SELECT COUNT(*) total FROM telephony_ledger WHERE company_id = ? AND responsible_user_id = ?', [$companyId, $userId]],
+    ];
+    $counts = [];
+    foreach ($checks as $key => [$sql, $params]) {
+        $counts[$key] = (int)(one($sql, $params)['total'] ?? 0);
+    }
+    return array_filter($counts, static fn(int $count): bool => $count > 0);
+}
+
+function user_access_can_be_removed(int $userId, int $companyId): bool
+{
+    $current = current_user();
+    if (!$current || (int)($current['id'] ?? 0) === $userId) {
+        return false;
+    }
+    $target = is_platform_admin($current)
+        ? one('SELECT id, company_id, role FROM users WHERE id = ?', [$userId])
+        : one('SELECT id, company_id, role FROM users WHERE id = ? AND company_id = ?', [$userId, $companyId]);
+    if (!$target) {
+        return false;
+    }
+    if (!is_platform_admin($current) && in_array((string)$target['role'], ['admin_geral', 'admin_plataforma'], true)) {
+        return false;
+    }
+    return user_access_blocking_relation_counts($userId, (int)$target['company_id']) === [];
+}
+
+function delete_user_access(int $userId, int $companyId): void
+{
+    $current = current_user();
+    $target = is_platform_admin($current)
+        ? one('SELECT * FROM users WHERE id = ?', [$userId])
+        : one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$userId, $companyId]);
+    if (!$target) {
+        flash('Usuario nao encontrado ou fora da sua conta.', 'error');
+        return;
+    }
+    if ((int)($current['id'] ?? 0) === $userId) {
+        flash('Voce nao pode remover o proprio acesso.', 'error');
+        return;
+    }
+    if (!is_platform_admin($current) && in_array((string)$target['role'], ['admin_geral', 'admin_plataforma'], true)) {
+        flash('Voce nao pode remover um administrador da plataforma.', 'error');
+        return;
+    }
+    if (user_access_blocking_relation_counts($userId, (int)$target['company_id']) !== []) {
+        flash('Este acesso não pode ser removido porque possui registros vinculados no sistema.', 'error');
+        return;
+    }
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $pdo->prepare("DELETE FROM consultant_profiles WHERE company_id = ? AND user_id = ?")
+            ->execute([(int)$target['company_id'], $userId]);
+        $pdo->prepare("DELETE FROM asterisk_user_extensions
+            WHERE company_id = ? AND user_id = ? AND status = 'Ativo' AND provisioned_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM asterisk_provisioning_jobs apj WHERE apj.asterisk_user_extension_id = asterisk_user_extensions.id)")
+            ->execute([(int)$target['company_id'], $userId]);
+        $pdo->prepare('DELETE FROM users WHERE id = ? AND company_id = ?')
+            ->execute([$userId, (int)$target['company_id']]);
+        $pdo->commit();
+        audit('excluiu_usuario', 'users:' . $userId, $target, null);
+        flash('Acesso removido.');
+    } catch (Throwable) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        flash('Nao foi possivel remover este acesso.', 'error');
+    }
 }
 function update_user_access(int $userId, int $companyId): void
 {
@@ -7836,6 +7940,10 @@ function render_users(): void
         $userProfiles = rows('SELECT * FROM access_profiles WHERE company_id = ? ORDER BY role_key, name', [$userProfileCompanyId]);
         $showCreateModal = $isPlatformAdmin && isset($_GET['new_user']);
         $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.lifecycle_status, axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} ORDER BY u.id DESC", $userParams);
+        foreach ($accessRows as &$accessRow) {
+            $accessRow['can_remove'] = user_access_can_be_removed((int)$accessRow['id'], (int)current_user()['company_id']);
+        }
+        unset($accessRow);
         ?>
         <?php if ($showProfileModal): ?>
             <?php
@@ -7941,7 +8049,16 @@ function render_users(): void
                                 <td><?= h($access['status']) ?></td>
                                 <td><?= h($access['identificacao']) ?></td>
                                 <td><?= h($access['asterisk_extension']) ?><small><?= h($access['asterisk_extension_status']) ?></small></td>
-                                <td><a class="mini-link" href="?page=users&edit_user=<?= (int)$access['id'] ?>">Editar</a></td>
+                                <td class="actions">
+                                    <a class="mini-link" href="?page=users&edit_user=<?= (int)$access['id'] ?>">Editar</a>
+                                    <?php if (!empty($access['can_remove'])): ?>
+                                        <form method="post" class="inline" onsubmit="return confirm('Tem certeza que deseja remover este acesso? Esta ação não poderá ser desfeita.');">
+                                            <input type="hidden" name="action" value="delete_user_access">
+                                            <input type="hidden" name="user_id" value="<?= (int)$access['id'] ?>">
+                                            <button class="mini-link danger-link" type="submit">Remover</button>
+                                        </form>
+                                    <?php endif; ?>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
