@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-if ((['REQUEST_METHOD'] ?? 'GET') !== 'POST') { http_response_code(405); header('Allow: POST'); echo json_encode(['ok'=>false,'error'=>'method_not_allowed']); exit; }
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') { http_response_code(405); header('Allow: POST'); echo json_encode(['ok'=>false,'error'=>'method_not_allowed']); exit; }
 $configPath = getenv('LIGFLOW_ASTERISK_AGENT_CONFIG') ?: __DIR__ . '/config.php';
 if (!is_file($configPath)) { http_response_code(503); echo json_encode(['ok'=>false,'error'=>'agent_not_configured']); exit; }
 $config = require $configPath;
