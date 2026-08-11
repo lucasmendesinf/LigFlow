@@ -9076,9 +9076,14 @@ function render_agent(): void
                         <dt>Produto</dt><dd><?= h($reserved['product']) ?></dd>
                         <dt>Tentativas</dt><dd><?= h((string)$reserved['attempts']) ?></dd>
                     </dl>
-                    <?php $custom = json_decode($reserved['custom_json'] ?: '{}', true) ?: []; if ($custom): ?>
+                    <?php $custom = json_decode($reserved['custom_json'] ?: '{}', true) ?: []; if (is_array($custom) && $custom): ?>
                         <h3>Campos personalizados</h3>
-                        <dl><?php foreach ($custom as $key => $value): ?><dt><?= h($key) ?></dt><dd><?= h($value) ?></dd><?php endforeach; ?></dl>
+                        <dl>
+                            <?php foreach ($custom as $key => $value): ?>
+                                <?php $displayValue = is_scalar($value) || $value === null ? (string)$value : json_encode_safe($value); ?>
+                                <dt><?= h((string)$key) ?></dt><dd><?= h($displayValue) ?></dd>
+                            <?php endforeach; ?>
+                        </dl>
                     <?php endif; ?>
                 <?php else: ?>
                     <p class="empty">Nenhum lead reservado.</p>
