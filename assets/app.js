@@ -141,7 +141,11 @@ document.querySelectorAll('[data-payment-method-tab]').forEach((tab) => {
 
 const pixPaymentModal = document.querySelector('[data-payment-pix-modal]');
 if (pixPaymentModal) {
-    const closePixPaymentModal = () => pixPaymentModal.remove();
+    document.body.classList.add('payment-modal-open');
+    const closePixPaymentModal = () => {
+        document.body.classList.remove('payment-modal-open');
+        pixPaymentModal.remove();
+    };
     pixPaymentModal.querySelectorAll('[data-payment-pix-close]').forEach((button) => button.addEventListener('click', closePixPaymentModal));
     pixPaymentModal.addEventListener('click', (event) => {
         if (event.target === pixPaymentModal) closePixPaymentModal();
@@ -153,7 +157,7 @@ if (pixPaymentModal) {
 
 document.querySelectorAll('[data-copy-pix]').forEach((button) => {
     button.addEventListener('click', async () => {
-        const scope = button.closest('.payment-pix-dialog, .payment-result-pix');
+        const scope = button.closest('.payment-pix-dialog, .payment-result');
         const code = scope?.querySelector('textarea')?.value || '';
         if (!code) return;
         try {

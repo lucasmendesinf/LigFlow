@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 19;
+const DB_SCHEMA_VERSION = 21;
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -56,6 +56,11 @@ function db(): PDO
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
     initialize_database($pdo);
+    $pdo->sqliteCreateFunction(
+        'ligflow_local_datetime',
+        static fn ($value): string => datetime_utc_display((string)$value, 'Y-m-d H:i:s'),
+        1
+    );
     return $pdo;
 }
 
@@ -73,6 +78,9 @@ function initialize_database(PDO $pdo): void
             migrate($pdo);
             seed($pdo);
             ensure_default_access_profiles($pdo);
+            if ($currentVersion < 21) {
+                migrate_legacy_local_datetimes_to_utc($pdo);
+            }
             $pdo->exec('PRAGMA user_version = ' . DB_SCHEMA_VERSION);
         }
         $pdo->exec('COMMIT');
@@ -992,10 +1000,18 @@ function seed(PDO $pdo): void
 
 function ensure_default_plans(PDO $pdo): void
 {
-    $stmt = $pdo->prepare("INSERT OR IGNORE INTO plans (name, included_minutes, max_users, max_consultants, max_lists, max_contacts, commercial_price_per_minute, monthly_price, setup_fee, billing_period, payment_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    $stmt->execute(['MVP', 1000, 3, 3, 20, 5000, 0.35, 299.00, 0, 'Mensal', 'Pix/Cartao', 'Ativo']);
-    $stmt->execute(['Consultor Individual', 200, 1, 1, 10, 1000, 0.35, 99.00, 0, 'Mensal', 'Pix/Cartao', 'Ativo']);
-    $stmt->execute(['Escritorio com equipe', 1000, 5, 5, 50, 10000, 0.30, 399.00, 0, 'Mensal', 'Boleto/Pix', 'Ativo']);
+    $plans = [
+        ['MVP', 1000, 3, 3, 20, 5000, 0.35, 350000000, 350000, 299.00, 'Pix/Cartao'],
+        ['Consultor Individual', 200, 1, 1, 10, 1000, 0.35, 70000000, 350000, 99.00, 'Pix/Cartao'],
+        ['Escritorio com equipe', 1000, 5, 5, 50, 10000, 0.30, 300000000, 300000, 399.00, 'Boleto/Pix'],
+    ];
+    $insert = $pdo->prepare("INSERT OR IGNORE INTO plans (name, included_minutes, max_users, max_consultants, max_lists, max_contacts, commercial_price_per_minute, telephony_credit_micros, telephony_rate_micros, monthly_price, setup_fee, billing_period, payment_type, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Mensal', ?, 'Ativo')");
+    $backfill = $pdo->prepare("UPDATE plans SET monthly_price = CASE WHEN COALESCE(monthly_price, 0) <= 0 THEN ? ELSE monthly_price END, telephony_credit_micros = COALESCE(telephony_credit_micros, ?), telephony_rate_micros = COALESCE(telephony_rate_micros, ?) WHERE name = ?");
+    foreach ($plans as $plan) {
+        [$name, $minutes, $users, $consultants, $lists, $contacts, $rate, $creditMicros, $rateMicros, $monthlyPrice, $paymentType] = $plan;
+        $insert->execute([$name, $minutes, $users, $consultants, $lists, $contacts, $rate, $creditMicros, $rateMicros, $monthlyPrice, $paymentType]);
+        $backfill->execute([$monthlyPrice, $creditMicros, $rateMicros, $name]);
+    }
 }
 
 function upgrade_demo_data(PDO $pdo): void
@@ -1269,13 +1285,82 @@ function datetime_local(?string $value): string
     return datetime_utc_display($value, 'Y-m-d\TH:i');
 }
 
+function local_datetime_to_utc_storage(string $value): string
+{
+    $value = trim($value);
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?$/', $value)) {
+        return '';
+    }
+    $normalized = str_replace('T', ' ', $value);
+    if (strlen($normalized) === 16) {
+        $normalized .= ':00';
+    }
+    try {
+        $local = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $normalized, new DateTimeZone('America/Sao_Paulo'));
+        $errors = DateTimeImmutable::getLastErrors();
+        if (!$local || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0)) || $local->format('Y-m-d H:i:s') !== $normalized) {
+            return '';
+        }
+        return $local->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+    } catch (Throwable) {
+        return '';
+    }
+}
+
 function callback_datetime_storage(string $value): string
 {
-    $value = str_replace('T', ' ', trim($value));
-    if (strlen($value) === 16) {
-        $value .= ':00';
+    return local_datetime_to_utc_storage($value);
+}
+
+function utc_now_storage(): string
+{
+    return gmdate('Y-m-d H:i:s');
+}
+
+function utc_storage_timestamp(?string $value): int|false
+{
+    $value = trim((string)$value);
+    if ($value === '') {
+        return false;
     }
-    return $value;
+    try {
+        return (new DateTimeImmutable($value, new DateTimeZone('UTC')))->getTimestamp();
+    } catch (Throwable) {
+        return false;
+    }
+}
+
+function sao_paulo_utc_period_bounds(string $period = 'day'): array
+{
+    $timezone = new DateTimeZone('America/Sao_Paulo');
+    $now = new DateTimeImmutable('now', $timezone);
+    $start = $period === 'month'
+        ? $now->modify('first day of this month')->setTime(0, 0)
+        : $now->setTime(0, 0);
+    $end = $period === 'month' ? $start->modify('+1 month') : $start->modify('+1 day');
+    $utc = new DateTimeZone('UTC');
+    return [
+        $start->setTimezone($utc)->format('Y-m-d H:i:s'),
+        $end->setTimezone($utc)->format('Y-m-d H:i:s'),
+    ];
+}
+
+function migrate_legacy_local_datetimes_to_utc(PDO $pdo): void
+{
+    foreach ([
+        ['callbacks', 'scheduled_at'],
+        ['campaigns', 'starts_at'],
+        ['campaigns', 'ends_at'],
+    ] as [$table, $column]) {
+        $select = $pdo->query("SELECT id, {$column} value FROM {$table} WHERE {$column} IS NOT NULL AND trim({$column}) <> ''");
+        $update = $pdo->prepare("UPDATE {$table} SET {$column} = ? WHERE id = ?");
+        foreach ($select->fetchAll() as $row) {
+            $utc = local_datetime_to_utc_storage((string)$row['value']);
+            if ($utc !== '') {
+                $update->execute([$utc, (int)$row['id']]);
+            }
+        }
+    }
 }
 
 function money(float $value): string
@@ -1292,7 +1377,8 @@ function monthly_usage(int $companyId, ?float $usedSeconds = null): array
         $limit = (int)($company['monthly_minutes_limit'] ?? 0);
     }
     if ($usedSeconds === null) {
-        $usedSeconds = (float)one("SELECT COALESCE(SUM(billable_seconds), 0) seconds FROM calls WHERE company_id = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')", [$companyId])['seconds'];
+        [$monthStartUtc, $monthEndUtc] = sao_paulo_utc_period_bounds('month');
+        $usedSeconds = (float)one("SELECT COALESCE(SUM(billable_seconds), 0) seconds FROM calls WHERE company_id = ? AND created_at >= ? AND created_at < ?", [$companyId, $monthStartUtc, $monthEndUtc])['seconds'];
     }
     $used = $usedSeconds / 60;
     $remaining = max(0, $limit - $used);
@@ -1401,8 +1487,8 @@ function call_billable_seconds(array $call, int $fallbackDuration, bool $answere
         return 0;
     }
     if (!empty($call['answered_at'])) {
-        $answeredAt = strtotime((string)$call['answered_at']);
-        $endedAt = !empty($call['ended_at']) ? strtotime((string)$call['ended_at']) : time();
+        $answeredAt = utc_storage_timestamp((string)$call['answered_at']);
+        $endedAt = !empty($call['ended_at']) ? utc_storage_timestamp((string)$call['ended_at']) : time();
         if ($answeredAt !== false && $endedAt !== false && $endedAt >= $answeredAt) {
             return $endedAt - $answeredAt;
         }
@@ -2481,8 +2567,10 @@ function apply_approved_payment(int $paymentId, array $providerPayment): void
         }
         $company = one('SELECT timezone FROM companies WHERE id = ?', [$payment['company_id']]) ?: [];
         $timezone = new DateTimeZone((string)($company['timezone'] ?? 'America/Sao_Paulo'));
-        $approvedValue = (string)($providerPayment['date_approved'] ?? $payment['approved_at'] ?? 'now');
-        $approvedAt = (new DateTimeImmutable($approvedValue ?: 'now', $timezone))->setTimezone($timezone);
+        $approvedValue = (string)($providerPayment['date_approved'] ?? $payment['approved_at'] ?? '');
+        $approvedUtc = payment_datetime_to_utc($approvedValue) ?? gmdate('Y-m-d H:i:s');
+        $approvedInstant = new DateTimeImmutable($approvedUtc, new DateTimeZone('UTC'));
+        $approvedAt = $approvedInstant->setTimezone($timezone);
         $period = one('SELECT * FROM subscription_periods WHERE payment_id = ?', [$paymentId]);
         $createdPeriod = !$period;
         $snapshot = json_decode((string)$payment['limits_snapshot_json'], true) ?: [];
@@ -2518,7 +2606,7 @@ function apply_approved_payment(int $paymentId, array $providerPayment): void
         $pdo->prepare('INSERT OR IGNORE INTO telephony_ledger (company_id,subscription_id,subscription_period_id,entry_type,amount_micros,balance_before_micros,balance_after_micros,idempotency_key,reference_type,reference_id,responsible_user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
             ->execute([(int)$payment['company_id'], (int)$subscription['id'], $periodId, 'INITIAL_CREDIT', $telephonySnapshot['telephony_credit_initial_micros'], 0, $telephonySnapshot['telephony_credit_initial_micros'], $grantKey, 'subscription_period', $periodId, (int)$payment['user_id']]);
         $pdo->prepare("UPDATE payments SET status='APPROVED', approved_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?")
-            ->execute([$approvedAt->format('Y-m-d H:i:s'), $paymentId]);
+            ->execute([$approvedInstant->format('Y-m-d H:i:s'), $paymentId]);
         if ($createdPeriod) {
             $pdo->prepare("INSERT INTO payment_events (company_id,payment_id,event_name,payload_json) VALUES (?,?,'PAYMENT_APPROVED',?)")
                 ->execute([$payment['company_id'], $paymentId, json_encode(['renews_at' => $end->format(DATE_ATOM)])]);
@@ -2536,8 +2624,10 @@ function sync_mercado_pago_payment(string $providerId): array
     $payment = one("SELECT * FROM payments WHERE provider='mercado_pago' AND provider_payment_id=?", [$providerId]);
     if (!$payment) throw new RuntimeException('Pagamento local nao encontrado.');
     $internal = billing_normalize_payment_status((string)($remote['status'] ?? ''), (string)($remote['status_detail'] ?? ''));
+    $approvedAtUtc = payment_datetime_to_utc($remote['date_approved'] ?? null);
+    $expiresAtUtc = payment_datetime_to_utc($remote['date_of_expiration'] ?? null);
     db()->prepare('UPDATE payments SET status=?, provider_status=?, provider_status_detail=?, approved_at=COALESCE(?,approved_at), expires_at=COALESCE(?,expires_at), updated_at=CURRENT_TIMESTAMP WHERE id=?')
-        ->execute([$internal, $remote['status'] ?? null, $remote['status_detail'] ?? null, $remote['date_approved'] ?? null, $remote['date_of_expiration'] ?? null, $payment['id']]);
+        ->execute([$internal, $remote['status'] ?? null, $remote['status_detail'] ?? null, $approvedAtUtc, $expiresAtUtc, $payment['id']]);
     if ($internal === 'APPROVED') apply_approved_payment((int)$payment['id'], $remote);
     return one('SELECT * FROM payments WHERE id=?', [$payment['id']]) ?: [];
 }
@@ -2580,8 +2670,9 @@ function create_tenant_payment(int $companyId, int $userId, string $method, arra
         $remote = mercado_pago_request('POST', '/v1/payments', $payload, $idempotency);
         $status = billing_normalize_payment_status((string)($remote['status'] ?? ''), (string)($remote['status_detail'] ?? ''));
         $checkout = ['qr_code'=>(string)($remote['point_of_interaction']['transaction_data']['qr_code'] ?? ''),'qr_code_base64'=>(string)($remote['point_of_interaction']['transaction_data']['qr_code_base64'] ?? ''),'ticket_url'=>(string)($remote['transaction_details']['external_resource_url'] ?? '')];
+        $expiresAtUtc = payment_datetime_to_utc($remote['date_of_expiration'] ?? null);
         db()->prepare('UPDATE payments SET provider_payment_id=?,status=?,provider_status=?,provider_status_detail=?,checkout_data_json=?,expires_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
-            ->execute([(string)$remote['id'],$status,$remote['status'] ?? null,$remote['status_detail'] ?? null,json_encode($checkout),$remote['date_of_expiration'] ?? null,$localId]);
+            ->execute([(string)$remote['id'],$status,$remote['status'] ?? null,$remote['status_detail'] ?? null,json_encode($checkout),$expiresAtUtc,$localId]);
         if ($status === 'APPROVED') apply_approved_payment($localId, $remote);
         return one('SELECT * FROM payments WHERE id=?', [$localId]) ?: [];
     } catch (Throwable $e) {
@@ -2590,29 +2681,50 @@ function create_tenant_payment(int $companyId, int $userId, string $method, arra
     }
 }
 
-function datetime_utc_display(?string $value, string $format = 'd/m/Y H:i:s'): string
+function payment_datetime_to_utc(mixed $value): ?string
+{
+    $value = trim((string)$value);
+    if ($value === '' || !preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/', $value)) {
+        return null;
+    }
+    try {
+        return (new DateTimeImmutable($value, new DateTimeZone('UTC')))
+            ->setTimezone(new DateTimeZone('UTC'))
+            ->format('Y-m-d H:i:s');
+    } catch (Throwable) {
+        return null;
+    }
+}
+
+function datetime_utc_display(?string $value, string $format = 'd/m/Y H:i:s', ?string $timezone = null): string
 {
     $value = trim((string)$value);
     if ($value === '') {
         return '';
     }
+    if (preg_match('/^\d{2}\/\d{2}\/\d{4}(?: \d{2}:\d{2}:\d{2})?$/', $value)) {
+        return $value;
+    }
     try {
-        $saoPaulo = new DateTimeZone('America/Sao_Paulo');
+        $targetTimezone = new DateTimeZone(trim((string)$timezone) ?: 'America/Sao_Paulo');
         // Datas sem horario sao datas de calendario do sistema, nao instantes UTC.
         $date = preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)
-            ? new DateTimeImmutable($value, $saoPaulo)
+            ? new DateTimeImmutable($value, $targetTimezone)
             : new DateTimeImmutable($value, new DateTimeZone('UTC'));
-        return $date->setTimezone($saoPaulo)
+        return $date->setTimezone($targetTimezone)
             ->format($format);
     } catch (Throwable) {
+        if ($timezone !== null && $timezone !== 'America/Sao_Paulo') {
+            return datetime_utc_display($value, $format, 'America/Sao_Paulo');
+        }
         return $value;
     }
 }
 
-function date_br_display(?string $value): string
+function date_br_display(?string $value, ?string $timezone = null): string
 {
     if (!$value) return '-';
-    return datetime_utc_display($value);
+    return datetime_utc_display($value, 'd/m/Y H:i:s', $timezone);
 }
 
 function nvoip_error_hint(int $status, string $body): string
@@ -3263,9 +3375,11 @@ function handle_post(): void
     }
 
     if ($action === 'create_campaign' && can('campaigns')) {
+        $campaignStartsAt = local_datetime_to_utc_storage((string)post('starts_at'));
+        $campaignEndsAt = local_datetime_to_utc_storage((string)post('ends_at'));
         $pdo->prepare("INSERT INTO campaigns (company_id, list_id, team_id, supervisor_id, name, description, dialer_type, caller_id, sip_trunk, script, starts_at, ends_at, call_window, max_attempts, simultaneous_calls, retry_interval_minutes, priority, recording_enabled, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
+            ->execute([$companyId, post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), $campaignStartsAt, $campaignEndsAt, post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status')]);
         audit('criou_campanha', 'campaigns:' . $pdo->lastInsertId(), null, $_POST);
         flash('Campanha criada.');
         redirect('?page=campaigns');
@@ -3280,10 +3394,12 @@ function handle_post(): void
             redirect('?page=campaigns');
         }
 
+        $campaignStartsAt = local_datetime_to_utc_storage((string)post('starts_at'));
+        $campaignEndsAt = local_datetime_to_utc_storage((string)post('ends_at'));
         $pdo->prepare("UPDATE campaigns
             SET list_id = ?, team_id = ?, supervisor_id = ?, name = ?, description = ?, dialer_type = ?, caller_id = ?, sip_trunk = ?, script = ?, starts_at = ?, ends_at = ?, call_window = ?, max_attempts = ?, simultaneous_calls = ?, retry_interval_minutes = ?, priority = ?, recording_enabled = ?, status = ?
             WHERE id = ?")
-            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), post('starts_at'), post('ends_at'), post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
+            ->execute([post('list_id'), post('team_id') ?: null, post('supervisor_id') ?: null, post('name'), post('description'), post('dialer_type'), post('caller_id'), post('sip_trunk'), post('script'), $campaignStartsAt, $campaignEndsAt, post('call_window'), max(1, (int)post('max_attempts', 1)), campaign_parallelism_input(post('simultaneous_calls', 1)), post('retry_interval_minutes'), post('priority'), post('recording_enabled') ? 1 : 0, post('status'), $campaignId]);
         audit('editou_campanha', 'campaigns:' . $campaignId, $campaign, $_POST);
         flash('Campanha atualizada.');
         redirect('?page=campaigns');
@@ -5300,7 +5416,7 @@ function create_remessa_from_selected_contacts(int $sourceListId, array $selecte
                 'ultimo_contato_origem' => (string)($contact['last_call_at'] ?? ''),
                 'filtros' => $statusFilters,
                 'filtro_label' => $filterLabel,
-                'gerado_em' => date('Y-m-d H:i:s'),
+                'gerado_em' => utc_now_storage(),
             ];
 
             $insert->execute([
@@ -5810,7 +5926,7 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
         return false;
     }
 
-    $answeredAt = call_was_answered(['status' => $providerCall['status']]) ? date('Y-m-d H:i:s') : null;
+    $answeredAt = call_was_answered(['status' => $providerCall['status']]) ? utc_now_storage() : null;
     $originNumber = (string)($providerCall['payload']['request']['bina'] ?? $providerCall['payload']['bina'] ?? $campaign['caller_id'] ?? '');
     $attemptNumber = max(1, (int)($contact['attempts'] ?? 0) + 1);
     $internalStatus = normalize_call_attempt_status((string)$providerCall['status'], ['event' => 'start']);
@@ -5919,7 +6035,7 @@ function finish_call(int $callId, int $resultId, string $notes, int $companyId):
     }
     $duration = max(0, (int)($call['duration_seconds'] ?? 0));
     if (!empty($call['started_at'])) {
-        $startedAt = strtotime((string)$call['started_at']);
+        $startedAt = utc_storage_timestamp((string)$call['started_at']);
         if ($startedAt !== false) {
             $duration = max($duration, time() - $startedAt);
         }
@@ -6017,7 +6133,7 @@ function quick_hangup(int $callId, int $companyId): void
     }
     $duration = max(0, (int)($call['duration_seconds'] ?? 0));
     if (!empty($call['started_at'])) {
-        $startedAt = strtotime((string)$call['started_at']);
+        $startedAt = utc_storage_timestamp((string)$call['started_at']);
         if ($startedAt !== false) {
             $duration = max($duration, time() - $startedAt);
         }
@@ -6071,7 +6187,7 @@ function handle_nvoip_webhook(): never
     $endedAtSql = in_array($status, $finalStatuses, true) ? "COALESCE(ended_at, datetime('now'))" : 'ended_at';
     $internalStatus = normalize_call_attempt_status($rawStatus, [
         'event' => in_array($status, ['answered', 'connected'], true) ? 'answered' : '',
-        'answered_at' => $status === 'answered' ? date('Y-m-d H:i:s') : ($call['answered_at'] ?? null),
+        'answered_at' => $status === 'answered' ? utc_now_storage() : ($call['answered_at'] ?? null),
         'duration_seconds' => $duration,
         'cause' => (string)($payload['cause'] ?? ''),
         'reason' => (string)($payload['reason'] ?? ''),
@@ -6479,8 +6595,8 @@ function handle_callback_notifications(): never
         exit;
     }
 
-    $now = date('Y-m-d H:i:s');
-    $windowStart = date('Y-m-d H:i:s', strtotime('-1 day'));
+    $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+    $windowStart = $now->modify('-1 day');
     $callbacks = rows("
         SELECT cb.id, cb.scheduled_at, cb.priority, cb.notes,
                COALESCE(ct.name, 'Contato') AS contact_name, ct.phone_e164
@@ -6493,7 +6609,7 @@ function handle_callback_notifications(): never
           AND cb.scheduled_at >= ?
         ORDER BY cb.scheduled_at ASC, cb.id ASC
         LIMIT 10
-    ", [(int)$user['company_id'], (int)$user['id'], $now, $windowStart]);
+    ", [(int)$user['company_id'], (int)$user['id'], $now->format('Y-m-d H:i:s'), $windowStart->format('Y-m-d H:i:s')]);
 
     echo json_encode_safe(['ok' => true, 'callbacks' => array_map(static function (array $callback): array {
         return [
@@ -6804,7 +6920,8 @@ function handle_sip_call_event(): never
         $status = $wasAnswered ? 'pos_atendimento' : unsuccessful_sip_status($cause, $stoppedByUser);
         $duration = max(0, (int)($payload['duration_seconds'] ?? 0));
         if ($duration === 0 && !empty($call['started_at'])) {
-            $duration = max(1, time() - strtotime((string)$call['started_at']));
+            $startedAt = utc_storage_timestamp((string)$call['started_at']);
+            $duration = $startedAt !== false ? max(1, time() - $startedAt) : 1;
         }
         $internalStatus = $wasAnswered
             ? 'atendida'
@@ -7095,7 +7212,8 @@ function asterisk_handle_event(array $event): void
             $updated = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)$call['id'], (int)$call['company_id']]);
             if ($updated) {
                 $answered = !empty($updated['answered_at']);
-                $duration = $answered && !empty($updated['answered_at']) ? max(0, time() - (int)strtotime((string)$updated['answered_at'])) : 0;
+                $answeredAt = utc_storage_timestamp((string)($updated['answered_at'] ?? ''));
+                $duration = $answered && $answeredAt !== false ? max(0, time() - $answeredAt) : 0;
                 $billable = call_billable_seconds($updated, $duration, $answered, $event['billsec'] ?? $event['billable_seconds'] ?? null);
                 $billing = call_billing_values($updated, $billable);
                 db()->prepare("UPDATE calls SET duration_seconds = ?, billable_seconds = ?, estimated_cost_micros = ?, confirmed_cost = ? WHERE id = ? AND finalized_at IS NOT NULL")
@@ -7326,7 +7444,7 @@ function layout(string $page, callable $content): void
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title><?= h(APP_NAME . ' - ' . $title) ?></title>
-    <link rel="stylesheet" href="assets/styles.css">
+    <link rel="stylesheet" href="assets/styles.css?v=<?= (int)(@filemtime(__DIR__ . '/assets/styles.css') ?: 1) ?>">
 </head>
 <body class="<?= $user ? 'app-shell' : 'login-shell' ?><?= $billingState && in_array($billingState['state'], ['warning','overdue','blocked'], true) ? ' billing-banner-active' : '' ?>">
 <?php if ($user): ?>
@@ -7606,15 +7724,17 @@ function render_dashboard(): void
             [$clause, $params] = tenant_clause('c');
             $companyId = (int)current_user()['company_id'];
             $dashboardCostMicros = call_cost_sql('c');
+            [$todayStartUtc, $todayEndUtc] = sao_paulo_utc_period_bounds('day');
+            [$monthStartUtc] = sao_paulo_utc_period_bounds('month');
             $dashboardStats = one("
             SELECT
-                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN 1 ELSE 0 END), 0) chamadas_hoje,
-                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN c.billable_seconds ELSE 0 END), 0) segundos_hoje,
+                COALESCE(SUM(CASE WHEN c.created_at >= ? AND c.created_at < ? THEN 1 ELSE 0 END), 0) chamadas_hoje,
+                COALESCE(SUM(CASE WHEN c.created_at >= ? AND c.created_at < ? THEN c.billable_seconds ELSE 0 END), 0) segundos_hoje,
                 COALESCE(SUM(CASE WHEN c.company_id = ? THEN c.billable_seconds ELSE 0 END), 0) segundos_mes_empresa,
-                COALESCE(SUM(CASE WHEN date(c.created_at) = date('now') THEN {$dashboardCostMicros} ELSE 0 END), 0) gasto_hoje_micros
+                COALESCE(SUM(CASE WHEN c.created_at >= ? AND c.created_at < ? THEN {$dashboardCostMicros} ELSE 0 END), 0) gasto_hoje_micros
             FROM calls c
-            WHERE {$clause} AND c.created_at >= datetime('now', 'start of month')
-        ", array_merge([$companyId], $params)) ?: [];
+            WHERE {$clause} AND c.created_at >= ?
+        ", array_merge([$todayStartUtc, $todayEndUtc, $todayStartUtc, $todayEndUtc, $companyId, $todayStartUtc, $todayEndUtc], $params, [$monthStartUtc])) ?: [];
         $usage = monthly_usage($companyId, (float)($dashboardStats['segundos_mes_empresa'] ?? 0));
         $cards = [
             'Chamadas hoje' => (int)($dashboardStats['chamadas_hoje'] ?? 0),
@@ -7717,7 +7837,7 @@ function render_dashboard(): void
         <section class="grid two">
             <article class="panel">
                 <h2>Ligações por hora hoje</h2>
-                <?= table(rows("SELECT strftime('%H:00', c.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(c.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$dashboardCostMicros}) / 1000000.0) gasto FROM calls c WHERE {$clause} AND date(c.created_at) = date('now') GROUP BY hora ORDER BY hora", $params), ['hora', 'ligacoes', 'minutos', 'gasto']) ?>
+                <?= table(rows("SELECT strftime('%H:00', ligflow_local_datetime(c.created_at)) hora, COUNT(*) ligacoes, ROUND(SUM(c.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$dashboardCostMicros}) / 1000000.0) gasto FROM calls c WHERE {$clause} AND c.created_at >= ? AND c.created_at < ? GROUP BY hora ORDER BY hora", array_merge($params, [$todayStartUtc, $todayEndUtc])), ['hora', 'ligacoes', 'minutos', 'gasto']) ?>
             </article>
             <article class="panel">
                 <h2><?= is_platform_admin() ? 'Configuracao tecnica' : 'Telefonia' ?></h2>
@@ -7743,9 +7863,9 @@ function render_dashboard(): void
     <?php });
 }
 
-function table(array $rows, array $columns): string
+function table(array $rows, array $columns, ?string $timezone = null): string
 {
-    $dateColumns = ['created_at', 'updated_at', 'started_at', 'ended_at', 'answered_at', 'scheduled_at', 'approved_at', 'expires_at', 'starts_at', 'renews_at'];
+    $dateColumns = ['created_at', 'updated_at', 'started_at', 'ringing_at', 'answered_at', 'connected_at', 'ended_at', 'finalized_at', 'scheduled_at', 'completed_at', 'approved_at', 'expires_at', 'starts_at', 'ends_at', 'renews_at', 'provisioned_at', 'last_event_at', 'next_started_at'];
     $labels = [
         'acoes' => 'Ações',
         'duracao_min' => 'Duração',
@@ -7774,7 +7894,7 @@ function table(array $rows, array $columns): string
         foreach ($columns as $column) {
             $value = (string)($row[$column] ?? '');
             if (in_array($column, $dateColumns, true) || ($column === 'data' && preg_match('/^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?/', $value))) {
-                $value = datetime_utc_display($value);
+                $value = datetime_utc_display($value, 'd/m/Y H:i:s', $timezone);
             }
             echo '<td>' . h($value) . '</td>';
         }
@@ -8790,7 +8910,7 @@ function render_radar(): void
         <?php endif; ?>
         <?php if ($radarLists): ?>
         <section class="panel">
-            <h2>Listas</h2>
+            <h2>Histórico de Listas</h2>
             <div class="table-wrap">
                 <table>
                     <thead><tr><th>Nome</th><th>Status</th><th>Origem</th><th>Contatos</th><th>Etiquetas</th><th>Criada em</th><th>Acoes</th></tr></thead>
@@ -9029,7 +9149,9 @@ function render_agent(): void
                             $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
                             $answeredSeconds = 0;
                             if (!empty($call['answered_at']) && !empty($call['ended_at'])) {
-                                $answeredSeconds = max(0, strtotime((string)$call['ended_at']) - strtotime((string)$call['answered_at']));
+                                $endedAt = utc_storage_timestamp((string)$call['ended_at']);
+                                $answeredAt = utc_storage_timestamp((string)$call['answered_at']);
+                                $answeredSeconds = $endedAt !== false && $answeredAt !== false ? max(0, $endedAt - $answeredAt) : 0;
                             } elseif (!empty($call['ever_answered']) && $duration > 0) {
                                 $answeredSeconds = $duration;
                             }
@@ -9082,7 +9204,7 @@ function render_agent(): void
                     $callbackDisplay = '';
                     if (!empty($call['callback_at'])) {
                         try {
-                            $callbackDisplay = (new DateTimeImmutable((string)$call['callback_at']))->format('d/m/Y H:i');
+                            $callbackDisplay = datetime_utc_display((string)$call['callback_at'], 'd/m/Y H:i');
                         } catch (Throwable) {
                             $callbackDisplay = (string)$call['callback_at'];
                         }
@@ -9270,6 +9392,7 @@ function render_supervisor(): void
         $user = current_user();
         [$userClause, $userParams] = scoped_users_clause('u', $user);
         [$callClause, $callParams] = scoped_calls_clause('co', $user);
+        [$todayStartUtc, $todayEndUtc] = sao_paulo_utc_period_bounds('day');
         ?>
         <section class="metric-grid">
             <?php
@@ -9289,11 +9412,11 @@ function render_supervisor(): void
                 <?= table(rows("SELECT u.name consultor, COALESCE(t.name, '-') equipe, u.status, COALESCE(ca.name, '-') campanha, COUNT(co.id) chamadas_dia
                 FROM users u
                 LEFT JOIN teams t ON t.id = u.team_id
-                LEFT JOIN calls co ON co.agent_id = u.id AND co.company_id = u.company_id AND date(co.created_at) = date('now')
+                LEFT JOIN calls co ON co.agent_id = u.id AND co.company_id = u.company_id AND co.created_at >= ? AND co.created_at < ?
                 LEFT JOIN campaigns ca ON ca.id = co.campaign_id AND ca.company_id = u.company_id
                 WHERE {$userClause} AND u.role = 'atendente'
                 GROUP BY u.id
-                ORDER BY u.status, u.name", $userParams), ['consultor', 'equipe', 'status', 'campanha', 'chamadas_dia']) ?>
+                ORDER BY u.status, u.name", array_merge([$todayStartUtc, $todayEndUtc], $userParams)), ['consultor', 'equipe', 'status', 'campanha', 'chamadas_dia']) ?>
             </section>
         <?php endif; ?>
         <details class="panel import-history-disclosure report-disclosure">
@@ -9438,13 +9561,13 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por dia</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT date(co.created_at) dia, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY dia ORDER BY dia DESC LIMIT 31", $params), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%d/%m/%Y 00:00:00', ligflow_local_datetime(co.created_at)) dia, date(ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 31", $params), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por mes</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y-%m', co.created_at) mes, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY mes ORDER BY mes DESC LIMIT 24", $params), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%m/%Y', ligflow_local_datetime(co.created_at)) mes, strftime('%Y-%m', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 24", $params), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
@@ -9452,13 +9575,13 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por hora</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y-%m-%d %H:00', co.created_at) hora, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY hora ORDER BY hora DESC LIMIT 48", $params), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%d/%m/%Y %H:00:00', ligflow_local_datetime(co.created_at)) hora, strftime('%Y-%m-%d %H', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 48", $params), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por ano</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y', co.created_at) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY ano ORDER BY ano DESC", $params), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%Y', ligflow_local_datetime(co.created_at)) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY ano ORDER BY ano DESC", $params), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
@@ -9678,12 +9801,7 @@ function render_costs(): void
         $telephonyConsumedMicros = (int)(one("SELECT COALESCE(SUM(-amount_micros), 0) total FROM telephony_ledger WHERE company_id=? AND entry_type='CALL_DEBIT'", [$companyId])['total'] ?? 0);
         $billing = tenant_billing_state($companyId);
         $payments = rows('SELECT * FROM payments WHERE company_id=? ORDER BY id DESC LIMIT 30', [$companyId]);
-        $paymentHistory = array_map(static function (array $payment): array {
-            $payment['created_at'] = date_br_display($payment['created_at'] ?? null);
-            $payment['approved_at'] = date_br_display($payment['approved_at'] ?? null);
-            $payment['expires_at'] = date_br_display($payment['expires_at'] ?? null);
-            return $payment;
-        }, $payments);
+        $tenantTimezone = (string)(one('SELECT timezone FROM companies WHERE id=?', [$companyId])['timezone'] ?? 'America/Sao_Paulo');
         $selectedPayment = !empty($_GET['payment_id']) ? one('SELECT * FROM payments WHERE id=? AND company_id=?', [(int)$_GET['payment_id'],$companyId]) : null;
         $paymentConfig = mercado_pago_config();
         $checkout = $selectedPayment ? (json_decode((string)$selectedPayment['checkout_data_json'], true) ?: []) : [];
@@ -9851,15 +9969,12 @@ function render_costs(): void
                 <?php endif; ?>
             <?php endif; ?>
             <?php if ($selectedPayment): ?>
-                <?php $isPixPayment = (string)$selectedPayment['payment_method'] === 'pix'; ?>
-                <article class="payment-result<?= $isPixPayment ? ' payment-result-pix' : '' ?>" data-payment-watch="<?= (int)$selectedPayment['id'] ?>"><strong>Status: <span data-payment-status><?= h($selectedPayment['status']) ?></span></strong>
-                    <?php if (!empty($checkout['qr_code_base64'])): ?><img class="pix-qr" src="data:image/png;base64,<?= h($checkout['qr_code_base64']) ?>" alt="QR Code Pix"><?php endif; ?>
-                    <?php if (!empty($checkout['qr_code'])): ?><textarea readonly><?= h($checkout['qr_code']) ?></textarea><?php endif; ?>
-                    <?php if ($isPixPayment && !empty($checkout['qr_code'])): ?><div class="payment-pix-actions"><button class="button secondary" type="button" data-copy-pix>Copiar codigo Pix</button><button class="button" type="button" data-check-payment data-payment-id="<?= (int)$selectedPayment['id'] ?>">Verificar pagamento</button></div><?php endif; ?>
-                    <?php if (!empty($checkout['ticket_url'])): ?><a class="button secondary" href="<?= h($checkout['ticket_url']) ?>" target="_blank" rel="noopener">Abrir boleto</a><?php endif; ?>
-                </article>
-                <?php if ($isPixPayment && $paymentInProgress && !empty($checkout['qr_code_base64'])): ?>
-                    <div class="payment-pix-modal" data-payment-pix-modal role="dialog" aria-modal="true" aria-labelledby="payment-pix-title">
+                <?php
+                $isPixPayment = (string)$selectedPayment['payment_method'] === 'pix';
+                $showPixModal = $isPixPayment && !empty($checkout['qr_code_base64']);
+                ?>
+                <?php if ($showPixModal): ?>
+                    <div class="payment-pix-modal" data-payment-pix-modal data-payment-watch="<?= (int)$selectedPayment['id'] ?>" role="dialog" aria-modal="true" aria-labelledby="payment-pix-title">
                         <div class="payment-pix-dialog">
                             <header><div><strong id="payment-pix-title">Pague com Pix</strong><small>Status: <span data-payment-status><?= h($selectedPayment['status']) ?></span></small></div><button class="icon-button" type="button" data-payment-pix-close aria-label="Fechar">x</button></header>
                             <img class="pix-qr" src="data:image/png;base64,<?= h($checkout['qr_code_base64']) ?>" alt="QR Code Pix">
@@ -9867,13 +9982,19 @@ function render_costs(): void
                             <button class="button secondary" type="button" data-payment-pix-close>Fechar</button>
                         </div>
                     </div>
+                <?php else: ?>
+                    <article class="payment-result" data-payment-watch="<?= (int)$selectedPayment['id'] ?>"><strong>Status: <span data-payment-status><?= h($selectedPayment['status']) ?></span></strong>
+                        <?php if (!empty($checkout['qr_code'])): ?><textarea readonly><?= h($checkout['qr_code']) ?></textarea><?php endif; ?>
+                        <?php if ($isPixPayment && !empty($checkout['qr_code'])): ?><div class="payment-pix-actions"><button class="button secondary" type="button" data-copy-pix>Copiar codigo Pix</button><button class="button" type="button" data-check-payment data-payment-id="<?= (int)$selectedPayment['id'] ?>">Verificar pagamento</button></div><?php endif; ?>
+                        <?php if (!empty($checkout['ticket_url'])): ?><a class="button secondary" href="<?= h($checkout['ticket_url']) ?>" target="_blank" rel="noopener">Abrir boleto</a><?php endif; ?>
+                    </article>
                 <?php endif; ?>
             <?php endif; ?>
             </div>
         </details>
         <details class="panel import-history-disclosure">
             <summary><span>Historico de pagamentos</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
-            <div class="import-history-content"><?= table($paymentHistory, ['created_at','internal_reference','payment_method','amount','billing_period','status','approved_at','expires_at']) ?></div>
+            <div class="import-history-content"><?= table($payments, ['created_at','internal_reference','payment_method','amount','billing_period','status','approved_at','expires_at'], $tenantTimezone) ?></div>
         </details>
         <?php if ($paymentConfig['active'] && $paymentConfig['card_enabled'] && $paymentConfig['public_key'] !== ''): ?>
         <script src="https://sdk.mercadopago.com/js/v2"></script>
@@ -10372,7 +10493,8 @@ function render_asterisk_diagnostics(): void
             <div class="section-heading"><div><h2>Lotes Asterisk</h2><p class="hint">Lotes ativos e recentes do tenant selecionado.</p></div><span data-asterisk-total><?= (int)$data['pagination']['total'] ?> lote(s)</span></div>
             <div class="table-wrap"><table><thead><tr><th>Batch</th><th>Tenant</th><th>Campanha</th><th>Consultor</th><th>Status</th><th>Paralelismo</th><th>Rota</th><th>Inicio</th><th>Duracao</th><th>Orig./Ativ./Fim.</th><th>WIN/LOS/LATE</th><th>Continuacao</th></tr></thead><tbody data-asterisk-batches>
                 <?php foreach ($data['batches'] as $batch): ?>
-                    <tr><td><a href="?page=asterisk_diagnostics&amp;batch_id=<?= (int)$batch['id'] ?>">#<?= (int)$batch['id'] ?></a></td><td><?= h($batch['tenant_name']) ?></td><td><?= h($batch['campaign_name'] ?: '-') ?></td><td><?= h($batch['agent_name'] ?: '-') ?></td><td><?= h($batch['status']) ?></td><td><?= (int)$batch['requested_parallelism'] ?> / <?= (int)$batch['effective_parallelism'] ?></td><td><?= h(($batch['telephony_mode'] ?: '-') . ' / ' . ($batch['telephony_trunk'] ?: '-')) ?></td><td><?= h(datetime_utc_display((string)$batch['created_at'])) ?></td><td><?= h(asterisk_diagnostics_duration(max(0, time() - strtotime((string)$batch['created_at'])))) ?></td><td><?= (int)$batch['originated_count'] ?> / <?= (int)$batch['active_count'] ?> / <?= (int)$batch['finalized_count'] ?></td><td><?= (int)$batch['winner_count'] ?> / <?= (int)$batch['loser_count'] ?> / <?= (int)$batch['late_answered_count'] ?></td><td><?= !empty($batch['next_started_at']) ? h(datetime_utc_display((string)$batch['next_started_at'])) : '-' ?></td></tr>
+                    <?php $batchCreatedAt = utc_storage_timestamp((string)$batch['created_at']); ?>
+                    <tr><td><a href="?page=asterisk_diagnostics&amp;batch_id=<?= (int)$batch['id'] ?>">#<?= (int)$batch['id'] ?></a></td><td><?= h($batch['tenant_name']) ?></td><td><?= h($batch['campaign_name'] ?: '-') ?></td><td><?= h($batch['agent_name'] ?: '-') ?></td><td><?= h($batch['status']) ?></td><td><?= (int)$batch['requested_parallelism'] ?> / <?= (int)$batch['effective_parallelism'] ?></td><td><?= h(($batch['telephony_mode'] ?: '-') . ' / ' . ($batch['telephony_trunk'] ?: '-')) ?></td><td><?= h(datetime_utc_display((string)$batch['created_at'])) ?></td><td><?= h(asterisk_diagnostics_duration($batchCreatedAt !== false ? max(0, time() - $batchCreatedAt) : 0)) ?></td><td><?= (int)$batch['originated_count'] ?> / <?= (int)$batch['active_count'] ?> / <?= (int)$batch['finalized_count'] ?></td><td><?= (int)$batch['winner_count'] ?> / <?= (int)$batch['loser_count'] ?> / <?= (int)$batch['late_answered_count'] ?></td><td><?= !empty($batch['next_started_at']) ? h(datetime_utc_display((string)$batch['next_started_at'])) : '-' ?></td></tr>
                 <?php endforeach; ?>
                 <?php if (!$data['batches']): ?><tr><td colspan="12" class="empty">Nenhum lote encontrado.</td></tr><?php endif; ?>
             </tbody></table></div>
