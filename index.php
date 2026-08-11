@@ -5658,8 +5658,8 @@ function campaign_effective_parallelism(array $campaign, int $companyId): int
 
     $teamAvailable = 10;
     if (!empty($campaign['team_id'])) {
-        $team = one('SELECT max_simultaneous_calls FROM teams WHERE id = ? AND company_id = ?', [(int)$campaign['team_id'], $companyId]) ?: [];
-        $teamCap = max(1, (int)($team['max_simultaneous_calls'] ?? 1));
+        $team = one('SELECT simultaneous_limit FROM teams WHERE id = ? AND company_id = ?', [(int)$campaign['team_id'], $companyId]) ?: [];
+        $teamCap = max(1, (int)($team['simultaneous_limit'] ?? 1));
         $teamInUse = (int)scalar("SELECT COUNT(*) FROM calls co INNER JOIN campaigns ca ON ca.id = co.campaign_id WHERE co.company_id = ? AND ca.team_id = ? AND co.status IN (" . live_call_statuses_sql() . ")", [$companyId, (int)$campaign['team_id']]);
         $teamAvailable = max(0, $teamCap - $teamInUse);
     }
