@@ -2331,6 +2331,44 @@ body.light-theme .call-modal {
     to { opacity: 1; }
 }
 
+.radar-loading-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 3000;
+    display: grid;
+    place-items: center;
+    background: rgba(15, 23, 42, .28);
+    backdrop-filter: blur(5px);
+}
+
+.radar-loading-overlay.is-hidden {
+    display: none;
+}
+
+.radar-loading-indicator {
+    display: grid;
+    justify-items: center;
+    gap: 14px;
+    color: #fff;
+}
+
+.radar-loading-spinner {
+    width: 52px;
+    height: 52px;
+    border: 5px solid rgba(255, 255, 255, .35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: radar-spin .8s linear infinite;
+}
+
+.radar-is-loading {
+    overflow: hidden;
+}
+
+@keyframes radar-spin {
+    to { transform: rotate(360deg); }
+}
+
 @media (max-width: 1180px) {
     .metric-grid { grid-template-columns: repeat(3, 1fr); }
     .agent-layout, .grid.two { grid-template-columns: 1fr; }

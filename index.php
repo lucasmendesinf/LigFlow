@@ -1071,6 +1071,32 @@ function is_account_admin(?array $user = null): bool
     return in_array($user['role'] ?? '', ['admin_geral', 'admin_plataforma', 'cliente_admin', 'admin_empresa'], true);
 }
 
+function is_consultant_user(?array $user = null): bool
+{
+    $user ??= current_user();
+    return ($user['role'] ?? '') === 'atendente';
+}
+
+function scoped_calls_clause(string $alias, array $user): array
+{
+    [$clause, $params] = tenant_clause($alias);
+    if (is_consultant_user($user)) {
+        $clause .= ' AND ' . $alias . '.agent_id = ?';
+        $params[] = (int)$user['id'];
+    }
+    return [$clause, $params];
+}
+
+function scoped_users_clause(string $alias, array $user): array
+{
+    [$clause, $params] = tenant_clause($alias);
+    if (is_consultant_user($user)) {
+        $clause .= ' AND ' . $alias . '.id = ?';
+        $params[] = (int)$user['id'];
+    }
+    return [$clause, $params];
+}
+
 function ensure_call_results_for_company(int $companyId): void
 {
     if ($companyId <= 0 || one('SELECT id FROM call_results WHERE company_id = ? LIMIT 1', [$companyId])) return;
@@ -1533,6 +1559,15 @@ function nvoip_api_url_error(string $url): ?string
 function voip_status_label(): string
 {
     return nvoip_enabled() ? 'Nvoip API configurada' : 'Modo demonstracao Nvoip';
+}
+
+function active_call_provider_label(): string
+{
+    $config = asterisk_config();
+    if (empty($config['enabled']) || $config['active_mode'] !== 'ASTERISK') {
+        return 'Nvoip';
+    }
+    return $config['active_route'] === 'DIRECTCALL_TRUNK' ? 'Direct Call' : 'Nvoip';
 }
 
 function nvoip_config(?int $companyId = null): array
@@ -3000,8 +3035,7 @@ function handle_post(): void
                 ->execute([(int)$user['company_id'], $name, 'Lista criada pelo Radar de Leads.', 'Google Places', 'Disponivel', 'radar', $target, (int)$user['id']]);
             $listId = (int)$pdo->lastInsertId();
             $added = radar_add_places_to_list((int)$user['company_id'], (int)$user['id'], $listId, $places);
-            $_SESSION['radar_leads']['list_id'] = $listId;
-            $_SESSION['radar_leads']['added'] = (int)($_SESSION['radar_leads']['added'] ?? 0) + $added;
+            unset($_SESSION['radar_leads']);
             audit('criou_lista_radar', 'contact_lists:' . $listId, null, ['added' => $added]);
             flash('Lista criada com ' . $added . ' lead(s) do Radar.');
         } catch (Throwable $e) {
@@ -3019,8 +3053,7 @@ function handle_post(): void
             $target = max(1, min(1000, (int)post('target_count', '20')));
             $pdo->prepare('UPDATE contact_lists SET radar_target_leads = CASE WHEN COALESCE(radar_target_leads, 0) <= 0 THEN ? ELSE radar_target_leads END WHERE id = ? AND company_id = ?')
                 ->execute([$target, $listId, (int)$user['company_id']]);
-            $_SESSION['radar_leads']['list_id'] = $listId;
-            $_SESSION['radar_leads']['added'] = (int)($_SESSION['radar_leads']['added'] ?? 0) + $added;
+            unset($_SESSION['radar_leads']);
             audit('adicionou_leads_radar', 'contact_lists:' . $listId, null, ['added' => $added]);
             flash($added . ' lead(s) adicionada(s) a lista selecionada.');
         } catch (Throwable $e) {
@@ -6084,6 +6117,7 @@ function save_callback_for_call(array $call, int $agentId, string $scheduledAt, 
 function handle_recording_file(): never
 {
     require_login();
+    $user = current_user();
     if (!can('recordings') && !can('supervisor')) {
         http_response_code(403);
         echo 'Acesso negado.';
@@ -6091,7 +6125,7 @@ function handle_recording_file(): never
     }
 
     $callId = (int)($_GET['id'] ?? 0);
-    [$clause, $params] = tenant_clause('co');
+    [$clause, $params] = scoped_calls_clause('co', $user);
     $params[] = $callId;
     $call = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$clause} AND co.id = ? LIMIT 1", $params);
     if (!$call || empty($call['recording_url'])) {
@@ -7588,9 +7622,11 @@ function render_dashboard(): void
             'Minutos restantes' => number_format((float)$usage['remaining'], 1, ',', '.'),
             'Gasto hoje' => money(((int)($dashboardStats['gasto_hoje_micros'] ?? 0)) / 1000000),
             'Leads restantes' => one("SELECT COUNT(*) v FROM contacts c WHERE {$clause} AND c.status IN ('novo','retentar')", $params)['v'],
-            'Consultores ativos' => one("SELECT COUNT(*) v FROM users c WHERE {$clause} AND c.role IN ('atendente','usuario_operacional') AND c.status <> 'Desconectado'", $params)['v'],
-            'Telefonia' => is_platform_admin() ? voip_status_label() : (nvoip_enabled() ? 'Disponivel' : 'Indisponivel'),
         ];
+        if (is_account_admin()) {
+            $cards['Consultores ativos'] = one("SELECT COUNT(*) v FROM users c WHERE {$clause} AND c.role IN ('atendente','usuario_operacional') AND c.status <> 'Desconectado'", $params)['v'];
+            $cards['Telefonia'] = active_call_provider_label();
+        }
         ?>
         <section class="metric-grid">
             <?php foreach ($cards as $label => $value): ?>
@@ -8682,6 +8718,13 @@ function render_radar(): void
         $targetCount = max(1, (int)($stored['target_count'] ?? 20));
         $activeListId = $sameTenant ? (int)($stored['list_id'] ?? 0) : 0;
         $listRows = rows("SELECT l.id,l.name,l.radar_target_leads,COUNT(c.id) contact_count FROM contact_lists l LEFT JOIN contacts c ON c.list_id=l.id AND c.status <> 'excluido' WHERE l.company_id=? GROUP BY l.id ORDER BY l.id DESC", [(int)$user['company_id']]);
+        $radarLists = rows("SELECT l.id,l.name,l.status,l.source,l.tags,l.created_at,COUNT(c.id) contatos
+            FROM contact_lists l
+            LEFT JOIN contacts c ON c.list_id=l.id AND c.status <> 'excluido'
+            WHERE l.company_id=?
+              AND EXISTS (SELECT 1 FROM radar_lead_history rh WHERE rh.company_id=l.company_id AND rh.list_id=l.id)
+            GROUP BY l.id
+            ORDER BY l.id DESC", [(int)$user['company_id']]);
         $historyListIds = [];
         if ($places) {
             $marks = implode(',', array_fill(0, count($places), '?'));
@@ -8697,7 +8740,7 @@ function render_radar(): void
             <div class="section-head">
                 <div><h2>Radar de Leads</h2><p>Encontre empresas novas no Google Places, sem repetir empresas ja apresentadas ou importadas.</p></div>
             </div>
-            <form method="post" class="form-grid">
+            <form method="post" class="form-grid" data-radar-loading-form>
                 <input type="hidden" name="action" value="search_radar_leads">
                 <label>Segmento<input name="segment" required value="<?= h((string)($filters['segment'] ?? '')) ?>" placeholder="Ex: imobiliaria, construtora"></label>
                 <label>Estado<input name="state" required maxlength="2" value="<?= h((string)($filters['state'] ?? '')) ?>" placeholder="PR"></label>
@@ -8738,13 +8781,40 @@ function render_radar(): void
             </table></div>
             </form>
             <div class="actions-row">
-                <?php if (!empty($stored['next_page_token'])): ?><form method="post"><input type="hidden" name="action" value="search_radar_more"><button class="button secondary" type="submit">Buscar mais empresas</button></form><?php else: ?><span class="muted">Nao ha mais empresas disponiveis para estes filtros.</span><?php endif; ?>
+                <?php if (!empty($stored['next_page_token'])): ?><form method="post" data-radar-loading-form><input type="hidden" name="action" value="search_radar_more"><button class="button secondary" type="submit">Buscar mais empresas</button></form><?php else: ?><span class="muted">Nao ha mais empresas disponiveis para estes filtros.</span><?php endif; ?>
                 <?php if ($activeListId): ?><form method="post" class="inline-form"><input type="hidden" name="action" value="create_radar_campaign"><input type="hidden" name="list_id" value="<?= $activeListId ?>"><input name="campaign_name" placeholder="Nome da campanha (opcional)"><button class="button" type="submit">Criar campanha</button></form><?php endif; ?>
             </div>
         </section>
         <?php elseif ($sameTenant && $filters): ?>
         <section class="panel"><p class="empty">Nenhuma empresa encontrada para os filtros informados.</p></section>
         <?php endif; ?>
+        <?php if ($radarLists): ?>
+        <section class="panel">
+            <h2>Listas</h2>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Nome</th><th>Status</th><th>Origem</th><th>Contatos</th><th>Etiquetas</th><th>Criada em</th><th>Acoes</th></tr></thead>
+                    <tbody><?php foreach ($radarLists as $list): ?>
+                        <tr>
+                            <td><?= h($list['name']) ?></td>
+                            <td><?= h($list['status']) ?></td>
+                            <td><?= h($list['source']) ?></td>
+                            <td><?= h((string)$list['contatos']) ?></td>
+                            <td><?= h($list['tags']) ?></td>
+                            <td><?= h(datetime_utc_display((string)$list['created_at'])) ?></td>
+                            <td><a class="mini-link" href="?page=lists&list_id=<?= (int)$list['id'] ?>">Ver numeros</a></td>
+                        </tr>
+                    <?php endforeach; ?></tbody>
+                </table>
+            </div>
+        </section>
+        <?php endif; ?>
+        <div class="radar-loading-overlay is-hidden" data-radar-loading-overlay role="status" aria-live="polite" aria-label="Buscando empresas">
+            <div class="radar-loading-indicator">
+                <span class="radar-loading-spinner" aria-hidden="true"></span>
+                <strong>Buscando empresas...</strong>
+            </div>
+        </div>
     <?php });
 }
 
@@ -9197,36 +9267,39 @@ function render_agent(): void
 function render_supervisor(): void
 {
     layout('supervisor', function () {
-        [$clause, $params] = tenant_clause('u');
+        $user = current_user();
+        [$userClause, $userParams] = scoped_users_clause('u', $user);
+        [$callClause, $callParams] = scoped_calls_clause('co', $user);
         ?>
         <section class="metric-grid">
             <?php
             $metrics = [
-                'Disponiveis' => one("SELECT COUNT(*) v FROM users u WHERE {$clause} AND role = 'atendente' AND status = 'Disponivel'", $params)['v'],
-                'Em ligacao' => one("SELECT COUNT(*) v FROM users u WHERE {$clause} AND role = 'atendente' AND status = 'Em ligacao'", $params)['v'],
-                'Em pausa' => one("SELECT COUNT(*) v FROM users u WHERE {$clause} AND role = 'atendente' AND status LIKE '%Pausa%'", $params)['v'],
-                'Chamadas em andamento' => one(str_replace('users u', 'calls u', "SELECT COUNT(*) v FROM users u WHERE {$clause} AND status IN (" . live_call_statuses_sql() . ")"), $params)['v'],
+                'Disponiveis' => one("SELECT COUNT(*) v FROM users u WHERE {$userClause} AND role = 'atendente' AND status = 'Disponivel'", $userParams)['v'],
+                'Em ligacao' => one("SELECT COUNT(*) v FROM users u WHERE {$userClause} AND role = 'atendente' AND status = 'Em ligacao'", $userParams)['v'],
+                'Em pausa' => one("SELECT COUNT(*) v FROM users u WHERE {$userClause} AND role = 'atendente' AND status LIKE '%Pausa%'", $userParams)['v'],
+                'Chamadas em andamento' => one("SELECT COUNT(*) v FROM calls co WHERE {$callClause} AND co.status IN (" . live_call_statuses_sql() . ")", $callParams)['v'],
             ];
             foreach ($metrics as $label => $value): ?>
                 <article class="metric"><span><?= h($label) ?></span><strong><?= h((string)$value) ?></strong></article>
             <?php endforeach; ?>
         </section>
-        <section class="panel">
-            <h2>Consultores</h2>
-            <?= table(rows("SELECT u.name consultor, COALESCE(t.name, '-') equipe, u.status, COALESCE(ca.name, '-') campanha, COUNT(co.id) chamadas_dia
+        <?php if (is_account_admin($user)): ?>
+            <section class="panel">
+                <h2>Consultores</h2>
+                <?= table(rows("SELECT u.name consultor, COALESCE(t.name, '-') equipe, u.status, COALESCE(ca.name, '-') campanha, COUNT(co.id) chamadas_dia
                 FROM users u
                 LEFT JOIN teams t ON t.id = u.team_id
-                LEFT JOIN calls co ON co.agent_id = u.id AND date(co.created_at) = date('now')
-                LEFT JOIN campaigns ca ON ca.id = co.campaign_id
-                WHERE {$clause} AND u.role = 'atendente'
+                LEFT JOIN calls co ON co.agent_id = u.id AND co.company_id = u.company_id AND date(co.created_at) = date('now')
+                LEFT JOIN campaigns ca ON ca.id = co.campaign_id AND ca.company_id = u.company_id
+                WHERE {$userClause} AND u.role = 'atendente'
                 GROUP BY u.id
-                ORDER BY u.status, u.name", $params), ['consultor', 'equipe', 'status', 'campanha', 'chamadas_dia']) ?>
-        </section>
+                ORDER BY u.status, u.name", $userParams), ['consultor', 'equipe', 'status', 'campanha', 'chamadas_dia']) ?>
+            </section>
+        <?php endif; ?>
         <details class="panel import-history-disclosure report-disclosure">
             <summary><span>Chamadas em tempo real</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
-            <?php [$callClause, $callParams] = tenant_clause('co'); ?>
-            <?= table(rows("SELECT co.status, ct.name contato, u.name consultor, ca.name campanha, co.started_at, co.destination_number FROM calls co JOIN contacts ct ON ct.id = co.contact_id LEFT JOIN users u ON u.id = co.agent_id LEFT JOIN campaigns ca ON ca.id = co.campaign_id WHERE {$callClause} ORDER BY co.id DESC LIMIT 12", $callParams), ['status', 'contato', 'consultor', 'campanha', 'started_at', 'destination_number']) ?>
+            <?= table(rows("SELECT co.status, ct.name contato, u.name consultor, ca.name campanha, co.started_at, co.destination_number FROM calls co JOIN contacts ct ON ct.id = co.contact_id AND ct.company_id = co.company_id LEFT JOIN users u ON u.id = co.agent_id AND u.company_id = co.company_id LEFT JOIN campaigns ca ON ca.id = co.campaign_id AND ca.company_id = co.company_id WHERE {$callClause} ORDER BY co.id DESC LIMIT 12", $callParams), ['status', 'contato', 'consultor', 'campanha', 'started_at', 'destination_number']) ?>
             </div>
         </details>
         <?php render_recordings_content(); ?>
@@ -9333,7 +9406,7 @@ function render_reports(): void
                 <?php endif; ?>
             <?php endif; ?>
         </section>
-        <section class="<?= is_platform_admin() ? 'grid two' : '' ?>">
+        <section class="stack">
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Ligações detalhadas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
@@ -9361,7 +9434,7 @@ function render_reports(): void
             </details>
             <?php endif; ?>
         </section>
-        <section class="grid two">
+        <section class="stack">
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por dia</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
@@ -9375,7 +9448,7 @@ function render_reports(): void
                 </div>
             </details>
         </section>
-        <section class="grid two">
+        <section class="stack">
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por hora</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
@@ -9407,12 +9480,13 @@ function render_reports(): void
 
 function render_recordings_content(): void
 {
-        backfill_recordings_from_call_events((int)current_user()['company_id']);
-        [$clause, $params] = tenant_clause('co');
+        $user = current_user();
+        backfill_recordings_from_call_events((int)$user['company_id']);
+        [$clause, $params] = scoped_calls_clause('co', $user);
         $recordingPhone = preg_replace('/\D+/', '', trim((string)($_GET['recording_phone'] ?? ''))) ?: '';
         $recordingName = trim((string)($_GET['recording_name'] ?? ''));
         $recordingDate = trim((string)($_GET['recording_date'] ?? ''));
-        $recordingTimezone = (string)(one('SELECT timezone FROM companies WHERE id = ?', [(int)current_user()['company_id']])['timezone'] ?? 'America/Sao_Paulo');
+        $recordingTimezone = (string)(one('SELECT timezone FROM companies WHERE id = ?', [(int)$user['company_id']])['timezone'] ?? 'America/Sao_Paulo');
         try { $recordingOffset = (new DateTimeZone($recordingTimezone))->getOffset(new DateTimeImmutable('now')); } catch (Throwable) { $recordingOffset = -10800; }
         $recordingFiltersActive = $recordingPhone !== '' || $recordingName !== '' || $recordingDate !== '';
         $recordingWhere = [$clause];
@@ -9437,23 +9511,19 @@ function render_recordings_content(): void
             LEFT JOIN call_results cr ON cr.id = co.result_id
             WHERE " . implode(' AND ', $recordingWhere) . "
             ORDER BY co.id DESC LIMIT 100", $params);
-        $available = array_values(array_filter($recordings, fn($call) => !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url'])));
-        $pending = count($recordings) - count($available);
-        [$logClause, $logParams] = tenant_clause('wl');
-        $webhookLogs = rows("SELECT wl.created_at, wl.status, wl.recording_url, wl.match_key, wl.call_id
+        $webhookLogs = [];
+        if (is_platform_admin($user)) {
+            [$logClause, $logParams] = tenant_clause('wl');
+            $webhookLogs = rows("SELECT wl.created_at, wl.status, wl.recording_url, wl.match_key, wl.call_id
             FROM nvoip_webhook_logs wl
             WHERE {$logClause}
             ORDER BY wl.id DESC
             LIMIT 8", $logParams);
-        $config = nvoip_config((int)current_user()['company_id']);
+        }
+        $config = nvoip_config((int)$user['company_id']);
         $webhookUrl = (string)($config['webhook_url'] ?: 'http://localhost/voipCalutec/?page=nvoip_webhook');
         $webhookIsLocal = preg_match('~https?://(localhost|127\.0\.0\.1)~i', $webhookUrl) === 1;
         ?>
-        <section class="metric-grid compact" id="gravacoes">
-            <article class="metric"><span>Gravacoes disponiveis</span><strong><?= h((string)count($available)) ?></strong></article>
-            <article class="metric"><span>Aguardando Nvoip</span><strong><?= h((string)$pending) ?></strong></article>
-            <article class="metric"><span>Total listado</span><strong><?= h((string)count($recordings)) ?></strong></article>
-        </section>
         <?php if (is_platform_admin() && $webhookIsLocal): ?>
             <div class="flash error">O webhook da Nvoip esta configurado como localhost. A Nvoip nao consegue enviar gravacoes para um endereco local; use uma URL publica HTTPS apontando para <?= h('?page=nvoip_webhook') ?>.</div>
         <?php endif; ?>
@@ -9489,7 +9559,7 @@ function render_recordings_content(): void
             </div>
         </details>
         <?php endif; ?>
-        <details class="panel import-history-disclosure report-disclosure" <?= $recordingFiltersActive ? 'open' : '' ?>>
+        <details class="panel import-history-disclosure report-disclosure" id="gravacoes" <?= $recordingFiltersActive ? 'open' : '' ?>>
             <summary><span>Gravacoes das ligacoes</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
             <div class="section-head">

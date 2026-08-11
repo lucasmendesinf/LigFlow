@@ -61,6 +61,23 @@ document.querySelectorAll('[data-radar-select-all]').forEach((toggle) => {
     });
 });
 
+const radarLoadingOverlay = document.querySelector('[data-radar-loading-overlay]');
+document.querySelectorAll('[data-radar-loading-form]').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+        if (form.dataset.loading === '1') return;
+        event.preventDefault();
+        form.dataset.loading = '1';
+        radarLoadingOverlay?.classList.remove('is-hidden');
+        document.body.classList.add('radar-is-loading');
+        requestAnimationFrame(() => requestAnimationFrame(() => form.submit()));
+    });
+});
+window.addEventListener('pageshow', () => {
+    document.querySelectorAll('[data-radar-loading-form]').forEach((form) => delete form.dataset.loading);
+    radarLoadingOverlay?.classList.add('is-hidden');
+    document.body.classList.remove('radar-is-loading');
+});
+
 document.querySelectorAll('[data-user-menu]').forEach((menu) => {
     const trigger = menu.querySelector('[data-user-menu-toggle]');
     const panel = menu.querySelector('[data-user-menu-panel]');
