@@ -7,6 +7,7 @@ class NvoipWebphoneService {
         this.session = null;
         this.status = 'DISCONNECTED';
         this.muted = false;
+        this.registeredOnce = false;
     }
 
     emit(status, patch = {}) {
@@ -39,6 +40,7 @@ class NvoipWebphoneService {
         if (this.ua) {
             this.disconnect();
         }
+        this.registeredOnce = false;
         const missing = [
             ['WSS URL', config.wssUrl],
             ['Dominio SIP', config.domain],
@@ -76,11 +78,19 @@ class NvoipWebphoneService {
             this.emit('CONNECTED', { ws: 'Conectado', register: 'Registrando' });
             this.log('WSS conectado');
         });
-        this.ua.on('disconnected', () => {
+        this.ua.on('disconnected', (event) => {
             this.emit('DISCONNECTED', { ws: 'Desconectado', register: 'Sem registro' });
-            this.log('WSS desconectado');
+            const detail = [event?.code, event?.reason].filter(Boolean).join(' - ');
+            this.log('WSS desconectado', detail);
+            if (!this.registeredOnce && this.ua) {
+                const failedUa = this.ua;
+                this.ua = null;
+                setTimeout(() => failedUa.stop(), 0);
+                this.log('Reconexao automatica interrompida porque o primeiro registro nao foi concluido');
+            }
         });
         this.ua.on('registered', () => {
+            this.registeredOnce = true;
             this.emit('REGISTERED', { ws: 'Conectado', register: 'Registrado' });
             this.log('Registro concluido');
         });
@@ -322,6 +332,7 @@ class NvoipWebphoneService {
             this.ua.stop();
             this.ua = null;
         }
+        this.registeredOnce = false;
         this.emit('DISCONNECTED', { ws: 'Desconectado', register: 'Sem registro', call: 'Nenhuma' });
         this.log('Webphone desconectado');
     }
@@ -639,10 +650,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         answerConfirmationTimer = setTimeout(async () => {
             answerConfirmationTimer = null;
             if (!service.session || currentSipAnswered || stopRequestedByUser) return;
-            if (isAutoDialing() && currentSipDirection !== 'incoming' && !currentSipRingingConfirmed) {
-                forceTerminalCallFailure('answered_without_detected_ringback');
-                return;
-            }
             await confirmAnsweredCall();
         }, 900);
     };
@@ -877,29 +884,33 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             }, finalizeDelay);
     };
 
+    const remainingOriginationTimeoutMs = () => {
+        const configuredSeconds = Number(config?.callbackTimeoutSeconds || 30);
+        const timeoutSeconds = Math.max(10, Number.isFinite(configuredSeconds) ? configuredSeconds : 30);
+        const elapsedMs = currentSipStartedAt ? Math.max(0, Date.now() - currentSipStartedAt) : 0;
+        return Math.max(0, (timeoutSeconds * 1000) - elapsedMs);
+    };
+
     const startRingConfirmationTimer = () => {
         if (!isAutoDialing() || currentSipDirection === 'incoming') return;
         if (ringConfirmationTimer) clearTimeout(ringConfirmationTimer);
-        const timeoutMs = 5000;
         ringConfirmationTimer = setTimeout(() => {
             ringConfirmationTimer = null;
             if (currentSipCallId && !currentSipRingingConfirmed && !currentSipAnswered) {
-                forceTerminalCallFailure('ringing_not_confirmed_timeout');
+                forceTerminalCallFailure('origination_timeout_without_ringing');
             }
-        }, timeoutMs);
+        }, remainingOriginationTimeoutMs());
     };
 
     const startUnansweredRingTimer = () => {
         if (!isAutoDialing() || currentSipDirection === 'incoming') return;
         if (unansweredRingTimer) clearTimeout(unansweredRingTimer);
-        const configuredSeconds = Number(config?.callbackTimeoutSeconds || 25);
-        const timeoutSeconds = Math.min(25, Math.max(15, Number.isFinite(configuredSeconds) ? configuredSeconds : 25));
         unansweredRingTimer = setTimeout(() => {
             unansweredRingTimer = null;
             if (currentSipCallId && currentSipRingingConfirmed && !currentSipAnswered) {
                 forceTerminalCallFailure('no_answer_ring_timeout');
             }
-        }, timeoutSeconds * 1000);
+        }, remainingOriginationTimeoutMs());
     };
 
     const finishSipCallRecord = async (eventName, extra = {}) => {
@@ -984,30 +995,15 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
                     clearTimeout(ringConfirmationTimer);
                     ringConfirmationTimer = null;
                 }
+                startUnansweredRingTimer();
                 reportSipProgress({ ...state, ringingConfirmed: true });
             }
             if (state.status === 'EARLY_MEDIA') {
                 reportSipProgress(state);
-                if (ringConfirmationTimer) {
-                    clearTimeout(ringConfirmationTimer);
-                    ringConfirmationTimer = null;
-                }
                 if (isAutoDialing() && currentSipDirection !== 'incoming' && !currentSipAnswered) {
-                    if (isImmediateSkipCause(state.cause, state.sipCode)) {
+                    const terminalSipResponse = Number(state.sipCode || 0) >= 300 && isTerminalFailureCause(state.cause);
+                    if (isImmediateSkipCause(state.cause, state.sipCode) || terminalSipResponse) {
                         forceTerminalCallFailure(state.cause || `SIP ${state.sipCode}`, state);
-                    } else if (!earlyMediaTimer) {
-                        earlyMediaTimer = setTimeout(() => {
-                            earlyMediaTimer = null;
-                            if (currentSipCallId && !currentSipAnswered && !currentSipRingingConfirmed) {
-                                const terminalCause = isTerminalFailureCause(state.cause)
-                                    ? state.cause
-                                    : 'no_answer_early_media_timeout';
-                                forceTerminalCallFailure(
-                                    terminalCause,
-                                    state,
-                                );
-                            }
-                        }, 500);
                     }
                 }
             }

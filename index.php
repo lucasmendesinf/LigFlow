@@ -1496,6 +1496,17 @@ function call_billable_seconds(array $call, int $fallbackDuration, bool $answere
     return max(0, $fallbackDuration);
 }
 
+function call_conversation_duration_seconds(array $call, ?int $endedAtFallback = null): int
+{
+    if (empty($call['answered_at'])) return 0;
+    $answeredAt = utc_storage_timestamp((string)$call['answered_at']);
+    $endedAt = !empty($call['ended_at'])
+        ? utc_storage_timestamp((string)$call['ended_at'])
+        : ($endedAtFallback ?? time());
+    if ($answeredAt === false || $endedAt === false || $endedAt < $answeredAt) return 0;
+    return $endedAt - $answeredAt;
+}
+
 function call_cost_sql(string $alias = 'co'): string
 {
     return "COALESCE({$alias}.estimated_cost_micros, CAST(ROUND({$alias}.estimated_cost * 1000000) AS INTEGER), 0)";
@@ -1896,7 +1907,7 @@ function google_places_search(array $filters, string $pageToken = ''): array
         CURLOPT_HTTPHEADER => [
             'Content-Type: application/json',
             'X-Goog-Api-Key: ' . $config['api_key'],
-            'X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.googleMapsUri',
+            'X-Goog-FieldMask: places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.googleMapsUri,nextPageToken',
         ],
         CURLOPT_POSTFIELDS => json_encode(array_filter([
             'textQuery' => implode(', ', $queryParts),
@@ -1934,6 +1945,40 @@ function google_places_search(array $filters, string $pageToken = ''): array
     return ['places' => $places, 'next_page_token' => trim((string)($decoded['nextPageToken'] ?? ''))];
 }
 
+function google_places_search_pages(array $filters, string $pageToken = '', int $maxPages = 3, ?callable $fetchPage = null): array
+{
+    $maxPages = max(1, min(3, $maxPages));
+    $fetchPage ??= static fn(array $pageFilters, string $token): array => google_places_search($pageFilters, $token);
+    $places = [];
+    $nextPageToken = $pageToken;
+    $pagesFetched = 0;
+    $pageError = '';
+
+    for ($page = 0; $page < $maxPages; $page++) {
+        try {
+            $result = $fetchPage($filters, $nextPageToken);
+        } catch (Throwable $e) {
+            if ($pagesFetched === 0 && $pageToken === '') throw $e;
+            $pageError = $e->getMessage();
+            break;
+        }
+        $places = array_merge($places, (array)$result['places']);
+        $pagesFetched++;
+        $nextPageToken = trim((string)($result['next_page_token'] ?? ''));
+        if ($nextPageToken === '') break;
+    }
+
+    if ($pagesFetched >= $maxPages && $pageError === '') {
+        $nextPageToken = '';
+    }
+    return [
+        'places' => $places,
+        'next_page_token' => $nextPageToken,
+        'pages_fetched' => $pagesFetched,
+        'page_error' => $pageError,
+    ];
+}
+
 function radar_duplicate_keys(int $companyId, array $places): array
 {
     $placeIds = array_values(array_filter(array_unique(array_column($places, 'place_id'))));
@@ -1945,7 +1990,7 @@ function radar_duplicate_keys(int $companyId, array $places): array
         foreach (rows("SELECT external_code FROM contacts WHERE company_id = ? AND external_code IN ($marks)", array_merge([$companyId], array_map(static fn(string $id): string => 'google_place:' . $id, $placeIds))) as $row) {
             $existingPlaces[(string)$row['external_code']] = true;
         }
-        foreach (rows("SELECT place_id FROM radar_lead_history WHERE company_id = ? AND place_id IN ($marks)", array_merge([$companyId], $placeIds)) as $row) {
+        foreach (rows("SELECT place_id FROM radar_lead_history WHERE company_id = ? AND list_id IS NOT NULL AND place_id IN ($marks)", array_merge([$companyId], $placeIds)) as $row) {
             $existingPlaces['google_place:' . (string)$row['place_id']] = true;
         }
     }
@@ -1954,19 +1999,24 @@ function radar_duplicate_keys(int $companyId, array $places): array
         foreach (rows("SELECT phone_e164 FROM contacts WHERE company_id = ? AND phone_e164 IN ($marks)", array_merge([$companyId], $phones)) as $row) {
             $existingPhones[(string)$row['phone_e164']] = true;
         }
-        foreach (rows("SELECT phone_e164 FROM radar_lead_history WHERE company_id = ? AND phone_e164 IN ($marks)", array_merge([$companyId], $phones)) as $row) {
+        foreach (rows("SELECT phone_e164 FROM radar_lead_history WHERE company_id = ? AND list_id IS NOT NULL AND phone_e164 IN ($marks)", array_merge([$companyId], $phones)) as $row) {
             $existingPhones[(string)$row['phone_e164']] = true;
         }
     }
     return ['places' => $existingPlaces, 'phones' => $existingPhones];
 }
 
-function radar_register_new_places(int $companyId, int $userId, array $filters, array $places): array
+function radar_filter_available_places(int $companyId, array $places, array $alreadyShown = []): array
 {
-    $duplicates = radar_duplicate_keys($companyId, $places);
+    $duplicates = radar_duplicate_keys($companyId, array_merge($alreadyShown, $places));
+    foreach ($alreadyShown as $place) {
+        $placeId = trim((string)($place['place_id'] ?? ''));
+        $phone = trim((string)($place['phone'] ?? ''));
+        if ($placeId !== '') $duplicates['places']['google_place:' . $placeId] = true;
+        if ($phone !== '') $duplicates['phones'][$phone] = true;
+    }
     $new = [];
     $discarded = 0;
-    $stmt = db()->prepare("INSERT OR IGNORE INTO radar_lead_history (company_id,place_id,phone_e164,search_json,created_by) VALUES (?,?,?,?,?)");
     foreach ($places as $place) {
         $placeKey = 'google_place:' . (string)$place['place_id'];
         $phone = trim((string)($place['phone'] ?? ''));
@@ -1974,12 +2024,9 @@ function radar_register_new_places(int $companyId, int $userId, array $filters, 
             $discarded++;
             continue;
         }
-        $stmt->execute([$companyId, $place['place_id'], $phone ?: null, json_encode($filters, JSON_UNESCAPED_UNICODE), $userId]);
-        if ($stmt->rowCount() !== 1) {
-            $discarded++;
-            continue;
-        }
         $new[] = $place;
+        $duplicates['places'][$placeKey] = true;
+        if ($phone !== '') $duplicates['phones'][$phone] = true;
     }
     return ['places' => $new, 'discarded' => $discarded];
 }
@@ -1993,14 +2040,18 @@ function radar_add_places_to_list(int $companyId, int $userId, int $listId, arra
     $pdo->beginTransaction();
     try {
         $insert = $pdo->prepare("INSERT OR IGNORE INTO contacts (company_id,list_id,name,phone_raw,phone_e164,organization,origin,external_code,notes,status) VALUES (?,?,?,?,?,?,?,?,?,'novo')");
-        $linkHistory = $pdo->prepare('UPDATE radar_lead_history SET list_id = ? WHERE company_id = ? AND place_id = ?');
+        $clearUnusedPhone = $pdo->prepare('DELETE FROM radar_lead_history WHERE company_id = ? AND list_id IS NULL AND phone_e164 = ? AND place_id <> ?');
+        $saveHistory = $pdo->prepare("INSERT INTO radar_lead_history (company_id,list_id,place_id,phone_e164,search_json,created_by) VALUES (?,?,?,?,?,?)
+            ON CONFLICT(company_id,place_id) DO UPDATE SET list_id=excluded.list_id,phone_e164=excluded.phone_e164,created_by=excluded.created_by");
         $added = 0;
         foreach ($places as $place) {
             $phone = trim((string)($place['phone'] ?? ''));
             if ($phone === '') continue;
             $insert->execute([$companyId, $listId, $place['name'], $phone, $phone, $place['name'], 'Google Places', 'google_place:' . $place['place_id'], trim((string)($place['address'] ?? ''))]);
-            $added += $insert->rowCount();
-            $linkHistory->execute([$listId, $companyId, $place['place_id']]);
+            if ($insert->rowCount() !== 1) continue;
+            $added++;
+            $clearUnusedPhone->execute([$companyId, $phone, $place['place_id']]);
+            $saveHistory->execute([$companyId, $listId, $place['place_id'], $phone, '{}', $userId]);
         }
         $pdo->commit();
         return $added;
@@ -3098,19 +3149,22 @@ function handle_post(): void
                 'street' => trim((string)post('street')),
                 'only_with_phone' => post('only_with_phone') ? 1 : 0,
             ];
-            $result = google_places_search($filters);
-            $registered = radar_register_new_places((int)$user['company_id'], (int)$user['id'], $filters, $result['places']);
+            $result = google_places_search_pages($filters);
+            $registered = radar_filter_available_places((int)$user['company_id'], $result['places']);
             $_SESSION['radar_leads'] = [
                 'company_id' => (int)$user['company_id'],
                 'filters' => $filters,
                 'places' => $registered['places'],
                 'next_page_token' => $result['next_page_token'],
+                'pages_fetched' => $result['pages_fetched'],
                 'discarded' => $registered['discarded'],
                 'target_count' => max(1, min(1000, (int)post('target_count', '20'))),
                 'list_id' => 0,
                 'added' => 0,
             ];
-            flash(count($registered['places']) . ' empresa(s) nova(s) encontrada(s). ' . $registered['discarded'] . ' repetida(s) foram descartadas.');
+            $message = count($registered['places']) . ' empresa(s) nova(s) encontrada(s) em ' . $result['pages_fetched'] . ' pagina(s). ' . $registered['discarded'] . ' repetida(s) foram descartadas.';
+            if ($result['page_error'] !== '') $message .= ' A ultima pagina nao foi carregada: ' . $result['page_error'];
+            flash($message);
         } catch (Throwable $e) {
             flash('Nao foi possivel buscar empresas: ' . $e->getMessage(), 'error');
         }
@@ -3123,13 +3177,18 @@ function handle_post(): void
             if ((int)($stored['company_id'] ?? 0) !== (int)$user['company_id'] || empty($stored['next_page_token'])) {
                 throw new RuntimeException('Nao ha mais resultados para esta busca.');
             }
-            $result = google_places_search((array)$stored['filters'], (string)$stored['next_page_token']);
-            $registered = radar_register_new_places((int)$user['company_id'], (int)$user['id'], (array)$stored['filters'], $result['places']);
+            $remainingPages = 3 - max(0, (int)($stored['pages_fetched'] ?? 1));
+            if ($remainingPages < 1) throw new RuntimeException('O limite de 60 resultados desta busca ja foi atingido.');
+            $result = google_places_search_pages((array)$stored['filters'], (string)$stored['next_page_token'], $remainingPages);
+            $registered = radar_filter_available_places((int)$user['company_id'], $result['places'], (array)($stored['places'] ?? []));
             $stored['places'] = array_merge((array)($stored['places'] ?? []), $registered['places']);
             $stored['next_page_token'] = $result['next_page_token'];
+            $stored['pages_fetched'] = max(0, (int)($stored['pages_fetched'] ?? 1)) + (int)$result['pages_fetched'];
             $stored['discarded'] = (int)($stored['discarded'] ?? 0) + $registered['discarded'];
             $_SESSION['radar_leads'] = $stored;
-            flash(count($registered['places']) . ' empresa(s) nova(s) adicionada(s) ao resultado.');
+            $message = count($registered['places']) . ' empresa(s) nova(s) adicionada(s) ao resultado.';
+            if ($result['page_error'] !== '') $message .= ' A pagina seguinte nao foi carregada: ' . $result['page_error'];
+            flash($message);
         } catch (Throwable $e) {
             flash('Nao foi possivel buscar mais empresas: ' . $e->getMessage(), 'error');
         }
@@ -5769,8 +5828,44 @@ function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId
     }
 }
 
+function asterisk_user_extension_record(int $companyId, int $userId): ?array
+{
+    return one("SELECT * FROM asterisk_user_extensions
+        WHERE company_id=? AND user_id=? AND asterisk_server_id=1 AND status='Ativo'
+        ORDER BY id DESC LIMIT 1", [$companyId, $userId]);
+}
+
+function asterisk_user_extension_ready(?array $extension): bool
+{
+    return $extension
+        && strtoupper((string)($extension['lifecycle_status'] ?? '')) === 'ACTIVE'
+        && strtolower((string)($extension['provisioning_status'] ?? '')) === 'concluido'
+        && !empty($extension['provisioned_at'])
+        && !empty($extension['sip_password_encrypted']);
+}
+
+function asterisk_uses_local_ari(array $config): bool
+{
+    foreach (['ari_url', 'ari_ws_url'] as $key) {
+        $host = strtolower((string)(parse_url((string)($config[$key] ?? ''), PHP_URL_HOST) ?? ''));
+        if (!in_array($host, ['localhost', '127.0.0.1', '::1'], true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 function start_asterisk_parallel_batch(array $campaign, int $agentId, int $companyId): bool
 {
+    $asterisk = asterisk_config();
+    if (!asterisk_uses_local_ari($asterisk)) {
+        $extension = asterisk_user_extension_record($companyId, $agentId);
+        if (!asterisk_user_extension_ready($extension)) {
+            $extensionLabel = !empty($extension['extension']) ? ' ' . (string)$extension['extension'] : '';
+            flash('Ramal Asterisk' . $extensionLabel . ' ainda nao foi provisionado. Atendimento automatico nao iniciado.', 'error');
+            return false;
+        }
+    }
     $allowed = telephony_call_allowed($companyId);
     if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
     $limit = campaign_effective_parallelism($campaign, $companyId);
@@ -6094,13 +6189,7 @@ function finish_call(int $callId, int $resultId, string $notes, int $companyId):
         try { (new AsteriskProvider(asterisk_config()))->hangup($call); }
         catch (Throwable $e) { log_call_status($companyId, $callId, 'Asterisk ARI', 'hangup_failed', $e->getMessage()); }
     }
-    $duration = max(0, (int)($call['duration_seconds'] ?? 0));
-    if (!empty($call['started_at'])) {
-        $startedAt = utc_storage_timestamp((string)$call['started_at']);
-        if ($startedAt !== false) {
-            $duration = max($duration, time() - $startedAt);
-        }
-    }
+    $duration = call_conversation_duration_seconds($call, time());
 
     if ($action === 'adjust_telephony_credit') {
         if (!is_platform_admin($user)) {
@@ -6192,18 +6281,12 @@ function quick_hangup(int $callId, int $companyId): void
         try { (new AsteriskProvider(asterisk_config()))->hangup($call); }
         catch (Throwable $e) { log_call_status($companyId, $callId, 'Asterisk ARI', 'hangup_failed', $e->getMessage()); }
     }
-    $duration = max(0, (int)($call['duration_seconds'] ?? 0));
-    if (!empty($call['started_at'])) {
-        $startedAt = utc_storage_timestamp((string)$call['started_at']);
-        if ($startedAt !== false) {
-            $duration = max($duration, time() - $startedAt);
-        }
-    }
-    $wasAnswered = !empty($call['answered_at']) || (int)($call['duration_seconds'] ?? 0) > 5;
+    $duration = call_conversation_duration_seconds($call, time());
+    $wasAnswered = !empty($call['answered_at']);
     $providerBillable = (int)($call['billable_seconds'] ?? 0) > 0 ? (int)$call['billable_seconds'] : null;
     $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
     $billing = call_billing_values($call, $billable);
-    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL OR duration_seconds > 5 THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
         ->execute([$duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
     telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
     db()->prepare("UPDATE contacts SET status = 'concluido', reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ?")
@@ -6240,7 +6323,7 @@ function handle_nvoip_webhook(): never
 
     $rawStatus = (string)(first_payload_value($payload, ['status', 'call_status', 'state']) ?? $call['status']);
     $status = normalize_call_status($rawStatus);
-    $duration = (int)($payload['duration_seconds'] ?? $payload['duration'] ?? $call['duration_seconds']);
+    $reportedDuration = max(0, (int)($payload['duration_seconds'] ?? $payload['duration'] ?? $call['duration_seconds']));
     $recording = $recording ?: (string)($call['recording_url'] ?? '');
 
     $finalStatuses = ['completed', 'failed', 'cancelled', 'busy', 'no_answer', 'missed'];
@@ -6249,13 +6332,17 @@ function handle_nvoip_webhook(): never
     $internalStatus = normalize_call_attempt_status($rawStatus, [
         'event' => in_array($status, ['answered', 'connected'], true) ? 'answered' : '',
         'answered_at' => $status === 'answered' ? utc_now_storage() : ($call['answered_at'] ?? null),
-        'duration_seconds' => $duration,
+        'duration_seconds' => $reportedDuration,
         'cause' => (string)($payload['cause'] ?? ''),
         'reason' => (string)($payload['reason'] ?? ''),
         'stopped_by_user' => !empty($payload['stopped_by_user']),
     ]);
     $providerBillable = first_payload_value($payload, ['billsec', 'billable_seconds', 'billable_duration', 'charged_seconds', 'talk_time']);
     $wasAnswered = $internalStatus === 'atendida' || !empty($call['answered_at']) || in_array($status, ['answered', 'connected'], true);
+    $duration = $wasAnswered ? call_conversation_duration_seconds($call, time()) : 0;
+    if ($duration === 0 && $wasAnswered && $providerBillable !== null && $providerBillable !== '' && is_numeric($providerBillable)) {
+        $duration = max(0, (int)$providerBillable);
+    }
     $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
     $billing = call_billing_values($call, $billable);
     db()->prepare("UPDATE calls SET status = ?, provider_call_id = COALESCE(NULLIF(provider_call_id, ''), NULLIF(external_call_id, '')), provider_status_raw = ?, internal_status = ?, duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, recording_url = NULLIF(?, ''), answered_at = {$answeredAtSql}, ended_at = {$endedAtSql}, updated_at = datetime('now') WHERE id = ?")
@@ -6554,13 +6641,31 @@ function handle_sip_config(): never
 
     $asterisk = asterisk_config();
     if ($asterisk['active_mode'] === 'ASTERISK') {
-        $sipUsername = preg_replace('/^PJSIP\//i', '', (string)$asterisk['consultant_endpoint']);
-        $sipPassword = trim((string)$asterisk['webrtc_password']);
-        if ($sipPassword === '') $sipPassword = trim((string)env_value('ASTERISK_WEBRTC_PASSWORD'));
+        if (asterisk_uses_local_ari($asterisk)) {
+            $sipUsername = preg_replace('/^PJSIP\//i', '', (string)$asterisk['consultant_endpoint']);
+            $sipPassword = trim((string)$asterisk['webrtc_password']);
+            if ($sipPassword === '') {
+                $sipPassword = trim((string)env_value('ASTERISK_WEBRTC_PASSWORD'));
+            }
+        } else {
+            $extension = asterisk_user_extension_record((int)$user['company_id'], (int)$user['id']);
+            $sipUsername = trim((string)($extension['extension'] ?? ''));
+            $sipPassword = $extension && !empty($extension['sip_password_encrypted'])
+                ? trim(decrypt_secret((string)$extension['sip_password_encrypted']))
+                : '';
+            if (!asterisk_user_extension_ready($extension)) {
+                http_response_code(409);
+                header('Content-Type: application/json; charset=utf-8');
+                header('Cache-Control: no-store, private');
+                $extensionLabel = $sipUsername !== '' ? ' ' . $sipUsername : '';
+                echo json_encode(['ok' => false, 'error' => 'Ramal Asterisk' . $extensionLabel . ' ainda nao foi provisionado. Aguarde o provisionamento antes de conectar o webphone.'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+        }
         $isComplete = $asterisk['enabled']
             && valid_asterisk_webrtc_wss_url((string)$asterisk['sip_wss_url'])
             && valid_asterisk_webrtc_domain((string)$asterisk['sip_domain'])
-            && valid_asterisk_webrtc_endpoint((string)$asterisk['consultant_endpoint'])
+            && valid_asterisk_webrtc_endpoint($sipUsername)
             && valid_asterisk_trunk_identifier((string)$asterisk['webrtc_context'])
             && $sipUsername !== ''
             && $sipPassword !== '';
@@ -6979,11 +7084,7 @@ function handle_sip_call_event(): never
         $terminalFailure = !empty($payload['terminal_failure']) || is_terminal_call_failure($cause);
         $wasAnswered = !$terminalFailure && (!empty($call['answered_at']) || !empty($payload['answered']));
         $status = $wasAnswered ? 'pos_atendimento' : unsuccessful_sip_status($cause, $stoppedByUser);
-        $duration = max(0, (int)($payload['duration_seconds'] ?? 0));
-        if ($duration === 0 && !empty($call['started_at'])) {
-            $startedAt = utc_storage_timestamp((string)$call['started_at']);
-            $duration = $startedAt !== false ? max(1, time() - $startedAt) : 1;
-        }
+        $duration = $wasAnswered ? call_conversation_duration_seconds($call, time()) : 0;
         $internalStatus = $wasAnswered
             ? 'atendida'
             : normalize_call_attempt_status($status, [
@@ -7802,7 +7903,7 @@ function render_dashboard(): void
             'Minutos hoje' => number_format(((float)($dashboardStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
             'Minutos restantes' => number_format((float)$usage['remaining'], 1, ',', '.'),
             'Gasto hoje' => money(((int)($dashboardStats['gasto_hoje_micros'] ?? 0)) / 1000000),
-            'Leads restantes' => one("SELECT COUNT(*) v FROM contacts c WHERE {$clause} AND c.status IN ('novo','retentar')", $params)['v'],
+            'Leads restantes' => one("SELECT COUNT(*) v FROM contacts c WHERE {$clause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $params)['v'],
         ];
         if (is_account_admin()) {
             $cards['Consultores ativos'] = one("SELECT COUNT(*) v FROM users c WHERE {$clause} AND c.role IN ('atendente','usuario_operacional') AND c.status <> 'Desconectado'", $params)['v'];
@@ -8795,7 +8896,7 @@ function render_campaigns(): void
                 flash('Campanha nao encontrada para edicao.', 'error');
             }
         }
-        $lists = rows("SELECT id, name FROM contact_lists WHERE {$clause} ORDER BY name", $params);
+        $lists = rows("SELECT l.id,l.name,(SELECT COUNT(*) FROM contacts c WHERE c.list_id=l.id AND c.status <> 'excluido') contact_count FROM contact_lists l WHERE {$clause} ORDER BY l.name", $params);
         $teams = rows("SELECT id, name FROM teams WHERE {$clause} ORDER BY name", $params);
         $supervisors = rows("SELECT id, name FROM users WHERE {$clause} AND role IN ('supervisor','admin_empresa') ORDER BY name", $params);
         $campaignRows = rows("SELECT ca.id, ca.name, ca.dialer_type, ca.status, COALESCE(l.name, '-') lista, COALESCE(t.name, '-') equipe, ca.max_attempts, ca.simultaneous_calls, COUNT(co.id) chamadas
@@ -8864,7 +8965,7 @@ function render_campaigns(): void
                         <?php if ($editing): ?><input type="hidden" name="campaign_id" value="<?= (int)$editCampaign['id'] ?>"><?php endif; ?>
                         <label>Nome<input name="name" value="<?= h((string)$field('name')) ?>" required></label>
                         <label>Descricao<textarea name="description"><?= h((string)$field('description')) ?></textarea></label>
-                        <label>Lista<select name="list_id" required><?php foreach ($lists as $l): ?><option value="<?= $l['id'] ?>" <?= (int)$field('list_id') === (int)$l['id'] ? 'selected' : '' ?>><?= h($l['name']) ?></option><?php endforeach; ?></select></label>
+                        <label>Lista<select name="list_id" required><?php foreach ($lists as $l): ?><option value="<?= $l['id'] ?>" <?= (int)$field('list_id') === (int)$l['id'] ? 'selected' : '' ?>><?= h($l['name'] . ' (' . (int)$l['contact_count'] . ')') ?></option><?php endforeach; ?></select></label>
                         <label>Equipe<select name="team_id"><option value="">Opcional</option><?php foreach ($teams as $t): ?><option value="<?= $t['id'] ?>" <?= (int)$field('team_id') === (int)$t['id'] ? 'selected' : '' ?>><?= h($t['name']) ?></option><?php endforeach; ?></select></label>
                         <label>Supervisor<select name="supervisor_id"><option value="">Opcional</option><?php foreach ($supervisors as $s): ?><option value="<?= $s['id'] ?>" <?= (int)$field('supervisor_id') === (int)$s['id'] ? 'selected' : '' ?>><?= h($s['name']) ?></option><?php endforeach; ?></select></label>
                         <label>Tipo de discador<select name="dialer_type"><?php foreach (['progressivo' => 'Progressivo', 'preview' => 'Preview', 'manual' => 'Manual'] as $value => $label): ?><option value="<?= h($value) ?>" <?= (string)$field('dialer_type', 'progressivo') === $value ? 'selected' : '' ?>><?= h($label) ?></option><?php endforeach; ?></select></label>
@@ -8899,13 +9000,19 @@ function render_radar(): void
         $targetCount = max(1, (int)($stored['target_count'] ?? 20));
         $activeListId = $sameTenant ? (int)($stored['list_id'] ?? 0) : 0;
         $listRows = rows("SELECT l.id,l.name,l.radar_target_leads,COUNT(c.id) contact_count FROM contact_lists l LEFT JOIN contacts c ON c.list_id=l.id AND c.status <> 'excluido' WHERE l.company_id=? GROUP BY l.id ORDER BY l.id DESC", [(int)$user['company_id']]);
-        $radarLists = rows("SELECT l.id,l.name,l.status,l.source,l.tags,l.created_at,COUNT(c.id) contatos
+        $radarLists = rows("SELECT l.id,l.name,l.status,l.source,l.tags,l.created_at,activity.latest_history_id,COUNT(c.id) contatos
             FROM contact_lists l
+            INNER JOIN (
+                SELECT list_id,MAX(id) latest_history_id
+                FROM radar_lead_history
+                WHERE company_id=? AND list_id IS NOT NULL
+                GROUP BY list_id
+            ) activity ON activity.list_id=l.id
             LEFT JOIN contacts c ON c.list_id=l.id AND c.status <> 'excluido'
             WHERE l.company_id=?
-              AND EXISTS (SELECT 1 FROM radar_lead_history rh WHERE rh.company_id=l.company_id AND rh.list_id=l.id)
             GROUP BY l.id
-            ORDER BY l.id DESC", [(int)$user['company_id']]);
+            ORDER BY activity.latest_history_id DESC,l.id DESC", [(int)$user['company_id'], (int)$user['company_id']]);
+        $latestRadarListId = (int)($radarLists[0]['id'] ?? 0);
         $historyListIds = [];
         if ($places) {
             $marks = implode(',', array_fill(0, count($places), '?'));
@@ -8919,7 +9026,7 @@ function render_radar(): void
         ?>
         <section class="panel">
             <div class="section-head">
-                <div><h2>Radar de Leads</h2><p>Encontre empresas novas no Google Places, sem repetir empresas ja apresentadas ou importadas.</p></div>
+                <div><h2>Radar de Leads</h2><p>Encontre empresas novas no Google Places, sem repetir empresas ja salvas em listas ou importadas.</p></div>
             </div>
             <form method="post" class="form-grid" data-radar-loading-form>
                 <input type="hidden" name="action" value="search_radar_leads">
@@ -8976,8 +9083,9 @@ function render_radar(): void
                 <table>
                     <thead><tr><th>Nome</th><th>Status</th><th>Origem</th><th>Contatos</th><th>Etiquetas</th><th>Criada em</th><th>Acoes</th></tr></thead>
                     <tbody><?php foreach ($radarLists as $list): ?>
-                        <tr>
-                            <td><?= h($list['name']) ?></td>
+                        <?php $isLatestRadarList = (int)$list['id'] === $latestRadarListId; ?>
+                        <tr class="<?= $isLatestRadarList ? 'radar-list-latest' : '' ?>">
+                            <td><?= h($list['name']) ?><?= $isLatestRadarList ? '<span class="radar-latest-label">Mais recente</span>' : '' ?></td>
                             <td><?= h($list['status']) ?></td>
                             <td><?= h($list['source']) ?></td>
                             <td><?= h((string)$list['contatos']) ?></td>
@@ -9226,16 +9334,9 @@ function render_agent(): void
                         <tbody>
                         <?php foreach ($answeredCalls as $index => $call): ?>
                             <?php
-                            $duration = (int)($call['duration_seconds'] ?? 0);
-                            $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
-                            $answeredSeconds = 0;
-                            if (!empty($call['answered_at']) && !empty($call['ended_at'])) {
-                                $endedAt = utc_storage_timestamp((string)$call['ended_at']);
-                                $answeredAt = utc_storage_timestamp((string)$call['answered_at']);
-                                $answeredSeconds = $endedAt !== false && $answeredAt !== false ? max(0, $endedAt - $answeredAt) : 0;
-                            } elseif (!empty($call['ever_answered']) && $duration > 0) {
-                                $answeredSeconds = $duration;
-                            }
+                            $duration = call_conversation_duration_seconds($call);
+                            $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '00:00';
+                            $answeredSeconds = $duration;
                             $isAnsweredCall = !empty($call['ever_answered']) && $answeredSeconds > 5;
                             ?>
                             <tr class="<?= $isAnsweredCall ? 'call-history-attended' : '' ?>">
@@ -9273,7 +9374,7 @@ function render_agent(): void
                 </div>
                 <?php foreach ($answeredCalls as $call): ?>
                     <?php
-                    $duration = (int)($call['duration_seconds'] ?? 0);
+                    $duration = call_conversation_duration_seconds($call);
                     $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '00:00';
                     $modalPhoneDigits = nvoip_phone_digits((string)$call['destination_number']);
                     if (strlen($modalPhoneDigits) === 10 || strlen($modalPhoneDigits) === 11) {
@@ -9580,7 +9681,7 @@ function render_reports(): void
                         <thead><tr><th>Data</th><th>Campanha</th><th>Contato</th><th>Telefone</th><th>Consultor</th><th>Tentativa</th><th>Status bruto</th><th>Status interno</th><th>Duracao</th><th>Erro</th></tr></thead>
                         <tbody>
                         <?php foreach ($campaignLogs['rows'] as $log): ?>
-                            <?php $duration = (int)($log['duration_seconds'] ?? 0); ?>
+                            <?php $duration = call_conversation_duration_seconds($log); ?>
                             <tr>
                                 <td><?= h(datetime_utc_display((string)($log['created_at'] ?? ''))) ?></td>
                                 <td><?= h((string)($log['campanha'] ?? '-')) ?></td>
@@ -9788,7 +9889,7 @@ function render_recordings_content(): void
                         <?php foreach ($recordings as $call): ?>
                             <?php
                             $hasRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
-                            $duration = (int)($call['duration_seconds'] ?? 0);
+                            $duration = call_conversation_duration_seconds($call);
                             $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
                             ?>
                             <tr>
@@ -9813,7 +9914,7 @@ function render_recordings_content(): void
                 <?php foreach ($recordings as $call): ?>
                     <?php
                     $hasRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
-                    $duration = (int)($call['duration_seconds'] ?? 0);
+                    $duration = call_conversation_duration_seconds($call);
                     $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
                     $playUrl = '?page=recording_file&id=' . (int)$call['id'];
                     $downloadUrl = $playUrl . '&download=1';
