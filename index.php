@@ -1391,6 +1391,7 @@ function call_cost_sql(string $alias = 'co'): string
 
 function telephony_credit_state(int $companyId): array
 {
+    ensure_telephony_period_initialized($companyId);
     $subscription = one('SELECT * FROM subscriptions WHERE company_id = ?', [$companyId]) ?: [];
     $configured = !empty($subscription['telephony_period_id'])
         && $subscription['telephony_credit_initial_micros'] !== null
@@ -2355,6 +2356,77 @@ function telephony_plan_snapshot(array $plan): array
         'telephony_credit_initial_micros' => max(0, (int)$plan['telephony_credit_micros']),
         'telephony_rate_micros' => max(0, (int)$plan['telephony_rate_micros']),
     ];
+}
+
+function ensure_telephony_period_initialized(int $companyId): void
+{
+    $pdo = db();
+    $ownTransaction = !$pdo->inTransaction();
+    if ($ownTransaction) {
+        $pdo->exec('BEGIN IMMEDIATE');
+    }
+    try {
+        $subscription = one('SELECT * FROM subscriptions WHERE company_id = ?', [$companyId]);
+        if (!$subscription || empty($subscription['plan_id']) || !empty($subscription['telephony_period_id'])) {
+            if ($ownTransaction) $pdo->exec('COMMIT');
+            return;
+        }
+        $plan = one('SELECT * FROM plans WHERE id = ?', [(int)$subscription['plan_id']]);
+        if (!$plan) {
+            if ($ownTransaction) $pdo->exec('COMMIT');
+            return;
+        }
+        try {
+            $telephonySnapshot = telephony_plan_snapshot($plan);
+        } catch (RuntimeException $e) {
+            if ($ownTransaction) $pdo->exec('COMMIT');
+            return;
+        }
+
+        $paymentId = -(int)$subscription['id'];
+        $period = one('SELECT * FROM subscription_periods WHERE payment_id = ? AND subscription_id = ?', [$paymentId, (int)$subscription['id']]);
+        $timezone = new DateTimeZone((string)((one('SELECT timezone FROM companies WHERE id = ?', [$companyId]) ?: [])['timezone'] ?? 'America/Sao_Paulo'));
+        if ($period) {
+            $start = new DateTimeImmutable((string)$period['starts_at'], $timezone);
+            $end = new DateTimeImmutable((string)$period['ends_at'], $timezone);
+        } else {
+            $now = new DateTimeImmutable('now', $timezone);
+            $startValue = (string)($subscription['starts_at'] ?? '');
+            $endValue = (string)($subscription['renews_at'] ?? '');
+            $start = $startValue !== '' ? new DateTimeImmutable($startValue, $timezone) : $now;
+            $end = $endValue !== '' ? new DateTimeImmutable($endValue, $timezone) : billing_period_end($start, (string)($plan['billing_period'] ?? 'Mensal'));
+            if ($end <= $start) {
+                $end = billing_period_end($start, (string)($plan['billing_period'] ?? 'Mensal'));
+            }
+            $limitsSnapshot = json_encode([
+                'included_minutes' => (int)($subscription['included_minutes'] ?? $plan['included_minutes'] ?? 0),
+                'max_users' => (int)($subscription['max_users'] ?? $plan['max_users'] ?? 1),
+                'max_consultants' => (int)($subscription['max_consultants'] ?? $plan['max_consultants'] ?? 1),
+                'max_lists' => (int)($subscription['max_lists'] ?? $plan['max_lists'] ?? 10),
+                'max_contacts' => (int)($subscription['max_contacts'] ?? $plan['max_contacts'] ?? 1000),
+                'commercial_price_per_minute' => (float)($subscription['commercial_price_per_minute'] ?? $plan['commercial_price_per_minute'] ?? 0),
+                'telephony_credit_initial_micros' => $telephonySnapshot['telephony_credit_initial_micros'],
+                'telephony_rate_micros' => $telephonySnapshot['telephony_rate_micros'],
+            ]);
+            $pdo->prepare('INSERT OR IGNORE INTO subscription_periods (company_id, subscription_id, plan_id, payment_id, starts_at, ends_at, limits_snapshot_json, telephony_credit_initial_micros, telephony_rate_micros, telephony_balance_micros) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$companyId, (int)$subscription['id'], (int)$subscription['plan_id'], $paymentId, $start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $limitsSnapshot, $telephonySnapshot['telephony_credit_initial_micros'], $telephonySnapshot['telephony_rate_micros'], $telephonySnapshot['telephony_credit_initial_micros']]);
+            $period = one('SELECT * FROM subscription_periods WHERE payment_id = ? AND subscription_id = ?', [$paymentId, (int)$subscription['id']]);
+        }
+        if ($period) {
+            $periodId = (int)$period['id'];
+            $initialMicros = (int)($period['telephony_credit_initial_micros'] ?? $telephonySnapshot['telephony_credit_initial_micros']);
+            $rateMicros = (int)($period['telephony_rate_micros'] ?? $telephonySnapshot['telephony_rate_micros']);
+            $balanceMicros = (int)($period['telephony_balance_micros'] ?? $initialMicros);
+            $pdo->prepare('UPDATE subscriptions SET starts_at=COALESCE(NULLIF(starts_at, \'\'), ?), renews_at=COALESCE(NULLIF(renews_at, \'\'), ?), telephony_period_id=?, telephony_credit_initial_micros=?, telephony_rate_micros=?, telephony_balance_micros=? WHERE id=? AND telephony_period_id IS NULL')
+                ->execute([$start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), $periodId, $initialMicros, $rateMicros, $balanceMicros, (int)$subscription['id']]);
+            $pdo->prepare('INSERT OR IGNORE INTO telephony_ledger (company_id,subscription_id,subscription_period_id,entry_type,amount_micros,balance_before_micros,balance_after_micros,idempotency_key,reference_type,reference_id) VALUES (?,?,?,?,?,?,?,?,?,?)')
+                ->execute([$companyId, (int)$subscription['id'], $periodId, 'INITIAL_CREDIT', $initialMicros, 0, $initialMicros, 'period-credit:' . $periodId, 'subscription_period', $periodId]);
+        }
+        if ($ownTransaction) $pdo->exec('COMMIT');
+    } catch (Throwable $e) {
+        if ($ownTransaction && $pdo->inTransaction()) $pdo->exec('ROLLBACK');
+        throw $e;
+    }
 }
 
 function apply_approved_payment(int $paymentId, array $providerPayment): void
