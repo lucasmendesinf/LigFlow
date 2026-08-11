@@ -5680,21 +5680,68 @@ function active_dial_batch(int $agentId, int $companyId): ?array
     return one("SELECT * FROM dial_batches WHERE company_id = ? AND agent_id = ? AND status IN ('ORIGINATING','RINGING','WINNER','CONNECTED') ORDER BY id DESC LIMIT 1", [$companyId, $agentId]) ?: null;
 }
 
-function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId, int $limit): array
+function insert_dial_batch(PDO $pdo, array $batch): int
+{
+    $available = array_flip(array_column($pdo->query('PRAGMA table_info(dial_batches)')->fetchAll(), 'name'));
+    $values = [
+        'company_id' => (int)$batch['company_id'],
+        'campaign_id' => (int)$batch['campaign_id'],
+        'agent_id' => (int)$batch['agent_id'],
+        'requested_parallelism' => (int)$batch['requested_parallelism'],
+        'effective_parallelism' => (int)$batch['effective_parallelism'],
+        'telephony_mode' => (string)$batch['telephony_mode'],
+        'telephony_trunk' => (string)$batch['telephony_trunk'],
+        'status' => (string)$batch['status'],
+        'idempotency_key' => (string)$batch['idempotency_key'],
+    ];
+    foreach ([
+        'trunk_route' => 'telephony_trunk',
+        'requested_calls' => 'requested_parallelism',
+        'effective_calls' => 'effective_parallelism',
+    ] as $legacyColumn => $sourceColumn) {
+        if (isset($available[$legacyColumn])) {
+            $values[$legacyColumn] = $values[$sourceColumn];
+        }
+    }
+    $values = array_intersect_key($values, $available);
+    $columns = array_keys($values);
+    $pdo->prepare('INSERT INTO dial_batches (' . implode(',', $columns) . ') VALUES (' . implode(',', array_fill(0, count($columns), '?')) . ')')
+        ->execute(array_values($values));
+    return (int)$pdo->lastInsertId();
+}
+
+function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId, int $limit, int $telephonyPeriodId): array
 {
     $pdo = db();
     $pdo->exec('BEGIN IMMEDIATE');
+    $transactionActive = true;
     try {
-        if (active_dial_batch($agentId, $companyId)) { $pdo->commit(); return []; }
+        if (active_dial_batch($agentId, $companyId)) {
+            $pdo->exec('COMMIT');
+            $transactionActive = false;
+            return [];
+        }
         $candidates = rows("SELECT c.* FROM contacts c WHERE c.company_id = ? AND c.list_id = ? AND c.status = 'novo' AND c.attempts = 0 AND c.last_call_at IS NULL AND (c.reservation_expires_at IS NULL OR c.reservation_expires_at < datetime('now')) AND NOT EXISTS (SELECT 1 FROM blocklist b WHERE b.company_id = c.company_id AND b.phone_e164 = c.phone_e164) ORDER BY c.id ASC LIMIT " . (int)$limit, [$companyId, (int)$campaign['list_id']]);
-        if (!$candidates) { $pdo->commit(); return []; }
+        if (!$candidates) {
+            $pdo->exec('COMMIT');
+            $transactionActive = false;
+            return [];
+        }
         $config = asterisk_config();
         $mode = 'ASTERISK';
         $trunk = (new AsteriskProvider($config))->trunk();
         $key = 'batch-' . bin2hex(random_bytes(16));
-        $pdo->prepare("INSERT INTO dial_batches (company_id,campaign_id,agent_id,requested_parallelism,effective_parallelism,telephony_mode,telephony_trunk,status,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?)")
-            ->execute([$companyId, (int)$campaign['id'], $agentId, max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1))), $limit, $mode, $trunk, 'ORIGINATING', $key]);
-        $batchId = (int)$pdo->lastInsertId();
+        $batchId = insert_dial_batch($pdo, [
+            'company_id' => $companyId,
+            'campaign_id' => (int)$campaign['id'],
+            'agent_id' => $agentId,
+            'requested_parallelism' => max(1, min(10, (int)($campaign['simultaneous_calls'] ?? 1))),
+            'effective_parallelism' => $limit,
+            'telephony_mode' => $mode,
+            'telephony_trunk' => $trunk,
+            'status' => 'ORIGINATING',
+            'idempotency_key' => $key,
+        ]);
         $reserved = [];
         foreach ($candidates as $contact) {
             $guard = $pdo->prepare("UPDATE contacts SET reserved_by=?, reserved_at=datetime('now'), reservation_expires_at=datetime('now','+10 minutes'), status='em_ligacao', attempts=attempts+1, last_call_at=datetime('now') WHERE id=? AND company_id=? AND status='novo' AND attempts=0 AND last_call_at IS NULL");
@@ -5702,16 +5749,22 @@ function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId
             if ($guard->rowCount() !== 1) continue;
             $externalId = 'ARI-' . bin2hex(random_bytes(12));
             $pdo->prepare("INSERT INTO calls (company_id,campaign_id,contact_id,agent_id,provider,external_call_id,provider_call_id,destination_number,status,provider_status_raw,internal_status,attempt_number,billing_rate_micros,telephony_period_id,telephony_mode,telephony_trunk,provider_channel_id,dial_batch_id,race_outcome,started_at,ringing_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))")
-                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), (int)(telephony_subscription_state($companyId)['period_id'] ?? 0), 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
+                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), $telephonyPeriodId, 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
             $contact['call_id'] = (int)$pdo->lastInsertId();
             $contact['external_call_id'] = $externalId;
             $reserved[] = $contact;
         }
         if (!$reserved) { $pdo->prepare("UPDATE dial_batches SET status='NO_WINNER', updated_at=datetime('now') WHERE id=?")->execute([$batchId]); }
-        $pdo->commit();
+        $pdo->exec('COMMIT');
+        $transactionActive = false;
         return ['id' => $batchId, 'contacts' => $reserved, 'trunk' => $trunk];
     } catch (Throwable $e) {
-        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($transactionActive) {
+            try {
+                $pdo->exec('ROLLBACK');
+            } catch (Throwable) {
+            }
+        }
         throw $e;
     }
 }
@@ -5722,27 +5775,33 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
     $limit = campaign_effective_parallelism($campaign, $companyId);
     if ($limit < 1) { flash('Sem capacidade ou leads elegiveis para iniciar o lote Asterisk.', 'error'); return false; }
-    $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit);
+    $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit, (int)$allowed['state']['period_id']);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
     if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
     $agent = one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$agentId, $companyId]) ?: [];
     $provider = telephony_provider_for_company($companyId);
     if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para este lote.');
+    $originatedCount = 0;
     foreach ($batch['contacts'] as $contact) {
         try {
             $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$contact['external_call_id']);
             db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND dial_batch_id=?")
                 ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$contact['call_id'], (int)$batch['id']]);
+            $originatedCount++;
         } catch (Throwable $e) {
             db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND dial_batch_id=? AND finalized_at IS NULL")
                 ->execute([$e->getMessage(), (int)$contact['call_id'], (int)$batch['id']]);
             db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=?")->execute([(int)$contact['id']]);
         }
     }
-    db()->prepare("UPDATE users SET status='Discando automatico' WHERE id=? AND company_id=?")->execute([$agentId, $companyId]);
     asterisk_continue_batch_if_exhausted((int)$batch['id']);
+    if ($originatedCount === 0) {
+        flash('Nenhuma chamada foi iniciada. Atendimento automatico encerrado.', 'error');
+        return false;
+    }
+    db()->prepare("UPDATE users SET status='Discando automatico' WHERE id=? AND company_id=?")->execute([$agentId, $companyId]);
     audit('iniciou_lote_asterisk', 'dial_batches:' . (int)$batch['id'], null, ['parallelism' => $limit]);
-    flash('Lote Asterisk iniciado com ' . count($batch['contacts']) . ' chamadas.');
+    flash('Lote Asterisk iniciado com ' . $originatedCount . ' chamadas.');
     return true;
 }
 
@@ -5783,10 +5842,12 @@ function asterisk_continue_batch_if_exhausted(int $batchId): void
     if (!$batch || !empty($batch['winner_call_id'])) return;
     $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
     if ($live > 0) return;
-    $updated = db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL");
-    $updated->execute([$batchId]);
-    if ($updated->rowCount() !== 1) return;
-    start_next_progressive_call((int)$batch['campaign_id'], (int)$batch['agent_id'], (int)$batch['company_id']);
+    db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL")
+        ->execute([$batchId]);
+    db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id=?) AND status IN ('reservado','em_ligacao')")
+        ->execute([$batchId]);
+    db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+        ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
 }
 
 function cancel_active_asterisk_batch(int $agentId, int $companyId): void
@@ -8949,6 +9010,13 @@ function render_agent(): void
         $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
         $usage = monthly_usage((int)$user['company_id']);
         $activeBatch = $isAutoDialing ? active_dial_batch((int)$user['id'], (int)$user['company_id']) : null;
+        if ($activeBatch) {
+            $batchLiveCalls = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [(int)$activeBatch['id']]);
+            if ($batchLiveCalls === 0) {
+                asterisk_continue_batch_if_exhausted((int)$activeBatch['id']);
+                $activeBatch = null;
+            }
+        }
         $activeCall = $isAutoDialing && $campaignId
             ? one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND campaign_id = ? AND status IN (" . active_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [(int)$user['id'], (int)$user['company_id'], $campaignId])
             : get_active_call((int)$user['id'], (int)$user['company_id']);
@@ -8962,6 +9030,14 @@ function render_agent(): void
         $autoNextPhone = (string)($_SESSION['auto_next_phone'] ?? '');
         if ($autoNextPhone !== '') {
             unset($_SESSION['auto_next_phone']);
+        }
+        if ($isAutoDialing && !$activeBatch && !$activeCall && !$reserved && $autoNextPhone === '') {
+            db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+                ->execute([(int)$user['id'], (int)$user['company_id']]);
+            $user['status'] = 'Disponivel';
+            $isAutoDialing = false;
+            $isBatchWaitingForWinner = false;
+            $isCallLive = false;
         }
         $showAnsweredModal = call_was_answered($activeCall);
         $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
