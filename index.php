@@ -7,7 +7,8 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 21;
+const DB_SCHEMA_VERSION = 24;
+const TERMS_VERSION = '2026-08-12.1';
 
 if (!is_dir(DATA_DIR)) {
     mkdir(DATA_DIR, 0775, true);
@@ -25,6 +26,7 @@ session_save_path(DATA_DIR . '/sessions');
 session_start();
 load_env_file(__DIR__ . '/.env');
 require_once __DIR__ . '/billing_domain.php';
+require_once __DIR__ . '/terms_content.php';
 
 function load_env_file(string $path): void
 {
@@ -129,6 +131,17 @@ function migrate(PDO $pdo): void
             status TEXT DEFAULT 'Disponivel',
             work_hours TEXT DEFAULT '08:00-18:00',
             two_factor_enabled INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS password_reset_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            pending_password_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            requested_ip TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -646,6 +659,9 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'users', 'created_by', 'INTEGER');
     ensure_column($pdo, 'users', 'access_profile_id', 'INTEGER');
     ensure_column($pdo, 'users', 'allowed_modules_json', 'TEXT');
+    ensure_column($pdo, 'users', 'deleted_at', 'TEXT');
+    ensure_column($pdo, 'users', 'terms_accepted_version', 'TEXT');
+    ensure_column($pdo, 'users', 'terms_accepted_at', 'TEXT');
     ensure_column($pdo, 'calls', 'provider_call_id', 'TEXT');
     ensure_column($pdo, 'calls', 'provider_status_raw', 'TEXT');
     ensure_column($pdo, 'calls', 'internal_status', 'TEXT');
@@ -1070,7 +1086,7 @@ function current_user(): ?array
     if (empty($_SESSION['user_id'])) {
         return null;
     }
-    $stmt = db()->prepare('SELECT * FROM users WHERE id = ?');
+    $stmt = db()->prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL');
     $stmt->execute([$_SESSION['user_id']]);
     return $stmt->fetch() ?: null;
 }
@@ -1085,6 +1101,11 @@ function is_account_admin(?array $user = null): bool
 {
     $user ??= current_user();
     return in_array($user['role'] ?? '', ['admin_geral', 'admin_plataforma', 'cliente_admin', 'admin_empresa'], true);
+}
+
+function user_has_accepted_current_terms(?array $user): bool
+{
+    return $user && hash_equals(TERMS_VERSION, (string)($user['terms_accepted_version'] ?? ''));
 }
 
 function is_consultant_user(?array $user = null): bool
@@ -1452,6 +1473,19 @@ function env_value(string $key, string $default = ''): string
     return $value === false || $value === '' ? $default : (string)$value;
 }
 
+function app_public_url(string $query = ''): string
+{
+    $base = rtrim(env_value('APP_URL', ''), '/');
+    if ($base === '') {
+        $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || (string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
+        $host = (string)($_SERVER['HTTP_HOST'] ?? 'localhost');
+        $scriptDir = trim(str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/index.php'))), '/');
+        $base = ($isHttps ? 'https' : 'http') . '://' . $host . ($scriptDir !== '' ? '/' . $scriptDir : '');
+    }
+    return $base . '/?' . ltrim($query, '?');
+}
+
 function price_per_minute(): float
 {
     $config = nvoip_config();
@@ -1475,7 +1509,25 @@ function call_billing_values(array $call, int $billableSeconds): array
     $storedRate = array_key_exists('billing_rate_micros', $call) && $call['billing_rate_micros'] !== null
         ? (int)$call['billing_rate_micros']
         : call_plan_rate_micros((int)$call['company_id']);
-    return billing_proportional_call_cost($billableSeconds, $storedRate);
+    return call_uses_directcall_tariff($call)
+        ? billing_full_minute_call_cost($billableSeconds, $storedRate)
+        : billing_proportional_call_cost($billableSeconds, $storedRate);
+}
+
+function call_uses_directcall_tariff(array $call): bool
+{
+    $mode = strtoupper(trim((string)($call['telephony_mode'] ?? '')));
+    $trunk = strtolower(trim((string)($call['telephony_trunk'] ?? '')));
+    if ($mode === 'ASTERISK' && ($trunk === 'directcall' || str_contains($trunk, 'directcall'))) {
+        return true;
+    }
+    if ($mode !== '' || $trunk !== '') {
+        return false;
+    }
+    $config = asterisk_config();
+    return !empty($config['enabled'])
+        && strtoupper((string)($config['active_mode'] ?? '')) === 'ASTERISK'
+        && strtoupper((string)($config['active_route'] ?? '')) === 'DIRECTCALL_TRUNK';
 }
 
 function call_billable_seconds(array $call, int $fallbackDuration, bool $answered, mixed $providerBillable = null): int
@@ -3073,7 +3125,7 @@ function handle_post(): void
     $pdo = db();
 
     if ($action === 'login') {
-        $stmt = $pdo->prepare('SELECT * FROM users WHERE email = ?');
+        $stmt = $pdo->prepare('SELECT * FROM users WHERE email = ? AND deleted_at IS NULL');
         $stmt->execute([post('email')]);
         $user = $stmt->fetch();
         if ($user && password_verify((string)post('password'), $user['password_hash'])) {
@@ -3088,6 +3140,21 @@ function handle_post(): void
     require_login();
     $user = current_user();
     $companyId = (is_platform_admin($user) && post('company_id')) ? (int)post('company_id') : (int)$user['company_id'];
+    if ($action === 'accept_terms') {
+        if (!post('terms_acceptance')) {
+            flash('Confirme a leitura e o aceite dos Termos de Uso e da Politica de Privacidade.', 'error');
+            redirect('?page=dashboard');
+        }
+        $pdo->prepare("UPDATE users SET terms_accepted_version=?, terms_accepted_at=datetime('now') WHERE id=?")
+            ->execute([TERMS_VERSION, (int)$user['id']]);
+        audit('aceitou_termos_de_uso', 'users:' . (int)$user['id'], null, ['version' => TERMS_VERSION]);
+        flash('Termos aceitos com sucesso.');
+        redirect('?page=dashboard');
+    }
+    if (!user_has_accepted_current_terms($user)) {
+        flash('Aceite os Termos de Uso e a Politica de Privacidade para continuar.', 'error');
+        redirect('?page=dashboard');
+    }
     if (!is_platform_admin($user) && tenant_billing_state((int)$user['company_id'])['blocked'] && !in_array($action, ['create_payment'], true)) {
         flash('Plano bloqueado. Regularize o pagamento para continuar.', 'error');
         redirect('?page=costs');
@@ -3279,6 +3346,11 @@ function handle_post(): void
         redirect('?page=companies');
     }
 
+    if ($action === 'remove_client' && can('companies')) {
+        remove_or_hide_client((int)post('client_id'));
+        redirect('?page=companies');
+    }
+
     if ($action === 'save_plan' && can('plans')) {
         save_plan();
         redirect('?page=plans');
@@ -3364,6 +3436,11 @@ function handle_post(): void
 
     if ($action === 'update_my_account' && can('account')) {
         update_my_account((int)$user['id']);
+        redirect('?page=account');
+    }
+
+    if ($action === 'request_my_password_reset' && can('account')) {
+        request_my_password_reset((int)$user['id']);
         redirect('?page=account');
     }
 
@@ -4426,20 +4503,76 @@ function plan_usage_count(array $plan): int
     return $companies + $subscriptions;
 }
 
+function plan_linked_user_count(array $plan): int
+{
+    return (int)(one("SELECT COUNT(DISTINCT u.id) total
+        FROM users u
+        INNER JOIN companies c ON c.id=u.company_id
+        LEFT JOIN subscriptions s ON s.company_id=c.id
+        WHERE s.plan_id=? OR COALESCE(NULLIF(s.plan_name,''),c.plan)=?", [(int)$plan['id'], (string)$plan['name']])['total'] ?? 0);
+}
+
 function delete_plan_record(int $planId): void
 {
-    $plan = one('SELECT * FROM plans WHERE id = ?', [$planId]);
+    $plan = one("SELECT * FROM plans WHERE id=? AND status <> 'Removido'", [$planId]);
     if (!$plan) {
         flash('Plano nao encontrado.', 'error');
         return;
     }
-    if (plan_usage_count($plan) > 0) {
-        flash('Este plano ja esta vinculado a cliente ou assinatura e nao pode ser excluido.', 'error');
+    if (plan_linked_user_count($plan) > 0) {
+        flash('Este plano possui usuario vinculado e nao pode ser removido.', 'error');
         return;
     }
-    db()->prepare('DELETE FROM plans WHERE id = ?')->execute([$planId]);
+    if (plan_usage_count($plan) > 0) {
+        db()->prepare("UPDATE plans SET status='Removido' WHERE id=?")->execute([$planId]);
+        audit('ocultou_plano_com_historico', 'plans:' . $planId, $plan, ['status' => 'Removido']);
+        flash('Plano removido da listagem. Os vinculos historicos foram preservados.');
+        return;
+    }
+    db()->prepare('DELETE FROM plans WHERE id=?')->execute([$planId]);
     audit('excluiu_plano', 'plans:' . $planId, $plan, null);
-    flash('Plano excluido.');
+    flash('Plano removido definitivamente.');
+}
+
+function client_has_saved_data(int $clientId): bool
+{
+    $checks = [
+        'users',
+        'subscriptions',
+        'contact_lists',
+        'contacts',
+        'campaigns',
+        'calls',
+        'callbacks',
+        'payments',
+        'telephony_ledger',
+    ];
+    foreach ($checks as $table) {
+        if ((int)scalar("SELECT EXISTS(SELECT 1 FROM {$table} WHERE company_id = ? LIMIT 1)", [$clientId]) === 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function remove_or_hide_client(int $clientId): void
+{
+    $user = current_user();
+    if (!is_platform_admin($user)) {
+        flash('Somente o administrador da plataforma pode remover clientes.', 'error');
+        return;
+    }
+    $client = one("SELECT c.* FROM companies c WHERE c.id=? AND c.status <> 'Removida'", [$clientId]);
+    if (!$client) {
+        flash('Cliente nao encontrado.', 'error');
+        return;
+    }
+    $hasSavedData = client_has_saved_data($clientId);
+    db()->prepare("UPDATE companies SET status='Removida' WHERE id=?")->execute([$clientId]);
+    audit($hasSavedData ? 'ocultou_cliente_com_historico' : 'removeu_cliente_sem_historico', 'companies:' . $clientId, $client, ['status' => 'Removida']);
+    flash($hasSavedData
+        ? 'Cliente ocultado da listagem. Usuarios e dados historicos foram preservados.'
+        : 'Cliente removido da listagem.');
 }
 
 function update_client_account(int $clientId): void
@@ -4766,23 +4899,23 @@ function user_access_can_be_removed(int $userId, int $companyId): bool
         return false;
     }
     $target = is_platform_admin($current)
-        ? one('SELECT id, company_id, role FROM users WHERE id = ?', [$userId])
-        : one('SELECT id, company_id, role FROM users WHERE id = ? AND company_id = ?', [$userId, $companyId]);
+        ? one('SELECT id, company_id, role FROM users WHERE id = ? AND deleted_at IS NULL', [$userId])
+        : one('SELECT id, company_id, role FROM users WHERE id = ? AND company_id = ? AND deleted_at IS NULL', [$userId, $companyId]);
     if (!$target) {
         return false;
     }
     if (!is_platform_admin($current) && in_array((string)$target['role'], ['admin_geral', 'admin_plataforma'], true)) {
         return false;
     }
-    return user_access_blocking_relation_counts($userId, (int)$target['company_id']) === [];
+    return true;
 }
 
 function delete_user_access(int $userId, int $companyId): void
 {
     $current = current_user();
     $target = is_platform_admin($current)
-        ? one('SELECT * FROM users WHERE id = ?', [$userId])
-        : one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$userId, $companyId]);
+        ? one('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL', [$userId])
+        : one('SELECT * FROM users WHERE id = ? AND company_id = ? AND deleted_at IS NULL', [$userId, $companyId]);
     if (!$target) {
         flash('Usuario nao encontrado ou fora da sua conta.', 'error');
         return;
@@ -4795,25 +4928,29 @@ function delete_user_access(int $userId, int $companyId): void
         flash('Voce nao pode remover um administrador da plataforma.', 'error');
         return;
     }
-    if (user_access_blocking_relation_counts($userId, (int)$target['company_id']) !== []) {
-        flash('Este acesso não pode ser removido porque possui registros vinculados no sistema.', 'error');
-        return;
-    }
+    $linkedData = user_access_blocking_relation_counts($userId, (int)$target['company_id']);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-        $pdo->prepare("DELETE FROM consultant_profiles WHERE company_id = ? AND user_id = ?")
-            ->execute([(int)$target['company_id'], $userId]);
-        $pdo->prepare("DELETE FROM asterisk_user_extensions
-            WHERE company_id = ? AND user_id = ? AND status = 'Ativo' AND provisioned_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM asterisk_provisioning_jobs apj WHERE apj.asterisk_user_extension_id = asterisk_user_extensions.id)")
-            ->execute([(int)$target['company_id'], $userId]);
-        $pdo->prepare('DELETE FROM users WHERE id = ? AND company_id = ?')
-            ->execute([$userId, (int)$target['company_id']]);
+        if ($linkedData) {
+            $pdo->prepare("UPDATE users SET status='Removido', deleted_at=datetime('now') WHERE id=? AND company_id=?")
+                ->execute([$userId, (int)$target['company_id']]);
+            $pdo->prepare("UPDATE consultant_profiles SET status='Inativo' WHERE company_id=? AND user_id=?")
+                ->execute([(int)$target['company_id'], $userId]);
+            $pdo->prepare("UPDATE asterisk_user_extensions SET status='Inativo', lifecycle_status='RELEASED', released_at=COALESCE(released_at,datetime('now')), deactivated_at=COALESCE(deactivated_at,datetime('now')), updated_at=datetime('now') WHERE company_id=? AND user_id=? AND status='Ativo'")
+                ->execute([(int)$target['company_id'], $userId]);
+        } else {
+            $pdo->prepare("DELETE FROM consultant_profiles WHERE company_id=? AND user_id=?")
+                ->execute([(int)$target['company_id'], $userId]);
+            $pdo->prepare("DELETE FROM asterisk_user_extensions WHERE company_id=? AND user_id=?")
+                ->execute([(int)$target['company_id'], $userId]);
+            $pdo->prepare('DELETE FROM users WHERE id=? AND company_id=?')
+                ->execute([$userId, (int)$target['company_id']]);
+        }
         $pdo->commit();
-        audit('excluiu_usuario', 'users:' . $userId, $target, null);
-        flash('Acesso removido.');
+        audit($linkedData ? 'ocultou_usuario_com_historico' : 'excluiu_usuario', 'users:' . $userId, $target, ['linked_data' => array_keys($linkedData)]);
+        flash($linkedData ? 'Acesso removido da plataforma. O historico foi preservado.' : 'Acesso removido definitivamente.');
     } catch (Throwable) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         flash('Nao foi possivel remover este acesso.', 'error');
@@ -4997,16 +5134,129 @@ function update_my_account(int $userId): void
         return;
     }
     $avatarPath = post('remove_avatar') ? '' : save_avatar_upload($userId, (string)($user['avatar_path'] ?? ''));
-    $password = trim((string)post('password'));
-    if ($password !== '') {
-        db()->prepare("UPDATE users SET name = ?, email = ?, phone = ?, extension = ?, work_hours = ?, avatar_path = ?, password_hash = ? WHERE id = ?")
-            ->execute([post('name'), post('email'), post('phone'), post('extension'), post('work_hours'), $avatarPath, password_hash($password, PASSWORD_DEFAULT), $userId]);
+    $currentPassword = (string)post('current_password');
+    $newPassword = trim((string)post('new_password'));
+    $confirmPassword = trim((string)post('confirm_password'));
+    $changePassword = $currentPassword !== '' || $newPassword !== '' || $confirmPassword !== '';
+    if ($changePassword) {
+        if (!password_verify($currentPassword, (string)$user['password_hash'])) {
+            flash('Senha atual incorreta. Confira a senha ou use a redefinicao por e-mail.', 'error');
+            return;
+        }
+        if ($newPassword === '' || strlen($newPassword) < 6) {
+            flash('Informe uma nova senha com pelo menos 6 caracteres.', 'error');
+            return;
+        }
+        if ($newPassword !== $confirmPassword) {
+            flash('A nova senha e a confirmacao precisam ser iguais.', 'error');
+            return;
+        }
+        db()->prepare("UPDATE users SET name = ?, email = ?, phone = ?, avatar_path = ?, password_hash = ? WHERE id = ?")
+            ->execute([post('name'), post('email'), post('phone'), $avatarPath, password_hash($newPassword, PASSWORD_DEFAULT), $userId]);
     } else {
-        db()->prepare("UPDATE users SET name = ?, email = ?, phone = ?, extension = ?, work_hours = ?, avatar_path = ? WHERE id = ?")
-            ->execute([post('name'), post('email'), post('phone'), post('extension'), post('work_hours'), $avatarPath, $userId]);
+        db()->prepare("UPDATE users SET name = ?, email = ?, phone = ?, avatar_path = ? WHERE id = ?")
+            ->execute([post('name'), post('email'), post('phone'), $avatarPath, $userId]);
     }
-    audit('editou_minha_conta', 'users:' . $userId, $user, ['name' => post('name'), 'email' => post('email'), 'avatar' => $avatarPath !== '']);
+    audit('editou_minha_conta', 'users:' . $userId, $user, ['name' => post('name'), 'email' => post('email'), 'avatar' => $avatarPath !== '', 'password_changed' => $changePassword]);
     flash('Sua conta foi atualizada.');
+}
+
+function send_password_reset_email(array $user, string $confirmationUrl): bool
+{
+    $host = preg_replace('/[^A-Za-z0-9.-]/', '', (string)($_SERVER['HTTP_HOST'] ?? 'localhost')) ?: 'localhost';
+    $subject = 'Confirmacao de redefinicao de senha - ' . APP_NAME;
+    $body = "Ola, " . (string)$user['name'] . ".\n\n"
+        . "Recebemos uma solicitacao para redefinir a senha da sua conta no " . APP_NAME . ".\n"
+        . "Para confirmar a troca, acesse o link abaixo em ate 30 minutos:\n\n"
+        . $confirmationUrl . "\n\n"
+        . "Se voce nao solicitou essa alteracao, ignore este e-mail.";
+    $headers = [
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=UTF-8',
+        'From: ' . APP_NAME . ' <no-reply@' . $host . '>',
+    ];
+    return @mail((string)$user['email'], $subject, $body, implode("\r\n", $headers));
+}
+
+function request_my_password_reset(int $userId): void
+{
+    $user = one('SELECT * FROM users WHERE id = ?', [$userId]);
+    if (!$user) {
+        flash('Usuario nao encontrado.', 'error');
+        return;
+    }
+    $newPassword = trim((string)post('reset_password'));
+    $confirmPassword = trim((string)post('reset_password_confirm'));
+    if ($newPassword === '' || strlen($newPassword) < 6) {
+        flash('Informe uma nova senha com pelo menos 6 caracteres.', 'error');
+        return;
+    }
+    if ($newPassword !== $confirmPassword) {
+        flash('A nova senha e a confirmacao precisam ser iguais.', 'error');
+        return;
+    }
+
+    $token = bin2hex(random_bytes(32));
+    $pdo = db();
+    $pdo->prepare("UPDATE password_reset_requests SET used_at = datetime('now') WHERE user_id = ? AND used_at IS NULL")
+        ->execute([$userId]);
+    $pdo->prepare("INSERT INTO password_reset_requests (user_id, token_hash, pending_password_hash, expires_at, requested_ip) VALUES (?, ?, ?, ?, ?)")
+        ->execute([
+            $userId,
+            hash('sha256', $token),
+            password_hash($newPassword, PASSWORD_DEFAULT),
+            gmdate('Y-m-d H:i:s', time() + 1800),
+            (string)($_SERVER['REMOTE_ADDR'] ?? ''),
+        ]);
+
+    $confirmationUrl = app_public_url('page=password_reset_confirm&token=' . urlencode($token));
+    if (!send_password_reset_email($user, $confirmationUrl)) {
+        flash('Nao foi possivel enviar o e-mail de confirmacao. Verifique a configuracao de e-mail do servidor.', 'error');
+        return;
+    }
+
+    audit('solicitou_redefinicao_senha', 'users:' . $userId);
+    flash('Enviamos um e-mail de confirmacao para redefinir sua senha.');
+}
+
+function confirm_password_reset(string $token): void
+{
+    $token = trim($token);
+    if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        flash('Link de redefinicao invalido.', 'error');
+        redirect('?page=login');
+    }
+    $request = one("SELECT r.*, u.name, u.email FROM password_reset_requests r INNER JOIN users u ON u.id = r.user_id WHERE r.token_hash = ? AND r.used_at IS NULL LIMIT 1", [hash('sha256', $token)]);
+    if (!$request) {
+        flash('Link de redefinicao invalido ou ja utilizado.', 'error');
+        redirect('?page=login');
+    }
+    $expiresAt = utc_storage_timestamp((string)$request['expires_at']);
+    if ($expiresAt === false || $expiresAt < time()) {
+        db()->prepare("UPDATE password_reset_requests SET used_at = datetime('now') WHERE id = ?")->execute([(int)$request['id']]);
+        flash('Este link de redefinicao expirou. Solicite um novo e-mail.', 'error');
+        redirect('?page=login');
+    }
+
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+            ->execute([(string)$request['pending_password_hash'], (int)$request['user_id']]);
+        $pdo->prepare("UPDATE password_reset_requests SET used_at = datetime('now') WHERE id = ?")
+            ->execute([(int)$request['id']]);
+        $pdo->commit();
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $error;
+    }
+
+    audit('confirmou_redefinicao_senha', 'users:' . (int)$request['user_id']);
+    unset($_SESSION['user_id']);
+    flash('Senha redefinida com sucesso. Entre usando a nova senha.');
+    redirect('?page=login');
 }
 
 function delete_contact(int $contactId, int $companyId): void
@@ -5591,6 +5841,58 @@ function normalize_call_attempt_status(string $status, array $context = []): str
     return $status !== '' ? 'falha' : 'falha';
 }
 
+function report_call_filter_clause(string $callAlias, string $contactAlias, int $campaignId, array $filters = []): array
+{
+    [$tenantClause, $tenantParams] = tenant_clause($callAlias);
+    $where = [$tenantClause];
+    $params = $tenantParams;
+
+    if ($campaignId > 0) {
+        $where[] = "{$callAlias}.campaign_id = ?";
+        $params[] = $campaignId;
+    }
+
+    $statuses = array_values(array_filter(array_map(static fn($value) => strtolower(trim((string)$value)), (array)($filters['status'] ?? []))));
+    $statuses = array_values(array_intersect($statuses, array_keys(call_attempt_status_labels())));
+    if ($statuses) {
+        $placeholders = implode(',', array_fill(0, count($statuses), '?'));
+        $where[] = "COALESCE(NULLIF({$callAlias}.internal_status, ''), NULLIF({$callAlias}.status, '')) IN ({$placeholders})";
+        $params = array_merge($params, $statuses);
+    }
+
+    $phone = nvoip_phone_digits(trim((string)($filters['phone'] ?? '')));
+    if ($phone !== '') {
+        if (strlen($phone) === 10 || strlen($phone) === 11) {
+            $phone = '55' . $phone;
+        }
+        $like = '%' . $phone . '%';
+        $where[] = "({$callAlias}.destination_number LIKE ? OR {$contactAlias}.phone_e164 LIKE ? OR {$contactAlias}.phone_raw LIKE ?)";
+        array_push($params, $like, $like, $like);
+    }
+
+    $from = trim((string)($filters['from'] ?? ''));
+    $fromUtc = $from !== '' ? local_datetime_to_utc_storage($from . ' 00:00:00') : '';
+    if ($fromUtc !== '') {
+        $where[] = "{$callAlias}.created_at >= ?";
+        $params[] = $fromUtc;
+    }
+
+    $to = trim((string)($filters['to'] ?? ''));
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
+        try {
+            $toExclusive = (new DateTimeImmutable($to, new DateTimeZone('America/Sao_Paulo')))->modify('+1 day')->format('Y-m-d');
+            $toUtc = local_datetime_to_utc_storage($toExclusive . ' 00:00:00');
+            if ($toUtc !== '') {
+                $where[] = "{$callAlias}.created_at < ?";
+                $params[] = $toUtc;
+            }
+        } catch (Throwable) {
+        }
+    }
+
+    return [implode(' AND ', $where), $params];
+}
+
 function campaign_call_logs_page(int $campaignId, array $filters = [], int $page = 1, int $perPage = 10): array
 {
     $user = current_user();
@@ -5601,47 +5903,7 @@ function campaign_call_logs_page(int $campaignId, array $filters = [], int $page
     $page = max(1, $page);
     $perPage = max(5, min(100, $perPage));
 
-    [$tenantClause, $tenantParams] = tenant_clause('co');
-    $where = [$tenantClause, 'co.campaign_id = ?'];
-    $params = array_merge($tenantParams, [$campaignId]);
-
-    $statuses = array_values(array_filter(array_map(static fn($value) => strtolower(trim((string)$value)), (array)($filters['status'] ?? []))));
-    $allowedStatuses = array_keys(call_attempt_status_labels());
-    $statuses = array_values(array_intersect($statuses, $allowedStatuses));
-    if ($statuses) {
-        $placeholders = implode(',', array_fill(0, count($statuses), '?'));
-        $where[] = 'COALESCE(NULLIF(co.internal_status, \'\'), NULLIF(co.status, \'\')) IN (' . $placeholders . ')';
-        $params = array_merge($params, $statuses);
-    }
-
-    $phone = trim((string)($filters['phone'] ?? ''));
-    if ($phone !== '') {
-        $digits = nvoip_phone_digits($phone);
-        if ($digits !== '') {
-            if (strlen($digits) === 10 || strlen($digits) === 11) {
-                $digits = '55' . $digits;
-            }
-            $like = '%' . $digits . '%';
-            $where[] = '(co.destination_number LIKE ? OR ct.phone_e164 LIKE ? OR ct.phone_raw LIKE ?)';
-            $params[] = $like;
-            $params[] = $like;
-            $params[] = $like;
-        }
-    }
-
-    $from = trim((string)($filters['from'] ?? ''));
-    if ($from !== '') {
-        $where[] = 'co.created_at >= ?';
-        $params[] = $from . ' 00:00:00';
-    }
-
-    $to = trim((string)($filters['to'] ?? ''));
-    if ($to !== '') {
-        $where[] = 'co.created_at <= ?';
-        $params[] = $to . ' 23:59:59';
-    }
-
-    $whereSql = implode(' AND ', $where);
+    [$whereSql, $params] = report_call_filter_clause('co', 'ct', $campaignId, $filters);
     $total = (int)(one("SELECT COUNT(*) total FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$whereSql}", $params)['total'] ?? 0);
     $offset = ($page - 1) * $perPage;
     $rows = rows("
@@ -6514,10 +6776,10 @@ function asterisk_diagnostics_payload(int $companyId, array $filters): array
 {
     $where = ['b.company_id = ?'];
     $params = [$companyId];
-    foreach (['campaign_id', 'agent_id', 'batch_id'] as $field) {
-        if (!empty($filters[$field])) {
-            $where[] = 'b.' . $field . ' = ?';
-            $params[] = (int)$filters[$field];
+    foreach (['campaign_id' => 'campaign_id', 'agent_id' => 'agent_id', 'batch_id' => 'id'] as $filter => $column) {
+        if (!empty($filters[$filter])) {
+            $where[] = 'b.' . $column . ' = ?';
+            $params[] = (int)$filters[$filter];
         }
     }
     if ($filters['status'] !== '') { $where[] = 'b.status = ?'; $params[] = $filters['status']; }
@@ -7197,12 +7459,16 @@ if (($_GET['page'] ?? '') === 'nvoip_webhook') {
     handle_nvoip_webhook();
 }
 
+if (($_GET['page'] ?? '') === 'password_reset_confirm') {
+    confirm_password_reset((string)($_GET['token'] ?? ''));
+}
+
 $requestedPage = (string)($_GET['page'] ?? 'dashboard');
 $billingUser = current_user();
 if ($billingUser && !is_platform_admin($billingUser)) {
     $billingState = tenant_billing_state((int)$billingUser['company_id']);
     if (!billing_operational_route_allowed((bool)$billingState['blocked'], $requestedPage) && !isset($_GET['logout'])) {
-        if (in_array($requestedPage, ['sip_config','sip_call_event','phone_history','list_contacts_batch','quick_block_call'], true)) {
+        if (in_array($requestedPage, ['sip_config','sip_call_event','phone_history','list_contacts_batch','answered_calls_batch','quick_block_call'], true)) {
             header('Content-Type: application/json; charset=utf-8'); http_response_code(402); echo json_encode(['ok'=>false,'error'=>'Plano bloqueado.']); exit;
         }
         flash((string)$billingState['message'], 'error');
@@ -7567,7 +7833,8 @@ if ($page !== 'login') {
     require_login();
     $mergedCallsAccess = ($page === 'supervisor' && can('recordings'))
         || ($page === 'recordings' && can('supervisor'));
-    if (!can($page) && !$mergedCallsAccess) {
+    $agentEndpointAccess = $page === 'answered_calls_batch' && can('agent');
+    if (!can($page) && !$mergedCallsAccess && !$agentEndpointAccess) {
         flash('Voce nao tem permissao para acessar esta area.', 'error');
         redirect('?page=dashboard');
     }
@@ -7579,10 +7846,12 @@ function layout(string $page, callable $content): void
     $flash = flash();
     $activeOperation = false;
     $billingState = null;
+    $termsRequired = false;
     if ($user) {
         $activeOperation = in_array((string)($user['status'] ?? ''), ['Discando automatico', 'Em ligacao'], true)
             || (bool)get_live_call((int)$user['id'], (int)$user['company_id']);
         if (!is_platform_admin($user)) $billingState = tenant_billing_state((int)$user['company_id']);
+        $termsRequired = !user_has_accepted_current_terms($user);
     }
     $titles = [
         'companies' => 'Clientes',
@@ -7608,12 +7877,12 @@ function layout(string $page, callable $content): void
     <title><?= h(APP_NAME . ' - ' . $title) ?></title>
     <link rel="stylesheet" href="assets/styles.css?v=<?= (int)(@filemtime(__DIR__ . '/assets/styles.css') ?: 1) ?>">
 </head>
-<body class="<?= $user ? 'app-shell' : 'login-shell' ?><?= $billingState && in_array($billingState['state'], ['warning','overdue','blocked'], true) ? ' billing-banner-active' : '' ?>">
+<body class="<?= $user ? 'app-shell' : 'login-shell' ?><?= $billingState && in_array($billingState['state'], ['warning','overdue','blocked'], true) ? ' billing-banner-active' : '' ?><?= $termsRequired ? ' terms-acceptance-required' : '' ?>">
 <?php if ($user): ?>
     <aside class="sidebar">
         <div class="brand">
             <span class="brand-mark"><img src="assets/img/logo-ligflow.png" alt=""></span>
-            <div><strong>Lig Flow</strong><small>Discador Inteligente</small></div>
+            <div><strong>Lig Flow</strong><small>Prospecção Inteligente</small></div>
         </div>
         <nav>
             <?php
@@ -7647,7 +7916,6 @@ function layout(string $page, callable $content): void
     <main>
         <?php if ($billingState && in_array($billingState['state'], ['warning','overdue','blocked'], true)): ?>
             <div class="billing-banner billing-<?= h($billingState['state']) ?>">
-                <strong><?= $billingState['state'] === 'warning' ? 'Vencimento proximo' : ($billingState['state'] === 'blocked' ? 'Plano bloqueado' : 'Plano em atraso') ?></strong>
                 <span><?= h((string)$billingState['message']) ?></span>
                 <a href="?page=costs">Ver plano e pagar</a>
             </div>
@@ -7697,6 +7965,7 @@ function layout(string $page, callable $content): void
     <?php if ($flash): ?><div class="flash login-flash <?= h($flash['type']) ?>"><?= h($flash['message']) ?></div><?php endif; ?>
     <?php $content(); ?>
 <?php endif; ?>
+<?php if ($user): ?><?php render_terms_modal($user); ?><?php endif; ?>
 <script src="assets/app.js?v=<?= (int)(@filemtime(__DIR__ . '/assets/app.js') ?: 1) ?>"></script>
 <?php if ($user && can('agent')): ?>
 <script src="assets/vendor/jssip.min.js"></script>
@@ -7862,7 +8131,7 @@ function render_login(): void
 {
     layout('login', function () { ?>
         <section class="login-card">
-            <div class="brand login-brand"><span class="brand-mark"><img src="assets/img/logo-ligflow.png" alt=""></span><div><strong>Lig Flow</strong><small>Discador Inteligente</small></div></div>
+            <div class="brand login-brand"><span class="brand-mark"><img src="assets/img/logo-ligflow.png" alt=""></span><div><strong>Lig Flow</strong><small>Prospecção Inteligente</small></div></div>
             <form method="post" class="stack">
                 <input type="hidden" name="action" value="login">
                 <label>E-mail<input name="email" type="email" value="admin@consorciocall.local" required></label>
@@ -7901,7 +8170,6 @@ function render_dashboard(): void
         $cards = [
             'Chamadas hoje' => (int)($dashboardStats['chamadas_hoje'] ?? 0),
             'Minutos hoje' => number_format(((float)($dashboardStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
-            'Minutos restantes' => number_format((float)$usage['remaining'], 1, ',', '.'),
             'Gasto hoje' => money(((int)($dashboardStats['gasto_hoje_micros'] ?? 0)) / 1000000),
             'Leads restantes' => one("SELECT COUNT(*) v FROM contacts c WHERE {$clause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $params)['v'],
         ];
@@ -7967,10 +8235,25 @@ function render_dashboard(): void
                     <?php endforeach; ?>
                     </tbody></table></div>
                     <?php foreach ($callbacks as $callback): ?>
+                        <?php
+                        $callbackPhone = (string)$callback['telefone'];
+                        $callbackPhoneNormalized = normalize_phone($callbackPhone);
+                        $callbackWhatsappLink = $callbackPhoneNormalized ? 'https://wa.me/' . ltrim($callbackPhoneNormalized, '+') : '';
+                        ?>
                         <section class="call-modal-backdrop is-hidden" data-callback-modal="<?= (int)$callback['id'] ?>">
                             <article class="call-modal callback-manage-modal">
                                 <header>
-                                    <div><span class="modal-kicker">Proximo retorno</span><h2><?= h((string)$callback['contato']) ?></h2><p><?= h((string)$callback['telefone']) ?></p></div>
+                                    <div>
+                                        <span class="modal-kicker">Proximo retorno</span>
+                                        <h2><?= h((string)$callback['contato']) ?></h2>
+                                        <p>
+                                            <?php if ($callbackWhatsappLink): ?>
+                                                <a class="whatsapp-phone-link" href="<?= h($callbackWhatsappLink) ?>" target="_blank" rel="noopener" title="Conversar pelo WhatsApp"><?= h($callbackPhone) ?></a>
+                                            <?php else: ?>
+                                                <?= h($callbackPhone) ?>
+                                            <?php endif; ?>
+                                        </p>
+                                    </div>
                                     <button type="button" class="icon-button" data-callback-modal-close aria-label="Fechar modal">x</button>
                                 </header>
                                 <form method="post" class="stack">
@@ -8070,8 +8353,8 @@ function render_plans(): void
 {
     layout('plans', function () {
         $editPlanId = (int)($_GET['edit_plan'] ?? 0);
-        $editPlan = $editPlanId ? one('SELECT * FROM plans WHERE id = ?', [$editPlanId]) : null;
-        $plans = rows('SELECT * FROM plans ORDER BY status, id DESC');
+        $editPlan = $editPlanId ? one("SELECT * FROM plans WHERE id=? AND status <> 'Removido'", [$editPlanId]) : null;
+        $plans = rows("SELECT * FROM plans WHERE status <> 'Removido' ORDER BY status,id DESC");
         $showCreateModal = isset($_GET['new_plan']);
         $editing = (bool)$editPlan;
         $field = fn(string $key, mixed $default = '') => $editPlan[$key] ?? $default;
@@ -8091,7 +8374,7 @@ function render_plans(): void
                         <thead><tr><th>Plano</th><th>Assinatura</th><th>Credito/ciclo</th><th>Tarifa/min</th><th>Periodo</th><th>Pagamento</th><th>Minutos</th><th>Status</th><th>Acoes</th></tr></thead>
                         <tbody>
                         <?php foreach ($plans as $plan): ?>
-                            <?php $usageCount = plan_usage_count($plan); ?>
+                            <?php $linkedUserCount = plan_linked_user_count($plan); ?>
                             <tr>
                                 <td><?= h($plan['name']) ?></td>
                                 <td><?= h(money((float)$plan['monthly_price'])) ?></td>
@@ -8103,11 +8386,11 @@ function render_plans(): void
                                 <td><?= h($plan['status']) ?></td>
                                 <td class="actions">
                                     <a class="mini-link" href="?page=plans&edit_plan=<?= (int)$plan['id'] ?>">Editar</a>
-                                    <?php if ($usageCount === 0): ?>
-                                        <form method="post" class="inline" onsubmit="return confirm('Excluir este plano? Esta acao nao podera ser desfeita.');">
+                                    <?php if ($linkedUserCount === 0): ?>
+                                        <form method="post" class="inline" onsubmit="return confirm('Remover este plano sem usuários vinculados?');">
                                             <input type="hidden" name="action" value="delete_plan">
                                             <input type="hidden" name="plan_id" value="<?= (int)$plan['id'] ?>">
-                                            <button class="mini-link danger-link" type="submit">Excluir</button>
+                                            <button class="mini-link danger-link" type="submit">Remover</button>
                                         </form>
                                     <?php endif; ?>
                                 </td>
@@ -8176,9 +8459,20 @@ function render_companies(): void
         };
         $integrations = rows("SELECT id, integration_name, provider, mode FROM integration_settings ORDER BY integration_name, provider");
         $editClientId = (int)($_GET['edit_client'] ?? 0);
-        $editClient = $editClientId ? one("SELECT c.*, COALESCE(s.plan_name, c.plan) AS plan_name, s.renews_at, s.included_minutes, s.max_users sub_max_users, s.max_consultants, s.max_lists, s.max_contacts, s.commercial_price_per_minute, s.status subscription_status FROM companies c LEFT JOIN subscriptions s ON s.company_id = c.id WHERE c.id = ?", [$editClientId]) : null;
+        $editClient = $editClientId ? one("SELECT c.*, COALESCE(s.plan_name, c.plan) AS plan_name, s.renews_at, s.included_minutes, s.max_users sub_max_users, s.max_consultants, s.max_lists, s.max_contacts, s.commercial_price_per_minute, s.status subscription_status FROM companies c LEFT JOIN subscriptions s ON s.company_id = c.id WHERE c.id = ? AND c.status <> 'Removida'", [$editClientId]) : null;
         $showCreateModal = isset($_GET['new_client']);
-        $clients = rows("SELECT c.id, c.trade_name cliente, c.cnpj documento, c.status, COALESCE(s.plan_name, c.plan) plano, c.max_users usuarios, c.max_agents consultores, c.monthly_minutes_limit minutos FROM companies c LEFT JOIN subscriptions s ON s.company_id = c.id ORDER BY c.id DESC");
+        $clients = rows("SELECT c.id, c.trade_name cliente, c.cnpj documento, c.status, COALESCE(s.plan_name, c.plan) plano, c.max_users usuarios, c.max_agents consultores, c.monthly_minutes_limit minutos,
+            (EXISTS(SELECT 1 FROM users u WHERE u.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM subscriptions sx WHERE sx.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM contact_lists l WHERE l.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM contacts ct WHERE ct.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM campaigns ca WHERE ca.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM calls co WHERE co.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM callbacks cb WHERE cb.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM payments p WHERE p.company_id=c.id)
+                OR EXISTS(SELECT 1 FROM telephony_ledger tl WHERE tl.company_id=c.id)) has_saved_data
+            FROM companies c LEFT JOIN subscriptions s ON s.company_id = c.id
+            WHERE c.status <> 'Removida' ORDER BY c.id DESC");
         ?>
         <section class="panel">
             <div class="section-head">
@@ -8204,7 +8498,17 @@ function render_companies(): void
                                 <td><?= h((string)$client['usuarios']) ?></td>
                                 <td><?= h((string)$client['consultores']) ?></td>
                                 <td><?= h((string)$client['minutos']) ?></td>
-                                <td><a class="mini-link" href="?page=companies&edit_client=<?= (int)$client['id'] ?>">Editar</a></td>
+                                <td class="actions">
+                                    <a class="mini-link" href="?page=companies&edit_client=<?= (int)$client['id'] ?>">Editar</a>
+                                    <?php $removeClientWarning = (int)$client['has_saved_data'] === 1
+                                        ? 'Este cliente contem dados no sistema. Ele sera apenas ocultado da listagem e todo o historico sera preservado. Deseja continuar?'
+                                        : 'Remover este cliente da listagem?'; ?>
+                                    <form method="post" class="inline" onsubmit="return confirm(<?= h(json_encode($removeClientWarning, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                                        <input type="hidden" name="action" value="remove_client">
+                                        <input type="hidden" name="client_id" value="<?= (int)$client['id'] ?>">
+                                        <button class="mini-link danger-link" type="submit">Remover</button>
+                                    </form>
+                                </td>
                             </tr>
                         <?php endforeach; ?>
                         </tbody>
@@ -8312,7 +8616,6 @@ function render_users(): void
     layout('users', function () {
         [$teamClause, $teamParams] = tenant_clause();
         [$userClause, $userParams] = tenant_clause('u');
-        [$consultantClause, $consultantParams] = tenant_clause('cp');
         $companies = rows('SELECT id, trade_name FROM companies ORDER BY trade_name');
         $teams = rows("SELECT id, name FROM teams WHERE {$teamClause} ORDER BY name", $teamParams);
         $isPlatformAdmin = in_array(current_user()['role'], ['admin_geral', 'admin_plataforma'], true);
@@ -8325,13 +8628,14 @@ function render_users(): void
         $editProfile = $editProfileId ? one('SELECT * FROM access_profiles WHERE id = ? AND company_id = ?', [$editProfileId, $profileCompanyId]) : null;
         $showProfileModal = $isPlatformAdmin && (isset($_GET['new_profile']) || $editProfile);
         $editUserId = (int)($_GET['edit_user'] ?? 0);
-        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.lifecycle_status asterisk_lifecycle_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
+        $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.lifecycle_status asterisk_lifecycle_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND u.deleted_at IS NULL AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
         $userProfileCompanyId = $editUser ? (int)$editUser['company_id'] : $profileCompanyId;
         $userProfiles = rows('SELECT * FROM access_profiles WHERE company_id = ? ORDER BY role_key, name', [$userProfileCompanyId]);
         $showCreateModal = $isPlatformAdmin && isset($_GET['new_user']);
-        $accessRows = rows("SELECT u.id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.lifecycle_status, axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} ORDER BY u.id DESC", $userParams);
+        $accessRows = rows("SELECT u.id, u.company_id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.lifecycle_status, axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} AND u.deleted_at IS NULL ORDER BY u.id DESC", $userParams);
         foreach ($accessRows as &$accessRow) {
             $accessRow['can_remove'] = user_access_can_be_removed((int)$accessRow['id'], (int)current_user()['company_id']);
+            $accessRow['has_saved_data'] = user_access_blocking_relation_counts((int)$accessRow['id'], (int)$accessRow['company_id']) !== [];
         }
         unset($accessRow);
         ?>
@@ -8419,7 +8723,6 @@ function render_users(): void
                     <p>Gerencie os usuarios que entram no sistema.</p>
                 </div>
                 <?php if ($isPlatformAdmin): ?>
-                    <a class="button secondary" href="?page=users&new_profile=1">Criar perfil</a>
                     <a class="button" href="?page=users&new_user=1">Criar novo acesso</a>
                 <?php endif; ?>
             </div>
@@ -8442,7 +8745,7 @@ function render_users(): void
                                 <td class="actions">
                                     <a class="mini-link" href="?page=users&edit_user=<?= (int)$access['id'] ?>">Editar</a>
                                     <?php if (!empty($access['can_remove'])): ?>
-                                        <form method="post" class="inline" onsubmit="return confirm('Tem certeza que deseja remover este acesso? Esta ação não poderá ser desfeita.');">
+                                        <form method="post" class="inline" onsubmit="return confirm('<?= !empty($access['has_saved_data']) ? 'Este usuário possui dados gravados. O acesso será ocultado e bloqueado, mas o histórico será preservado. Deseja continuar?' : 'Este usuário não possui dados gravados e será removido definitivamente. Deseja continuar?' ?>');">
                                             <input type="hidden" name="action" value="delete_user_access">
                                             <input type="hidden" name="user_id" value="<?= (int)$access['id'] ?>">
                                             <button class="mini-link danger-link" type="submit">Remover</button>
@@ -8536,10 +8839,6 @@ function render_users(): void
                 <?php endif; ?>
             </section>
         <?php endif; ?>
-        <section class="panel">
-            <h2>Consultores</h2>
-            <?= table(rows("SELECT cp.display_name consultor, COALESCE(u.email, '-') acesso, COALESCE(t.name, '-') equipe, cp.status, cp.goal meta, cp.internal_code identificacao FROM consultant_profiles cp LEFT JOIN users u ON u.id = cp.user_id LEFT JOIN teams t ON t.id = cp.team_id WHERE {$consultantClause} ORDER BY cp.id DESC", $consultantParams), ['consultor', 'acesso', 'equipe', 'status', 'meta', 'identificacao']) ?>
-        </section>
     <?php });
 }
 
@@ -8577,6 +8876,13 @@ function render_lists(): void
         [$clause, $params] = tenant_clause();
         [$listClause, $listParams] = tenant_clause('l');
         $lists = rows("SELECT * FROM contact_lists WHERE {$clause} ORDER BY id DESC", $params);
+        $listPage = max(1, (int)($_GET['lists_page'] ?? 1));
+        $listsPerPage = 10;
+        $listTotal = (int)scalar("SELECT COUNT(*) FROM contact_lists l WHERE {$listClause}", $listParams);
+        $listPages = max(1, (int)ceil($listTotal / $listsPerPage));
+        $listPage = min($listPage, $listPages);
+        $listOffset = ($listPage - 1) * $listsPerPage;
+        $listTableRows = rows("SELECT l.id, l.name, l.status, l.source, COUNT(c.id) contatos, SUM(CASE WHEN c.attempts > 0 OR c.last_call_at IS NOT NULL THEN 1 ELSE 0 END) chamados, l.tags, l.created_at FROM contact_lists l LEFT JOIN contacts c ON c.list_id = l.id AND c.status <> 'excluido' WHERE {$listClause} GROUP BY l.id ORDER BY l.id DESC LIMIT {$listsPerPage} OFFSET {$listOffset}", $listParams);
         $selectedListId = (int)($_GET['list_id'] ?? 0);
         $importToken = (string)($_GET['import_token'] ?? '');
         $pendingImport = $importToken ? ($_SESSION['pending_imports'][$importToken] ?? null) : null;
@@ -8713,7 +9019,7 @@ function render_lists(): void
                 <table>
                     <thead><tr><th>Nome</th><th>Status</th><th>Origem</th><th>Contatos</th><th>Etiquetas</th><th>Criada em</th><th>Acoes</th></tr></thead>
                     <tbody>
-                    <?php foreach (rows("SELECT l.id, l.name, l.status, l.source, COUNT(c.id) contatos, SUM(CASE WHEN c.attempts > 0 OR c.last_call_at IS NOT NULL THEN 1 ELSE 0 END) chamados, l.tags, l.created_at FROM contact_lists l LEFT JOIN contacts c ON c.list_id = l.id AND c.status <> 'excluido' WHERE {$listClause} GROUP BY l.id ORDER BY l.id DESC", $listParams) as $list): ?>
+                    <?php foreach ($listTableRows as $list): ?>
                         <tr>
                             <td><?= h($list['name']) ?></td>
                             <td><?= h($list['status']) ?></td>
@@ -8744,6 +9050,17 @@ function render_lists(): void
                     </tbody>
                 </table>
             </div>
+            <?php if ($listPages > 1): ?>
+                <div class="pagination table-pagination" aria-label="Paginacao das listas">
+                    <?php if ($listPage > 1): ?>
+                        <a class="button secondary" href="?page=lists&amp;lists_page=<?= $listPage - 1 ?>">Anterior</a>
+                    <?php endif; ?>
+                    <span>Pagina <?= $listPage ?> de <?= $listPages ?></span>
+                    <?php if ($listPage < $listPages): ?>
+                        <a class="button secondary" href="?page=lists&amp;lists_page=<?= $listPage + 1 ?>">Proxima</a>
+                    <?php endif; ?>
+                </div>
+            <?php endif; ?>
         </section>
         <?php if ($selectedList): ?>
         <section class="call-modal-backdrop" data-list-numbers-modal>
@@ -8899,6 +9216,12 @@ function render_campaigns(): void
         $lists = rows("SELECT l.id,l.name,(SELECT COUNT(*) FROM contacts c WHERE c.list_id=l.id AND c.status <> 'excluido') contact_count FROM contact_lists l WHERE {$clause} ORDER BY l.name", $params);
         $teams = rows("SELECT id, name FROM teams WHERE {$clause} ORDER BY name", $params);
         $supervisors = rows("SELECT id, name FROM users WHERE {$clause} AND role IN ('supervisor','admin_empresa') ORDER BY name", $params);
+        $campaignPage = max(1, (int)($_GET['campaigns_page'] ?? 1));
+        $campaignsPerPage = 10;
+        $campaignTotal = (int)scalar("SELECT COUNT(*) FROM campaigns ca WHERE {$campaignClause} AND ca.status <> 'Manual'", $campaignParams);
+        $campaignPages = max(1, (int)ceil($campaignTotal / $campaignsPerPage));
+        $campaignPage = min($campaignPage, $campaignPages);
+        $campaignOffset = ($campaignPage - 1) * $campaignsPerPage;
         $campaignRows = rows("SELECT ca.id, ca.name, ca.dialer_type, ca.status, COALESCE(l.name, '-') lista, COALESCE(t.name, '-') equipe, ca.max_attempts, ca.simultaneous_calls, COUNT(co.id) chamadas
             FROM campaigns ca
             LEFT JOIN contact_lists l ON l.id = ca.list_id
@@ -8906,7 +9229,8 @@ function render_campaigns(): void
             LEFT JOIN calls co ON co.campaign_id = ca.id
             WHERE {$campaignClause} AND ca.status <> 'Manual'
             GROUP BY ca.id
-            ORDER BY ca.id DESC", $campaignParams);
+            ORDER BY ca.id DESC
+            LIMIT {$campaignsPerPage} OFFSET {$campaignOffset}", $campaignParams);
         $editing = (bool)$editCampaign;
         $showCreateModal = isset($_GET['new_campaign']);
         $field = fn(string $key, mixed $default = '') => $editCampaign[$key] ?? $default;
@@ -8936,7 +9260,7 @@ function render_campaigns(): void
                             <td><?= h((string)$row['max_attempts']) ?></td>
                             <td><?= h((string)($row['simultaneous_calls'] ?? 1)) ?></td>
                             <td class="actions">
-                                <a class="button secondary" href="?page=campaigns&edit_campaign=<?= (int)$row['id'] ?>">Editar</a>
+                                <a class="button secondary" href="?page=campaigns&amp;campaigns_page=<?= $campaignPage ?>&amp;edit_campaign=<?= (int)$row['id'] ?>">Editar</a>
                                 <?php if ((int)$row['chamadas'] === 0): ?>
                                     <form method="post" onsubmit="return confirm('Excluir esta campanha? Esta acao nao podera ser desfeita.');">
                                         <input type="hidden" name="action" value="delete_campaign">
@@ -8947,6 +9271,17 @@ function render_campaigns(): void
                             </td>
                         </tr><?php endforeach; ?></tbody>
                     </table></div>
+                    <?php if ($campaignPages > 1): ?>
+                        <div class="pagination table-pagination" aria-label="Paginacao das campanhas">
+                            <?php if ($campaignPage > 1): ?>
+                                <a class="button secondary" href="?page=campaigns&amp;campaigns_page=<?= $campaignPage - 1 ?>">Anterior</a>
+                            <?php endif; ?>
+                            <span>Pagina <?= $campaignPage ?> de <?= $campaignPages ?></span>
+                            <?php if ($campaignPage < $campaignPages): ?>
+                                <a class="button secondary" href="?page=campaigns&amp;campaigns_page=<?= $campaignPage + 1 ?>">Proxima</a>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
                 <?php endif; ?>
         </section>
         <?php if ($showCreateModal || $editing): ?>
@@ -8958,7 +9293,7 @@ function render_campaigns(): void
                             <h2><?= $editing ? h((string)$field('name', 'Editar campanha')) : 'Nova campanha' ?></h2>
                             <p><?= $editing ? 'Atualize a campanha, roteiro e parametros de discagem.' : 'Crie uma campanha vinculada a uma lista de contatos.' ?></p>
                         </div>
-                        <a class="icon-button" href="?page=campaigns" aria-label="Fechar modal">x</a>
+                        <a class="icon-button" href="?page=campaigns&amp;campaigns_page=<?= $campaignPage ?>" aria-label="Fechar modal">x</a>
                     </header>
                     <form class="form-grid" method="post">
                         <input type="hidden" name="action" value="<?= $editing ? 'update_campaign' : 'create_campaign' ?>">
@@ -9107,6 +9442,128 @@ function render_radar(): void
     <?php });
 }
 
+function answered_calls_batch(int $companyId, int $userId, int $offset, int $limit = 15): array
+{
+    $offset = max(0, $offset);
+    $limit = max(1, min(50, $limit));
+    $calls = rows("
+        SELECT co.id, co.campaign_id, co.contact_id, co.created_at, co.started_at, co.answered_at, co.ended_at, co.destination_number, co.origin_number, co.status, co.duration_seconds, co.result_id, co.notes,
+               ct.name contato, ct.email, ct.city, ct.state, ct.product, ct.origin contato_origem, ct.attempts, ct.notes contato_observacoes, ct.custom_json,
+               ca.name campanha, COALESCE(cr.name, '-') resultado,
+               cb.scheduled_at callback_at, cb.priority callback_priority, cb.status callback_status, cb.reason callback_reason,
+               EXISTS(
+                   SELECT 1 FROM call_events ce
+                   WHERE ce.company_id = co.company_id AND ce.call_id = co.id AND ce.event_name = 'sip.answered'
+               ) AS ever_answered
+        FROM calls co
+        LEFT JOIN contacts ct ON ct.id = co.contact_id AND ct.company_id = co.company_id
+        LEFT JOIN campaigns ca ON ca.id = co.campaign_id AND ca.company_id = co.company_id
+        LEFT JOIN call_results cr ON cr.id = co.result_id
+        LEFT JOIN callbacks cb ON cb.id = (
+            SELECT cbx.id FROM callbacks cbx
+            WHERE cbx.company_id = co.company_id AND cbx.agent_id = co.agent_id AND cbx.contact_id = co.contact_id
+              AND (cbx.call_id = co.id OR cbx.call_id IS NULL)
+            ORDER BY (cbx.call_id IS NULL) ASC, cbx.id DESC LIMIT 1
+        )
+        WHERE co.company_id = ? AND co.agent_id = ?
+          AND (co.answered_at IS NOT NULL OR co.status IN ('answered','connected','completed','em_atendimento','atendida','atendido','pos_atendimento') OR co.duration_seconds > 0)
+        ORDER BY co.id DESC
+        LIMIT " . ($limit + 1) . " OFFSET " . $offset, [$companyId, $userId]);
+    $hasMore = count($calls) > $limit;
+    return ['calls' => array_slice($calls, 0, $limit), 'has_more' => $hasMore];
+}
+
+function answered_call_row_html(array $call): string
+{
+    $duration = call_conversation_duration_seconds($call);
+    $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '00:00';
+    $isAnsweredCall = !empty($call['ever_answered']) && $duration > 5;
+    $phoneDigits = nvoip_phone_digits((string)$call['destination_number']);
+    if (strlen($phoneDigits) === 10 || strlen($phoneDigits) === 11) $phoneDigits = '55' . $phoneDigits;
+    $whatsappLink = $phoneDigits !== '' ? 'https://wa.me/' . $phoneDigits : '';
+    ob_start();
+    ?>
+    <tr class="<?= $isAnsweredCall ? 'call-history-attended' : '' ?>">
+        <td><?= h(datetime_utc_display((string)($call['answered_at'] ?: $call['created_at']))) ?></td>
+        <td><?= h($call['contato'] ?: 'Sem nome') ?></td>
+        <td><span class="phone-inline-actions"><span><?= h($call['destination_number']) ?></span><?php if ($whatsappLink): ?><a class="mini-link whatsapp-link" href="<?= h($whatsappLink) ?>" target="_blank" rel="noopener">WhatsApp</a><?php endif; ?></span></td>
+        <td><?= h($call['campanha'] ?: '-') ?></td>
+        <td><?= h($durationText) ?></td>
+        <td><?= h($call['resultado']) ?></td>
+        <td><?php if ($isAnsweredCall): ?><span class="call-history-badge">Atendida +5s</span><?php endif; ?> <?= h($call['status']) ?></td>
+        <td><button class="mini-link" type="button" data-open-call-history="<?= (int)$call['id'] ?>">Atendimento</button></td>
+    </tr>
+    <?php
+    return (string)ob_get_clean();
+}
+
+function answered_call_modal_html(array $call, array $user, array $results): string
+{
+    $duration = call_conversation_duration_seconds($call);
+    $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '00:00';
+    $phoneDigits = nvoip_phone_digits((string)$call['destination_number']);
+    if (strlen($phoneDigits) === 10 || strlen($phoneDigits) === 11) $phoneDigits = '55' . $phoneDigits;
+    $whatsappMessage = 'Oi, aqui e ' . (string)$user['name'] . ', conforme combinado, vamos seguir nossa conversa por aqui ';
+    $whatsappLink = $phoneDigits !== '' ? 'https://wa.me/' . $phoneDigits . '?text=' . rawurlencode($whatsappMessage) : '';
+    $callbackAtValue = !empty($call['callback_at']) ? datetime_local((string)$call['callback_at']) : '';
+    $callbackDisplay = '';
+    if (!empty($call['callback_at'])) {
+        try {
+            $callbackDisplay = datetime_utc_display((string)$call['callback_at'], 'd/m/Y H:i');
+        } catch (Throwable) {
+            $callbackDisplay = (string)$call['callback_at'];
+        }
+    }
+    $callbackPriority = (string)($call['callback_priority'] ?: 'normal');
+    $customFields = json_decode((string)($call['custom_json'] ?? ''), true);
+    $customFields = is_array($customFields) ? $customFields : [];
+    ob_start();
+    ?>
+    <section class="call-modal-backdrop is-hidden" data-call-history-modal="<?= (int)$call['id'] ?>">
+        <article class="call-modal">
+            <header><div><span class="modal-kicker">Chamada atendida</span><h2><?= h($call['contato'] ?: 'Cliente sem nome') ?></h2></div><div class="call-modal-actions"><strong><?= h($call['status']) ?></strong><button type="button" class="icon-button" data-call-history-close aria-label="Fechar modal">x</button></div></header>
+            <div class="call-modal-grid">
+                <dl>
+                    <dt>Telefone</dt><dd><span class="modal-phone-actions"><?php if ($whatsappLink): ?><a class="whatsapp-phone-link" href="<?= h($whatsappLink) ?>" target="_blank" rel="noopener" title="Conversar pelo WhatsApp"><?= h($call['destination_number']) ?></a><?php else: ?><span><?= h($call['destination_number']) ?></span><?php endif; ?><button class="mini-link danger-link" type="button" data-quick-block-call="<?= (int)$call['id'] ?>">Bloquear</button></span></dd>
+                    <dt>E-mail</dt><dd><?= h($call['email'] ?: '-') ?></dd><dt>Origem</dt><dd><?= h($call['contato_origem'] ?: '-') ?></dd><dt>Cidade</dt><dd><?= h(trim((string)$call['city'] . ' / ' . (string)$call['state'], ' /') ?: '-') ?></dd><dt>Produto</dt><dd><?= h($call['product'] ?: '-') ?></dd><dt>Campanha</dt><dd><?= h($call['campanha'] ?: '-') ?></dd>
+                    <?php if (!empty($call['contato_observacoes'])): ?><dt>Observacao do contato</dt><dd><?= nl2br(h((string)$call['contato_observacoes'])) ?></dd><?php endif; ?>
+                    <?php if ($callbackDisplay): ?><dt>Retorno agendado</dt><dd><?= h($callbackDisplay) ?></dd><?php endif; ?>
+                    <?php if (!empty($call['callback_status'])): ?><dt>Status do retorno</dt><dd><?= h((string)$call['callback_status']) ?></dd><?php endif; ?>
+                    <?php if (!empty($call['callback_reason'])): ?><dt>Motivo do retorno</dt><dd><?= h((string)$call['callback_reason']) ?></dd><?php endif; ?>
+                    <?php foreach ($customFields as $key => $value): ?><?php if (is_scalar($value) && trim((string)$value) !== ''): ?><dt><?= h((string)$key) ?></dt><dd><?= h((string)$value) ?></dd><?php endif; ?><?php endforeach; ?>
+                </dl>
+                <div class="live-call-card is-live"><div class="live-indicator"><span></span> Atendimento registrado</div><strong><?= h($durationText) ?></strong><small><?= h($call['destination_number']) ?></small></div>
+            </div>
+            <form method="post" class="stack"><input type="hidden" name="action" value="update_answered_call"><input type="hidden" name="campaign_id" value="<?= (int)($call['campaign_id'] ?? 0) ?>"><input type="hidden" name="call_id" value="<?= (int)$call['id'] ?>"><label>Resultado<select name="result_id"><?php foreach ($results as $result): ?><option value="<?= (int)$result['id'] ?>" <?= (int)$call['result_id'] === (int)$result['id'] ? 'selected' : '' ?>><?= h($result['name']) ?></option><?php endforeach; ?></select></label><label>Observacoes<textarea name="notes" rows="5"><?= h((string)$call['notes']) ?></textarea></label><label>Agendar retorno<input name="callback_at" type="datetime-local" value="<?= h($callbackAtValue) ?>"></label><label>Prioridade<select name="callback_priority"><option <?= $callbackPriority === 'normal' ? 'selected' : '' ?>>normal</option><option <?= $callbackPriority === 'alta' ? 'selected' : '' ?>>alta</option><option <?= $callbackPriority === 'urgente' ? 'selected' : '' ?>>urgente</option></select></label><button class="button" type="submit">Salvar atendimento</button></form>
+        </article>
+    </section>
+    <?php
+    return (string)ob_get_clean();
+}
+
+function handle_answered_calls_batch(): void
+{
+    require_login();
+    $user = current_user();
+    $offset = max(15, min(10000, (int)($_GET['offset'] ?? 15)));
+    $batch = answered_calls_batch((int)$user['company_id'], (int)$user['id'], $offset, 15);
+    ensure_call_results_for_company((int)$user['company_id']);
+    $results = rows('SELECT id, name, action FROM call_results WHERE company_id = ? OR company_id IS NULL ORDER BY is_default DESC, id', [(int)$user['company_id']]);
+    $rowsHtml = '';
+    $modalsHtml = '';
+    foreach ($batch['calls'] as $call) {
+        $rowsHtml .= answered_call_row_html($call);
+        $modalsHtml .= answered_call_modal_html($call, $user, $results);
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => true, 'rows_html' => $rowsHtml, 'modals_html' => $modalsHtml, 'count' => count($batch['calls']), 'has_more' => $batch['has_more']], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (($_GET['page'] ?? '') === 'answered_calls_batch') {
+    handle_answered_calls_batch();
+}
+
 function render_agent(): void
 {
     layout('agent', function () {
@@ -9116,7 +9573,22 @@ function render_agent(): void
         $campaignId = selected_campaign_id();
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ?', [$campaignId]) : null;
         $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
-        $usage = monthly_usage((int)$user['company_id']);
+        [$agentStatsClause, $agentStatsParams] = tenant_clause('c');
+        [$todayStartUtc, $todayEndUtc] = sao_paulo_utc_period_bounds('day');
+        $agentCostMicros = call_cost_sql('c');
+        $agentStats = one("SELECT
+                COUNT(*) chamadas_hoje,
+                COALESCE(SUM(c.billable_seconds), 0) segundos_hoje,
+                COALESCE(SUM({$agentCostMicros}), 0) gasto_hoje_micros
+            FROM calls c
+            WHERE {$agentStatsClause} AND c.created_at >= ? AND c.created_at < ?",
+            array_merge($agentStatsParams, [$todayStartUtc, $todayEndUtc])) ?: [];
+        $agentCards = [
+            'Chamadas hoje' => (int)($agentStats['chamadas_hoje'] ?? 0),
+            'Minutos hoje' => number_format(((float)($agentStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
+            'Gasto hoje' => money(((int)($agentStats['gasto_hoje_micros'] ?? 0)) / 1000000),
+            'Leads restantes' => (int)(one("SELECT COUNT(*) v FROM contacts c WHERE {$agentStatsClause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $agentStatsParams)['v'] ?? 0),
+        ];
         $activeBatch = $isAutoDialing ? active_dial_batch((int)$user['id'], (int)$user['company_id']) : null;
         if ($activeBatch) {
             $batchLiveCalls = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [(int)$activeBatch['id']]);
@@ -9154,41 +9626,9 @@ function render_agent(): void
         $recentReceived = $recentHistory['recebidas'];
         $recentMade = $recentHistory['realizadas'];
         $recentMissed = $recentHistory['perdidas'];
-        $answeredCalls = rows("
-            SELECT co.id, co.campaign_id, co.contact_id, co.created_at, co.started_at, co.answered_at, co.ended_at, co.destination_number, co.origin_number, co.status, co.duration_seconds, co.result_id, co.notes,
-                   ct.name contato, ct.email, ct.city, ct.state, ct.product, ct.origin contato_origem, ct.attempts, ct.notes contato_observacoes, ct.custom_json,
-                   ca.name campanha, COALESCE(cr.name, '-') resultado,
-                   cb.scheduled_at callback_at, cb.priority callback_priority, cb.status callback_status, cb.reason callback_reason,
-                   EXISTS(
-                       SELECT 1
-                       FROM call_events ce
-                       WHERE ce.company_id = co.company_id
-                         AND ce.call_id = co.id
-                         AND ce.event_name = 'sip.answered'
-                   ) AS ever_answered
-            FROM calls co
-            LEFT JOIN contacts ct ON ct.id = co.contact_id
-            LEFT JOIN campaigns ca ON ca.id = co.campaign_id
-            LEFT JOIN call_results cr ON cr.id = co.result_id
-            LEFT JOIN callbacks cb ON cb.id = (
-                SELECT cbx.id
-                FROM callbacks cbx
-                WHERE cbx.company_id = co.company_id
-                  AND cbx.agent_id = co.agent_id
-                  AND cbx.contact_id = co.contact_id
-                  AND (cbx.call_id = co.id OR cbx.call_id IS NULL)
-                ORDER BY (cbx.call_id IS NULL) ASC, cbx.id DESC
-                LIMIT 1
-            )
-            WHERE co.agent_id = ?
-              AND (
-                co.answered_at IS NOT NULL
-                OR co.status IN ('answered','connected','completed','em_atendimento','atendida','atendido','pos_atendimento')
-                OR co.duration_seconds > 0
-              )
-            ORDER BY co.id DESC
-            LIMIT 10
-        ", [$user['id']]);
+        $answeredCallsBatch = answered_calls_batch((int)$user['company_id'], (int)$user['id'], 0, 15);
+        $answeredCalls = $answeredCallsBatch['calls'];
+        $answeredCallsHasMore = (bool)$answeredCallsBatch['has_more'];
         $phoneContacts = rows("SELECT name, phone_e164, product, status FROM contacts WHERE company_id = ? AND status <> 'excluido' ORDER BY last_call_at DESC, id DESC LIMIT 8", [(int)$user['company_id']]);
         ensure_call_results_for_company((int)$user['company_id']);
         $results = rows('SELECT id, name, action FROM call_results WHERE company_id = ? OR company_id IS NULL ORDER BY is_default DESC, id', [(int)$user['company_id']]);
@@ -9218,9 +9658,9 @@ function render_agent(): void
         };
         ?>
         <section class="metric-grid compact">
-            <article class="metric"><span>Minutos restantes</span><strong><?= h(number_format((float)$usage['remaining'], 1, ',', '.')) ?></strong></article>
-            <article class="metric"><span>Minutos usados no mes</span><strong><?= h(number_format((float)$usage['used'], 1, ',', '.')) ?></strong></article>
-            <article class="metric"><span>Limite mensal</span><strong><?= h(number_format((float)$usage['limit'], 0, ',', '.')) ?></strong></article>
+            <?php foreach ($agentCards as $label => $value): ?>
+                <article class="metric"><span><?= h($label) ?></span><strong><?= h((string)$value) ?></strong></article>
+            <?php endforeach; ?>
         </section>
         <section class="agent-layout">
             <article class="panel">
@@ -9331,7 +9771,7 @@ function render_agent(): void
                 <div class="table-wrap">
                     <table>
                         <thead><tr><th>Data</th><th>Contato</th><th>Telefone</th><th>Campanha</th><th>Duração</th><th>Resultado</th><th>Status</th><th>Ações</th></tr></thead>
-                        <tbody>
+                        <tbody data-answered-calls-body>
                         <?php foreach ($answeredCalls as $index => $call): ?>
                             <?php
                             $duration = call_conversation_duration_seconds($call);
@@ -9372,6 +9812,10 @@ function render_agent(): void
                         </tbody>
                     </table>
                 </div>
+                <div class="answered-calls-more" data-answered-calls-more<?= $answeredCallsHasMore ? '' : ' hidden' ?>>
+                    <button class="button secondary" type="button" data-load-more-answered-calls data-offset="15">Mostrar mais...</button>
+                </div>
+                <div data-answered-calls-modals>
                 <?php foreach ($answeredCalls as $call): ?>
                     <?php
                     $duration = call_conversation_duration_seconds($call);
@@ -9442,6 +9886,10 @@ function render_agent(): void
                         </article>
                     </section>
                 <?php endforeach; ?>
+                </div>
+                <div class="answered-calls-loading-overlay is-hidden" data-answered-calls-loading role="status" aria-live="polite" aria-label="Carregando chamadas">
+                    <div class="answered-calls-loading-indicator"><span aria-hidden="true"></span><strong>Carregando chamadas...</strong></div>
+                </div>
             <?php endif; ?>
         </section>
         <section class="webphone-panel" data-sip-floating data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= $isAutoDialing && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
@@ -9614,7 +10062,6 @@ function render_supervisor(): void
 function render_reports(): void
 {
     layout('reports', function () {
-        [$clause, $params] = tenant_clause('co');
         $reportCostMicros = call_cost_sql('co');
         [$campaignClause, $campaignParams] = tenant_clause('ca');
         $campaigns = rows("SELECT ca.id, ca.name FROM campaigns ca WHERE {$campaignClause} ORDER BY ca.name", $campaignParams);
@@ -9629,6 +10076,7 @@ function render_reports(): void
             'from' => trim((string)($_GET['from'] ?? '')),
             'to' => trim((string)($_GET['to'] ?? '')),
         ];
+        [$reportClause, $reportParams] = report_call_filter_clause('co', 'ct', $selectedCampaignId, $logFilters);
         $logPage = max(1, (int)($_GET['logs_page'] ?? 1));
         $campaignLogs = $selectedCampaignId > 0 ? campaign_call_logs_page($selectedCampaignId, $logFilters, $logPage, 10) : ['rows' => [], 'total' => 0, 'page' => 1, 'per_page' => 10, 'pages' => 1];
         $statusLabels = call_attempt_status_labels();
@@ -9639,8 +10087,8 @@ function render_reports(): void
         <section class="panel">
             <div class="section-head">
                 <div>
-                    <h2>Logs de chamadas por campanha</h2>
-                    <p>Consulte as tentativas por campanha com filtros por status, telefone e periodo.</p>
+                    <h2>Filtros dos relatorios</h2>
+                    <p>Os filtros por campanha, status, telefone e periodo se aplicam a todas as amostragens abaixo.</p>
                 </div>
             </div>
             <form method="get" class="form-grid campaign-log-filters">
@@ -9699,7 +10147,7 @@ function render_reports(): void
                     </table>
                 </div>
                 <?php if ($campaignLogs['pages'] > 1): ?>
-                    <div class="pagination">
+                    <div class="pagination table-pagination" aria-label="Paginacao dos logs de chamadas">
                         <?php if ($campaignLogs['page'] > 1): ?>
                             <a class="button secondary" href="?<?= h($baseQueryString . ($baseQueryString !== '' ? '&' : '') . 'logs_page=' . max(1, $campaignLogs['page'] - 1)) ?>">Anterior</a>
                         <?php endif; ?>
@@ -9721,8 +10169,8 @@ function render_reports(): void
                     LEFT JOIN users u ON u.id = co.agent_id
                     LEFT JOIN campaigns ca ON ca.id = co.campaign_id
                     LEFT JOIN call_results cr ON cr.id = co.result_id
-                    WHERE {$clause}
-                    ORDER BY co.id DESC LIMIT 50", $params), ['data', 'contato', 'telefone', 'consultor', 'campanha', 'minutos', 'resultado', 'status', 'custo']) ?>
+                    WHERE {$reportClause}
+                    ORDER BY co.id DESC LIMIT 50", $reportParams), ['data', 'contato', 'telefone', 'consultor', 'campanha', 'minutos', 'resultado', 'status', 'custo']) ?>
                 </div>
             </details>
             <?php if (is_platform_admin()): ?>
@@ -9731,10 +10179,11 @@ function render_reports(): void
                 <div class="import-history-content">
                 <?= table(rows("SELECT u.name consultor, COUNT(co.id) ligacoes, SUM(CASE WHEN co.status = 'completed' THEN 1 ELSE 0 END) concluidas, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, printf('%.2f', COALESCE(SUM({$reportCostMicros}), 0) / 1000000.0) custo
                     FROM users u
-                    LEFT JOIN calls co ON co.agent_id = u.id
-                    WHERE u.company_id = ?
+                    JOIN calls co ON co.agent_id = u.id
+                    LEFT JOIN contacts ct ON ct.id = co.contact_id
+                    WHERE {$reportClause}
                     GROUP BY u.id
-                    ORDER BY ligacoes DESC", [current_user()['company_id']]), ['consultor', 'ligacoes', 'concluidas', 'minutos', 'custo']) ?>
+                    ORDER BY ligacoes DESC", $reportParams), ['consultor', 'ligacoes', 'concluidas', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <?php endif; ?>
@@ -9743,13 +10192,13 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por dia</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%d/%m/%Y 00:00:00', ligflow_local_datetime(co.created_at)) dia, date(ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 31", $params), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%d/%m/%Y 00:00:00', ligflow_local_datetime(co.created_at)) dia, date(ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$reportClause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 31", $reportParams), ['dia', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por mes</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%m/%Y', ligflow_local_datetime(co.created_at)) mes, strftime('%Y-%m', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 24", $params), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%m/%Y', ligflow_local_datetime(co.created_at)) mes, strftime('%Y-%m', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$reportClause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 24", $reportParams), ['mes', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
@@ -9757,27 +10206,26 @@ function render_reports(): void
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por hora</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%d/%m/%Y %H:00:00', ligflow_local_datetime(co.created_at)) hora, strftime('%Y-%m-%d %H', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 48", $params), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%d/%m/%Y %H:00:00', ligflow_local_datetime(co.created_at)) hora, strftime('%Y-%m-%d %H', ligflow_local_datetime(co.created_at)) sort_key, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$reportClause} GROUP BY sort_key ORDER BY sort_key DESC LIMIT 48", $reportParams), ['hora', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
             <details class="panel import-history-disclosure report-disclosure">
                 <summary><span>Por ano</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
                 <div class="import-history-content">
-                <?= table(rows("SELECT strftime('%Y', ligflow_local_datetime(co.created_at)) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co WHERE {$clause} GROUP BY ano ORDER BY ano DESC", $params), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
+                <?= table(rows("SELECT strftime('%Y', ligflow_local_datetime(co.created_at)) ano, COUNT(*) ligacoes, ROUND(SUM(co.billable_seconds) / 60.0, 1) minutos, printf('%.2f', SUM({$reportCostMicros}) / 1000000.0) custo FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$reportClause} GROUP BY ano ORDER BY ano DESC", $reportParams), ['ano', 'ligacoes', 'minutos', 'custo']) ?>
                 </div>
             </details>
         </section>
         <details class="panel import-history-disclosure report-disclosure">
             <summary><span>Campanhas</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
             <div class="import-history-content">
-            <?php [$caClause, $caParams] = tenant_clause('ca'); ?>
-            <?= table(rows("SELECT ca.name campanha, COUNT(ct.id) leads, SUM(CASE WHEN ct.status = 'concluido' THEN 1 ELSE 0 END) trabalhados, SUM(CASE WHEN ct.status IN ('novo','retentar') THEN 1 ELSE 0 END) restantes, printf('%.2f', COALESCE(SUM({$reportCostMicros}), 0) / 1000000.0) custo
+            <?= table(rows("SELECT ca.name campanha, COUNT(DISTINCT ct.id) leads, COUNT(DISTINCT CASE WHEN ct.status = 'concluido' THEN ct.id END) trabalhados, COUNT(DISTINCT CASE WHEN ct.status IN ('novo','retentar') THEN ct.id END) restantes, printf('%.2f', COALESCE(SUM({$reportCostMicros}), 0) / 1000000.0) custo
                 FROM campaigns ca
-                LEFT JOIN contacts ct ON ct.list_id = ca.list_id
-                LEFT JOIN calls co ON co.campaign_id = ca.id
-                WHERE {$caClause}
+                JOIN calls co ON co.campaign_id = ca.id
+                LEFT JOIN contacts ct ON ct.id = co.contact_id
+                WHERE {$reportClause}
                 GROUP BY ca.id
-                ORDER BY ca.id DESC", $caParams), ['campanha', 'leads', 'trabalhados', 'restantes', 'custo']) ?>
+                ORDER BY ca.id DESC", $reportParams), ['campanha', 'leads', 'trabalhados', 'restantes', 'custo']) ?>
             </div>
         </details>
     <?php });
@@ -9973,43 +10421,82 @@ function render_costs(): void
     layout('costs', function () {
         $user = current_user();
         $companyId = (int)$user['company_id'];
-        [$clause, $params] = tenant_clause('co');
-        $usage = monthly_usage($companyId);
-        $costMicrosSql = call_cost_sql('co');
-        $total = one("SELECT COUNT(*) ligacoes, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, COALESCE(SUM({$costMicrosSql}), 0) custo_micros FROM calls co WHERE {$clause}", $params);
-        $subscription = one('SELECT s.*,p.monthly_price,p.billing_period,p.description FROM subscriptions s LEFT JOIN plans p ON p.id=s.plan_id WHERE s.company_id=?', [$companyId]) ?: [];
         $telephony = telephony_credit_state($companyId);
-        $telephonyLedger = rows('SELECT l.*, u.name responsavel FROM telephony_ledger l LEFT JOIN users u ON u.id=l.responsible_user_id WHERE l.company_id=? ORDER BY l.id DESC LIMIT 50', [$companyId]);
-        $telephonyConsumedMicros = (int)(one("SELECT COALESCE(SUM(-amount_micros), 0) total FROM telephony_ledger WHERE company_id=? AND entry_type='CALL_DEBIT'", [$companyId])['total'] ?? 0);
+        $subscription = one('SELECT s.*,p.monthly_price,p.billing_period,p.description FROM subscriptions s LEFT JOIN plans p ON p.id=s.plan_id WHERE s.company_id=?', [$companyId]) ?: [];
+        $currentPeriod = $telephony['period_id'] > 0
+            ? one('SELECT * FROM subscription_periods WHERE id=? AND company_id=?', [$telephony['period_id'], $companyId])
+            : null;
+        $cycleStart = (string)($currentPeriod['starts_at'] ?? $subscription['starts_at'] ?? '');
+        $cycleEnd = (string)($currentPeriod['ends_at'] ?? $subscription['renews_at'] ?? '');
+        $cycleStartInput = strlen($cycleStart) === 10 ? $cycleStart . ' 00:00:00' : $cycleStart;
+        $cycleEndInput = strlen($cycleEnd) === 10 ? $cycleEnd . ' 00:00:00' : $cycleEnd;
+        $cycleStartUtc = local_datetime_to_utc_storage($cycleStartInput);
+        $cycleEndUtc = local_datetime_to_utc_storage($cycleEndInput);
+        $cycleStartDisplay = $cycleStartUtc !== '' ? datetime_utc_display($cycleStartUtc) : date_br_display($cycleStart);
+        $cycleEndDisplay = $cycleEndUtc !== '' ? datetime_utc_display($cycleEndUtc) : date_br_display($cycleEnd);
+        $costMicrosSql = call_cost_sql('co');
+        $billedMinutesSql = "CASE WHEN co.billable_seconds > 0 THEN CAST((co.billable_seconds + 59) / 60 AS INTEGER) ELSE 0 END";
+        $cycleWhere = ['co.company_id=?'];
+        $cycleParams = [$companyId];
+        if ($telephony['period_id'] > 0 && $cycleStartUtc !== '' && $cycleEndUtc !== '') {
+            $cycleWhere[] = '(co.telephony_period_id=? OR (co.telephony_period_id IS NULL AND co.created_at>=? AND co.created_at<?))';
+            array_push($cycleParams, $telephony['period_id'], $cycleStartUtc, $cycleEndUtc);
+        } elseif ($cycleStartUtc !== '' && $cycleEndUtc !== '') {
+            $cycleWhere[] = 'co.created_at>=? AND co.created_at<?';
+            array_push($cycleParams, $cycleStartUtc, $cycleEndUtc);
+        }
+        $total = one("SELECT COUNT(*) ligacoes, COALESCE(SUM(co.billable_seconds), 0) segundos, ROUND(COALESCE(SUM(co.billable_seconds), 0) / 60.0, 1) minutos, COALESCE(SUM({$billedMinutesSql}), 0) minutos_tarifados, COALESCE(SUM({$costMicrosSql}), 0) custo_micros FROM calls co WHERE " . implode(' AND ', $cycleWhere), $cycleParams) ?: [];
+        $usage = monthly_usage($companyId, (float)($total['segundos'] ?? 0));
+        $telephonyLedger = $telephony['period_id'] > 0
+            ? rows('SELECT l.*, u.name responsavel FROM telephony_ledger l LEFT JOIN users u ON u.id=l.responsible_user_id WHERE l.company_id=? AND l.subscription_period_id=? ORDER BY l.id DESC LIMIT 50', [$companyId, $telephony['period_id']])
+            : [];
+        $telephonyDebitedUsage = $telephony['period_id'] > 0
+            ? (one("SELECT
+                    COALESCE(SUM(-l.amount_micros), 0) consumed_micros,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN COALESCE(NULLIF(co.billing_rate_micros, 0), NULLIF(sp.telephony_rate_micros, 0)) IS NOT NULL
+                            THEN CAST(-l.amount_micros AS REAL) / COALESCE(NULLIF(co.billing_rate_micros, 0), NULLIF(sp.telephony_rate_micros, 0))
+                            ELSE 0
+                        END
+                    ), 0) billed_minutes
+                FROM telephony_ledger l
+                LEFT JOIN calls co ON co.id=l.call_id AND co.company_id=l.company_id
+                LEFT JOIN subscription_periods sp ON sp.id=l.subscription_period_id AND sp.company_id=l.company_id
+                WHERE l.company_id=? AND l.subscription_period_id=? AND l.entry_type='CALL_DEBIT' AND l.amount_micros < 0", [$companyId, $telephony['period_id']]) ?: [])
+            : [];
+        $telephonyConsumedMicros = (int)($telephonyDebitedUsage['consumed_micros'] ?? 0);
+        $telephonyBilledMinutes = (float)($telephonyDebitedUsage['billed_minutes'] ?? 0);
         $billing = tenant_billing_state($companyId);
         $payments = rows('SELECT * FROM payments WHERE company_id=? ORDER BY id DESC LIMIT 30', [$companyId]);
         $tenantTimezone = (string)(one('SELECT timezone FROM companies WHERE id=?', [$companyId])['timezone'] ?? 'America/Sao_Paulo');
         $selectedPayment = !empty($_GET['payment_id']) ? one('SELECT * FROM payments WHERE id=? AND company_id=?', [(int)$_GET['payment_id'],$companyId]) : null;
         $paymentConfig = mercado_pago_config();
         $checkout = $selectedPayment ? (json_decode((string)$selectedPayment['checkout_data_json'], true) ?: []) : [];
+        $showRenewalCallout = !is_platform_admin() && in_array((string)$billing['state'], ['warning', 'overdue', 'blocked'], true);
         ?>
-        <section class="panel billing-plan-summary">
+        <section class="panel billing-plan-summary<?= $showRenewalCallout ? ' needs-renewal' : '' ?>">
             <div class="section-head"><div><h2><?= h((string)($subscription['plan_name'] ?? 'Plano nao definido')) ?></h2><p><?= h((string)($subscription['description'] ?? 'Assinatura LigFlow')) ?></p></div><strong><?= money((float)($subscription['monthly_price'] ?? 0)) ?> / <?= h((string)($subscription['billing_period'] ?? 'Mensal')) ?></strong></div>
             <dl class="billing-details">
-                <dt>Inicio do periodo</dt><dd><?= h(date_br_display((string)($subscription['starts_at'] ?? ''))) ?></dd>
-                <?php if (!is_platform_admin()): ?>
-                    <dt>Vencimento</dt><dd><?= h(date_br_display((string)($subscription['renews_at'] ?? ''))) ?></dd>
-                <?php endif; ?>
+                <dt>Inicio do ciclo</dt><dd><?= h($cycleStartDisplay) ?></dd>
+                <dt>Fim do ciclo</dt><dd><?= h($cycleEndDisplay) ?></dd>
                 <dt>Status</dt><dd><?= h(strtoupper((string)$billing['state'])) ?></dd>
-                <dt>Saldo restante</dt><dd><?= h(number_format((float)$usage['remaining'],1,',','.')) ?> minutos</dd>
                 <dt>Credito inicial do ciclo</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['initial_micros'])) : 'Nao configurado' ?></dd>
                 <dt>Tarifa vigente</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['rate_micros'])) . ' / min' : 'Nao configurada' ?></dd>
                 <dt>Saldo de telefonia</dt><dd><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['balance_micros'])) : 'Configure e renove o plano' ?></dd>
             </dl>
+            <?php if ($showRenewalCallout): ?>
+                <div class="billing-renewal-callout" role="status">
+                    <div><strong><?= $billing['state'] === 'warning' ? 'Renovacao proxima' : ($billing['state'] === 'blocked' ? 'Plano bloqueado' : 'Renovacao pendente') ?></strong><span><?= h((string)$billing['message']) ?></span></div>
+                    <a class="button" href="#pagamento">Renovar plano agora</a>
+                </div>
+            <?php endif; ?>
         </section>
         <section class="metric-grid">
-            <article class="metric"><span>Minutos restantes</span><strong><?= h(number_format((float)$usage['remaining'], 1, ',', '.')) ?></strong></article>
-            <article class="metric"><span>Minutos usados no mes</span><strong><?= h(number_format((float)$usage['used'], 1, ',', '.')) ?></strong></article>
-            <article class="metric"><span>Limite mensal</span><strong><?= h(number_format((float)$usage['limit'], 0, ',', '.')) ?></strong></article>
-            <article class="metric"><span>Total de ligações</span><strong><?= h((string)$total['ligacoes']) ?></strong></article>
-            <article class="metric"><span>Minutos tarifados</span><strong><?= h((string)$total['minutos']) ?></strong></article>
-            <article class="metric"><span>Gasto estimado</span><strong><?= h(money(((int)$total['custo_micros']) / 1000000)) ?></strong></article>
-            <article class="metric"><span>Credito consumido</span><strong><?= $telephony['configured'] ? h(billing_micros_to_brl($telephonyConsumedMicros)) : '-' ?></strong></article>
+            <article class="metric"><span>Minutos usados no ciclo</span><strong><?= h(number_format((float)$usage['used'], 1, ',', '.')) ?></strong></article>
+            <article class="metric"><span>Ligações no ciclo</span><strong><?= h((string)($total['ligacoes'] ?? 0)) ?></strong></article>
+            <article class="metric"><span>Minutos tarifados no ciclo</span><strong><?= h(number_format($telephonyBilledMinutes, 1, ',', '.')) ?></strong></article>
+            <article class="metric"><span>Credito consumido no ciclo</span><strong><?= $telephony['configured'] ? h(billing_micros_to_brl($telephonyConsumedMicros)) : '-' ?></strong></article>
             <article class="metric"><span>Saldo de telefonia</span><strong><?= $telephony['configured'] ? h(billing_micros_to_brl($telephony['balance_micros'])) : '-' ?></strong></article>
         </section>
         <section class="panel">
@@ -10589,7 +11076,15 @@ function render_account(): void
 {
     layout('account', function () {
         $user = current_user();
-        $company = one('SELECT trade_name FROM companies WHERE id = ?', [(int)$user['company_id']]);
+        $company = one('SELECT c.trade_name, p.name plan_name
+            FROM companies c
+            LEFT JOIN subscriptions s ON s.company_id=c.id
+            LEFT JOIN plans p ON p.id=s.plan_id
+            WHERE c.id=?
+            ORDER BY s.id DESC
+            LIMIT 1', [(int)$user['company_id']]);
+        $asteriskExtension = asterisk_user_extension_record((int)$user['company_id'], (int)$user['id']);
+        $accountExtension = trim((string)($asteriskExtension['extension'] ?? ''));
         ?>
         <section class="grid two">
             <article class="panel profile-card">
@@ -10599,10 +11094,11 @@ function render_account(): void
                 <dl>
                     <dt>E-mail</dt><dd><?= h($user['email']) ?></dd>
                     <dt>Telefone</dt><dd><?= h($user['phone'] ?: '-') ?></dd>
-                    <dt>Identificacao</dt><dd><?= h($user['extension'] ?: '-') ?></dd>
                     <dt>Status</dt><dd><?= h($user['status']) ?></dd>
                     <dt>Conta</dt><dd><?= h($company['trade_name'] ?? '-') ?></dd>
+                    <dt>Plano</dt><dd><?= h($company['plan_name'] ?? '-') ?></dd>
                 </dl>
+                <button class="mini-link terms-review-button" type="button" data-open-terms>Termos de uso e privacidade</button>
             </article>
             <form class="panel form-grid" method="post" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="update_my_account">
@@ -10610,9 +11106,17 @@ function render_account(): void
                 <label>Nome<input name="name" value="<?= h($user['name']) ?>" required></label>
                 <label>E-mail<input name="email" type="email" value="<?= h($user['email']) ?>" required></label>
                 <label>Telefone<input name="phone" value="<?= h($user['phone']) ?>" data-phone-mask inputmode="tel" placeholder="Ex: (41) 99631-0725"></label>
-                <label>Identificacao/Ramal<input name="extension" value="<?= h($user['extension']) ?>"></label>
-                <label>Horario<input name="work_hours" value="<?= h($user['work_hours']) ?>"></label>
-                <label>Nova senha<input name="password" type="password" placeholder="Deixe em branco para manter"></label>
+                <label>Ramal<input value="<?= h($accountExtension ?: 'Sem ramal') ?>" disabled></label>
+                <label class="account-password-control">
+                    <span>Senha</span>
+                    <button class="button secondary" type="button" data-password-enable>Alterar senha</button>
+                    <span class="password-input-wrap is-hidden" data-password-editor>
+                        <input name="current_password" type="password" value="" autocomplete="current-password" placeholder="Senha atual" disabled data-password-input>
+                        <input name="new_password" type="password" value="" autocomplete="new-password" placeholder="Nova senha" disabled data-password-input>
+                        <input name="confirm_password" type="password" value="" autocomplete="new-password" placeholder="Confirmar nova senha" disabled data-password-input>
+                        <button class="password-visibility-button" type="button" data-password-visibility aria-label="Mostrar senhas" title="Mostrar senhas" aria-pressed="false">&#128065;</button>
+                    </span>
+                </label>
                 <label class="wide">Avatar<input name="avatar" type="file" accept="image/png,image/jpeg,image/webp"></label>
                 <?php if (!empty($user['avatar_path'])): ?>
                     <label class="check wide"><input type="checkbox" name="remove_avatar"> Remover avatar atual</label>
@@ -10620,6 +11124,16 @@ function render_account(): void
                 <p class="hint">Use uma imagem JPG, PNG ou WebP com ate 2 MB. Se nao enviar imagem, o avatar usa suas iniciais.</p>
                 <button class="button">Salvar minha conta</button>
             </form>
+            <details class="panel password-reset-panel">
+                <summary>Nao sei minha senha atual</summary>
+                <form class="form-grid compact-form" method="post">
+                    <input type="hidden" name="action" value="request_my_password_reset">
+                    <p class="hint wide">Digite uma nova senha. Enviaremos um e-mail para confirmar a alteracao antes de atualizar sua conta.</p>
+                    <label>Nova senha<input name="reset_password" type="password" autocomplete="new-password" required minlength="6"></label>
+                    <label>Confirmar nova senha<input name="reset_password_confirm" type="password" autocomplete="new-password" required minlength="6"></label>
+                    <button class="button secondary">Enviar confirmacao por e-mail</button>
+                </form>
+            </details>
         </section>
     <?php });
 }

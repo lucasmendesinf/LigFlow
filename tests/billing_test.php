@@ -35,6 +35,7 @@ $assert((int)$pdo->query("SELECT COUNT(*) FROM periods p JOIN payments x ON x.id
 
 $rate035 = billing_decimal_to_micros('0.35');
 $cost = static fn(int $seconds, int $rate = 350000): array => billing_proportional_call_cost($seconds, $rate);
+$directCallCost = static fn(int $seconds, int $rate = 320000): array => billing_full_minute_call_cost($seconds, $rate);
 $assert($cost(0)['cost_micros'] === 0, '0 segundos sem custo');
 $assert($cost(10)['cost_micros'] === 58333 && $cost(10)['cost_decimal'] === '0.058333', '10 segundos proporcionais');
 $assert($cost(30)['cost_micros'] === 175000, '30 segundos proporcionais');
@@ -45,6 +46,11 @@ $assert($cost(90)['cost_micros'] === 525000, '90 segundos proporcionais');
 $assert($cost(0, $rate035)['cost_micros'] === 0, 'chamada nao atendida sem custo');
 $assert($cost(10, $rate035)['cost_micros'] !== $rate035, '10 segundos nao cobram minuto cheio');
 $assert($cost(60, billing_decimal_to_micros('0.50'))['cost_micros'] === 500000, 'tarifa conforme plano');
+$assert($directCallCost(0)['cost_micros'] === 0 && $directCallCost(0)['billed_minutes'] === 0, 'DirectCall 0 segundos sem custo');
+$assert($directCallCost(15)['cost_micros'] === 320000 && $directCallCost(15)['billed_minutes'] === 1, 'DirectCall 15 segundos cobra 1 minuto cheio');
+$assert($directCallCost(48)['cost_micros'] === 320000 && $directCallCost(48)['billed_minutes'] === 1, 'DirectCall 48 segundos cobra 1 minuto cheio');
+$assert($directCallCost(60)['cost_micros'] === 320000 && $directCallCost(60)['billed_minutes'] === 1, 'DirectCall 60 segundos cobra 1 minuto cheio');
+$assert($directCallCost(61)['cost_micros'] === 640000 && $directCallCost(61)['billed_minutes'] === 2, 'DirectCall 61 segundos cobra 2 minutos cheios');
 
 $pdo->exec('CREATE TABLE call_charges (call_id INTEGER PRIMARY KEY, cost_micros INTEGER NOT NULL)');
 $charge = $pdo->prepare('INSERT INTO call_charges(call_id,cost_micros) VALUES (?,?) ON CONFLICT(call_id) DO UPDATE SET cost_micros=excluded.cost_micros');

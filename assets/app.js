@@ -61,6 +61,65 @@ document.querySelectorAll('[data-radar-select-all]').forEach((toggle) => {
     });
 });
 
+document.querySelectorAll('.account-password-control').forEach((control) => {
+    const enableButton = control.querySelector('[data-password-enable]');
+    const editor = control.querySelector('[data-password-editor]');
+    const inputs = Array.from(control.querySelectorAll('[data-password-input]'));
+    const visibilityButton = control.querySelector('[data-password-visibility]');
+    if (!enableButton || !editor || inputs.length === 0 || !visibilityButton) return;
+
+    enableButton.addEventListener('click', () => {
+        enableButton.hidden = true;
+        editor.classList.remove('is-hidden');
+        inputs.forEach((input) => {
+            input.disabled = false;
+            input.value = '';
+        });
+        inputs[0].focus();
+    });
+
+    visibilityButton.addEventListener('click', () => {
+        const showPassword = inputs.some((input) => input.type === 'password');
+        inputs.forEach((input) => {
+            input.type = showPassword ? 'text' : 'password';
+        });
+        visibilityButton.setAttribute('aria-pressed', showPassword ? 'true' : 'false');
+        visibilityButton.setAttribute('aria-label', showPassword ? 'Ocultar senhas' : 'Mostrar senhas');
+        visibilityButton.title = showPassword ? 'Ocultar senhas' : 'Mostrar senhas';
+    });
+});
+
+const termsModal = document.querySelector('[data-terms-modal]');
+const termsRequired = termsModal?.dataset.termsRequired === '1';
+const termsCheckbox = termsModal?.querySelector('[data-terms-checkbox]');
+const acceptTermsButton = termsModal?.querySelector('[data-accept-terms]');
+
+document.querySelectorAll('[data-open-terms]').forEach((button) => {
+    button.addEventListener('click', () => {
+        termsModal?.classList.remove('is-hidden');
+        document.body.classList.add('terms-modal-open');
+        termsModal?.querySelector('.terms-modal-content')?.focus();
+    });
+});
+
+document.querySelectorAll('[data-close-terms]').forEach((button) => {
+    button.addEventListener('click', () => {
+        if (termsRequired) return;
+        termsModal?.classList.add('is-hidden');
+        document.body.classList.remove('terms-modal-open');
+    });
+});
+
+termsCheckbox?.addEventListener('change', () => {
+    if (acceptTermsButton) acceptTermsButton.disabled = !termsCheckbox.checked;
+});
+
+document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || termsRequired || termsModal?.classList.contains('is-hidden')) return;
+    termsModal?.classList.add('is-hidden');
+    document.body.classList.remove('terms-modal-open');
+});
+
 const radarLoadingOverlay = document.querySelector('[data-radar-loading-overlay]');
 document.querySelectorAll('[data-radar-loading-form]').forEach((form) => {
     form.addEventListener('submit', (event) => {
@@ -492,17 +551,15 @@ document.querySelectorAll('[data-call-modal-close]').forEach((button) => {
     });
 });
 
-document.querySelectorAll('[data-open-call-history]').forEach((button) => {
-    button.addEventListener('click', () => {
-        const id = button.getAttribute('data-open-call-history');
+document.addEventListener('click', (event) => {
+    const openButton = event.target.closest('[data-open-call-history]');
+    if (openButton) {
+        const id = openButton.getAttribute('data-open-call-history');
         document.querySelector(`[data-call-history-modal="${id}"]`)?.classList.remove('is-hidden');
-    });
-});
-
-document.querySelectorAll('[data-call-history-close]').forEach((button) => {
-    button.addEventListener('click', () => {
-        button.closest('[data-call-history-modal]')?.classList.add('is-hidden');
-    });
+        return;
+    }
+    const closeButton = event.target.closest('[data-call-history-close]');
+    if (closeButton) closeButton.closest('[data-call-history-modal]')?.classList.add('is-hidden');
 });
 
 document.querySelectorAll('[data-open-callback]').forEach((button) => {
@@ -516,30 +573,57 @@ document.querySelectorAll('[data-callback-modal-close]').forEach((button) => {
     button.addEventListener('click', () => button.closest('[data-callback-modal]')?.classList.add('is-hidden'));
 });
 
-document.querySelectorAll('[data-quick-block-call]').forEach((button) => {
-    button.addEventListener('click', async () => {
-        const callId = Number(button.dataset.quickBlockCall || 0);
-        if (!callId || button.disabled) return;
-        button.disabled = true;
-        button.textContent = 'Bloqueando...';
-        try {
-            const response = await fetch('?page=quick_block_call', {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ call_id: callId }),
-            });
-            const body = await response.text();
-            const result = body.trim() ? JSON.parse(body) : null;
-            if (!response.ok || !result?.ok) throw new Error(result?.error || 'Falha ao bloquear numero.');
-            button.textContent = 'Bloqueado';
-            button.classList.add('is-blocked');
-        } catch (error) {
-            button.disabled = false;
-            button.textContent = 'Bloquear';
-            window.alert(error.message);
-        }
-    });
+document.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-quick-block-call]');
+    if (!button) return;
+    const callId = Number(button.dataset.quickBlockCall || 0);
+    if (!callId || button.disabled) return;
+    button.disabled = true;
+    button.textContent = 'Bloqueando...';
+    try {
+        const response = await fetch('?page=quick_block_call', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ call_id: callId }),
+        });
+        const body = await response.text();
+        const result = body.trim() ? JSON.parse(body) : null;
+        if (!response.ok || !result?.ok) throw new Error(result?.error || 'Falha ao bloquear numero.');
+        button.textContent = 'Bloqueado';
+        button.classList.add('is-blocked');
+    } catch (error) {
+        button.disabled = false;
+        button.textContent = 'Bloquear';
+        window.alert(error.message);
+    }
+});
+
+document.querySelector('[data-load-more-answered-calls]')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const more = button.closest('[data-answered-calls-more]');
+    const tbody = document.querySelector('[data-answered-calls-body]');
+    const modals = document.querySelector('[data-answered-calls-modals]');
+    const overlay = document.querySelector('[data-answered-calls-loading]');
+    if (!tbody || !modals || button.disabled) return;
+    button.disabled = true;
+    overlay?.classList.remove('is-hidden');
+    try {
+        const offset = Math.max(15, Number(button.dataset.offset || 15));
+        const response = await fetch(`?page=answered_calls_batch&offset=${offset}`, { credentials: 'same-origin' });
+        const body = await response.text();
+        const result = body.trim() ? JSON.parse(body) : null;
+        if (!response.ok || !result?.ok) throw new Error(result?.error || 'Falha ao carregar chamadas.');
+        tbody.insertAdjacentHTML('beforeend', result.rows_html || '');
+        modals.insertAdjacentHTML('beforeend', result.modals_html || '');
+        button.dataset.offset = String(offset + Number(result.count || 0));
+        if (!result.has_more || !result.count) more.hidden = true;
+    } catch (error) {
+        window.alert(error.message);
+    } finally {
+        button.disabled = false;
+        overlay?.classList.add('is-hidden');
+    }
 });
 
 document.querySelectorAll('[data-open-recording]').forEach((button) => {

@@ -58,6 +58,21 @@ function billing_proportional_call_cost(int $billableSeconds, int $rateMicros): 
     ];
 }
 
+function billing_full_minute_call_cost(int $billableSeconds, int $rateMicros): array
+{
+    $billableSeconds = max(0, $billableSeconds);
+    $rateMicros = max(0, $rateMicros);
+    $billedMinutes = $billableSeconds > 0 ? intdiv($billableSeconds + 59, 60) : 0;
+    $costMicros = $rateMicros > 0 ? $billedMinutes * $rateMicros : 0;
+    return [
+        'billable_seconds' => $billableSeconds,
+        'billed_minutes' => $billedMinutes,
+        'rate_micros' => $rateMicros,
+        'cost_micros' => $costMicros,
+        'cost_decimal' => billing_micros_to_decimal($costMicros),
+    ];
+}
+
 function billing_telephony_balance_after(int $balanceMicros, int $debitMicros): int
 {
     return $balanceMicros - max(0, $debitMicros);
