@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+// Required by index.php to render and record the current Terms of Use flow.
+
 function render_terms_content(): void
 {
     ?>
