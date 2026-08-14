@@ -46,8 +46,12 @@ $assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'next_starte
 
 $workerSource = file_get_contents(__DIR__ . '/../asterisk_ari_worker.php') ?: '';
 $deploySource = file_get_contents(__DIR__ . '/../.cpanel.yml') ?: '';
+$restartSource = file_get_contents(__DIR__ . '/../deploy/restart_ari_worker.sh') ?: '';
 $assert(str_contains($workerSource, 'LOCK_EX | LOCK_NB'), 'ARI worker prevents duplicate instances');
 $assert(str_contains($deploySource, 'asterisk_ari_worker.php $DEPLOYPATH/'), 'cPanel deploy includes the ARI worker');
-$assert(str_contains($deploySource, '/usr/bin/nohup /usr/bin/env php'), 'cPanel deploy starts the ARI worker');
+$assert(str_contains($deploySource, '/bin/sh deploy/restart_ari_worker.sh $DEPLOYPATH'), 'cPanel deploy restarts the ARI worker');
+$assert(str_contains($restartSource, 'kill -TERM "$PID"'), 'worker deploy uses graceful termination');
+$assert(!str_contains($restartSource, 'kill -9'), 'worker deploy never forces termination');
+$assert(str_contains($restartSource, 'nohup env php "$WORKER"'), 'worker deploy starts one detached process');
 
 echo "OK - {$tests} tests\n";

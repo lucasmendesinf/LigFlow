@@ -7,4 +7,4 @@ deployment:
     - /bin/cp -Rf assets $DEPLOYPATH/
     - /bin/cp -Rf migrations/. $DEPLOYPATH/migrations/
     - /bin/chmod 775 $DEPLOYPATH/data $DEPLOYPATH/uploads $DEPLOYPATH/uploads/avatars $DEPLOYPATH/uploads/imports
-    - /bin/sh -c '/usr/bin/nohup /usr/bin/env php "$DEPLOYPATH/asterisk_ari_worker.php" >> "$DEPLOYPATH/data/asterisk_ari_worker.log" 2>&1 < /dev/null &'
+    - /bin/sh deploy/restart_ari_worker.sh $DEPLOYPATH

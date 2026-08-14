@@ -6349,18 +6349,25 @@ function asterisk_batch_answered(int $callId): void
     } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
 }
 
-function asterisk_continue_batch_if_exhausted(int $batchId): void
+function asterisk_continue_batch_if_exhausted(int $batchId): bool
 {
     $batch = one('SELECT * FROM dial_batches WHERE id=?', [$batchId]);
-    if (!$batch || !empty($batch['winner_call_id'])) return;
+    if (!$batch || !empty($batch['winner_call_id']) || !in_array((string)$batch['status'], ['ORIGINATING', 'RINGING'], true)) return false;
     $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
-    if ($live > 0) return;
-    db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL")
-        ->execute([$batchId]);
+    if ($live > 0) return false;
+    $claim = db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL AND status IN ('ORIGINATING','RINGING')");
+    $claim->execute([$batchId]);
+    if ($claim->rowCount() !== 1) return false;
     db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id=?) AND status IN ('reservado','em_ligacao')")
         ->execute([$batchId]);
+    $agent = one('SELECT status FROM users WHERE id=? AND company_id=?', [(int)$batch['agent_id'], (int)$batch['company_id']]);
+    $campaign = one('SELECT * FROM campaigns WHERE id=? AND company_id=? AND status="Ativa"', [(int)$batch['campaign_id'], (int)$batch['company_id']]);
+    if ($agent && (string)$agent['status'] === 'Discando automatico' && $campaign) {
+        if (start_asterisk_parallel_batch($campaign, (int)$batch['agent_id'], (int)$batch['company_id'])) return true;
+    }
     db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
         ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
+    return false;
 }
 
 function cancel_active_asterisk_batch(int $agentId, int $companyId): void
@@ -9772,9 +9779,9 @@ function render_agent(): void
         $batchState = $isAutoDialing ? agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']) : null;
         $activeBatch = $batchState['batch'] ?? null;
         if ($batchState && (int)$batchState['active_count'] === 0 && empty($batchState['winner_call_id'])) {
-            asterisk_continue_batch_if_exhausted((int)$batchState['batch_id']);
-            $batchState = null;
-            $activeBatch = null;
+            $continued = asterisk_continue_batch_if_exhausted((int)$batchState['batch_id']);
+            $batchState = $continued ? agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']) : null;
+            $activeBatch = $batchState['batch'] ?? null;
         }
         if ($activeBatch && !empty($activeBatch['winner_call_id'])) {
             $activeCall = one("SELECT * FROM calls WHERE id = ? AND agent_id = ? AND company_id = ? AND race_outcome = 'WINNER' LIMIT 1", [(int)$activeBatch['winner_call_id'], (int)$user['id'], (int)$user['company_id']]);

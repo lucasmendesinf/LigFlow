@@ -55,6 +55,13 @@ $assert($noWinner->rowCount() === 1, 'batch with no winner advances once');
 $noWinner->execute([2]);
 $assert($noWinner->rowCount() === 0, 'repeated final event does not start another batch');
 
+$db->exec("INSERT INTO dial_batches(id,status) VALUES (3,'ORIGINATING')");
+$nextWave = $db->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at='now' WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL AND status IN ('ORIGINATING','RINGING')");
+$nextWave->execute([3]);
+$assert($nextWave->rowCount() === 1, 'exhausted wave claims one continuation');
+$nextWave->execute([3]);
+$assert($nextWave->rowCount() === 0, 'exhausted wave cannot start duplicate continuations');
+
 $db->exec("UPDATE contacts SET status='em_ligacao', reserved_by=7 WHERE id IN (1,2)");
 $db->exec("UPDATE contacts SET status='reservado', reserved_by=7 WHERE id=3");
 $db->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL WHERE id IN (SELECT contact_id FROM calls WHERE batch_id=?)")->execute([1]);
@@ -68,4 +75,5 @@ $source = file_get_contents(dirname(__DIR__) . '/index.php') ?: '';
 $assert(str_contains($source, "? 'PJSIP/' . \$destination . '@' . \$trunk"), 'Nvoip uses the registered PJSIP trunk dial string');
 $assert(str_contains($source, ": 'PJSIP/' . \$trunk . '/' . \$destination"), 'DirectCall keeps its established dial string');
 $assert(substr_count($source, "'endpoint' => \$this->outboundEndpoint(\$destination)") === 2, 'single and parallel calls share the route endpoint builder');
+$assert(str_contains($source, "start_asterisk_parallel_batch(\$campaign, (int)\$batch['agent_id'], (int)\$batch['company_id'])"), 'exhausted wave starts the next parallel wave');
 echo "OK - {$tests} tests\n";
