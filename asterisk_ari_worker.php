@@ -36,13 +36,19 @@ while (true) {
     try {
         $socket = new AsteriskAriWebSocket($config);
         $socket->connect();
+        asterisk_process_pending_originations();
         $backoff = max(1, (int)$config['reconnect_initial_seconds']);
         while (true) {
-            $event = $socket->readEvent(10);
+            $event = $socket->readEvent(1);
             if ($event === null) {
+                if ($socket->timedOut()) {
+                    asterisk_process_pending_originations();
+                    continue;
+                }
                 throw new RuntimeException('Conexao ARI encerrada.');
             }
             asterisk_handle_event($event);
+            asterisk_process_pending_originations();
         }
     } catch (Throwable $e) {
         error_log('LigFlow Asterisk ARI worker: reconnecting after connection failure.');

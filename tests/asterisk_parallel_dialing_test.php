@@ -76,4 +76,20 @@ $assert(str_contains($source, "? 'PJSIP/' . \$destination . '@' . \$trunk"), 'Nv
 $assert(str_contains($source, ": 'PJSIP/' . \$trunk . '/' . \$destination"), 'DirectCall keeps its established dial string');
 $assert(substr_count($source, "'endpoint' => \$this->outboundEndpoint(\$destination)") === 2, 'single and parallel calls share the route endpoint builder');
 $assert(str_contains($source, "start_asterisk_parallel_batch(\$campaign, (int)\$batch['agent_id'], (int)\$batch['company_id'])"), 'exhausted wave starts the next parallel wave');
+$assert(str_contains($source, "'ARI_ORIGINATE_PENDING'"), 'batch reservation queues each Asterisk origination');
+$assert(str_contains($source, 'function asterisk_process_pending_originations'), 'persistent worker has a pending origination processor');
+$assert(str_contains($source, "provider_status_raw='ARI_ORIGINATE_CLAIMED'"), 'worker claims pending calls atomically');
+$assert(str_contains($source, "\$config['active_route'] = (string)\$call['telephony_trunk'];"), 'worker preserves the trunk selected when the batch was created');
+$assert(str_contains($source, "provider_status_raw <> 'ARI_ORIGINATE_FAILED'"), 'a fully rejected wave does not consume the next leads');
+$startOffset = strpos($source, 'function start_asterisk_parallel_batch');
+$processOffset = strpos($source, 'function asterisk_process_pending_originations');
+$startSection = $startOffset !== false && $processOffset !== false ? substr($source, $startOffset, $processOffset - $startOffset) : '';
+$assert(!str_contains($startSection, '->originateParallel('), 'web request no longer waits for ARI originations');
+
+$worker = file_get_contents(dirname(__DIR__) . '/asterisk_ari_worker.php') ?: '';
+$connectOffset = strpos($worker, '$socket->connect();');
+$processPendingOffset = strpos($worker, 'asterisk_process_pending_originations();');
+$assert($connectOffset !== false && $processPendingOffset !== false && $connectOffset < $processPendingOffset, 'worker connects to ARI events before originating queued calls');
+$assert(str_contains($worker, '$socket->readEvent(1)'), 'worker polls queued originations without delaying the dialer screen');
+$assert(str_contains($worker, 'if ($socket->timedOut())'), 'normal WebSocket polling timeout does not reconnect the worker');
 echo "OK - {$tests} tests\n";

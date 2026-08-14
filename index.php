@@ -2309,7 +2309,8 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
         CURLOPT_USERPWD => $config['ari_username'] . ':' . $config['ari_password'],
         CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
         CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json'],
-        CURLOPT_TIMEOUT => max(5, (int)$config['originate_timeout_seconds']),
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 8,
     ]);
     if ($payload !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE));
     $body = curl_exec($ch);
@@ -6279,7 +6280,7 @@ function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId
             if ($guard->rowCount() !== 1) continue;
             $externalId = 'ARI-' . bin2hex(random_bytes(12));
             $pdo->prepare("INSERT INTO calls (company_id,campaign_id,contact_id,agent_id,provider,external_call_id,provider_call_id,destination_number,status,provider_status_raw,internal_status,attempt_number,billing_rate_micros,telephony_period_id,telephony_mode,telephony_trunk,provider_channel_id,dial_batch_id,race_outcome,started_at,ringing_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))")
-                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), $telephonyPeriodId, 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
+                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATE_PENDING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), $telephonyPeriodId, 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
             $contact['call_id'] = (int)$pdo->lastInsertId();
             $contact['external_call_id'] = $externalId;
             $reserved[] = $contact;
@@ -6344,31 +6345,57 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit, (int)$allowed['state']['period_id']);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
     if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
-    $agent = one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$agentId, $companyId]) ?: [];
-    $provider = telephony_provider_for_company($companyId);
-    if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para este lote.');
-    $originatedCount = 0;
-    foreach ($batch['contacts'] as $contact) {
-        try {
-            $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$contact['external_call_id']);
-            db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND dial_batch_id=?")
-                ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$contact['call_id'], (int)$batch['id']]);
-            $originatedCount++;
-        } catch (Throwable $e) {
-            db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND dial_batch_id=? AND finalized_at IS NULL")
-                ->execute([$e->getMessage(), (int)$contact['call_id'], (int)$batch['id']]);
-            db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=?")->execute([(int)$contact['id']]);
-        }
-    }
-    asterisk_continue_batch_if_exhausted((int)$batch['id']);
-    if ($originatedCount === 0) {
-        flash('Nenhuma chamada foi iniciada. Atendimento automatico encerrado.', 'error');
-        return false;
-    }
     db()->prepare("UPDATE users SET status='Discando automatico' WHERE id=? AND company_id=?")->execute([$agentId, $companyId]);
     audit('iniciou_lote_asterisk', 'dial_batches:' . (int)$batch['id'], null, ['parallelism' => $limit]);
-    flash('Lote Asterisk iniciado com ' . $originatedCount . ' chamadas.');
+    flash('Lote Asterisk preparado com ' . count($batch['contacts']) . ' chamadas.');
     return true;
+}
+
+function asterisk_process_pending_originations(int $limit = 10): int
+{
+    $pending = rows("SELECT ca.* FROM calls ca
+        JOIN dial_batches b ON b.id = ca.dial_batch_id AND b.company_id = ca.company_id
+        WHERE ca.telephony_mode = 'ASTERISK'
+          AND ca.finalized_at IS NULL
+          AND b.status IN ('ORIGINATING','RINGING')
+          AND (ca.provider_status_raw = 'ARI_ORIGINATE_PENDING'
+               OR (ca.provider_status_raw = 'ARI_ORIGINATE_CLAIMED' AND ca.last_event_at < datetime('now','-60 seconds')))
+        ORDER BY ca.id ASC LIMIT " . max(1, min(10, $limit)));
+    if (!$pending) return 0;
+
+    $processed = 0;
+    $batchIds = [];
+    foreach ($pending as $call) {
+        $claim = db()->prepare("UPDATE calls SET provider_status_raw='ARI_ORIGINATE_CLAIMED', last_event_at=datetime('now')
+            WHERE id=? AND finalized_at IS NULL
+              AND (provider_status_raw='ARI_ORIGINATE_PENDING'
+                   OR (provider_status_raw='ARI_ORIGINATE_CLAIMED' AND last_event_at < datetime('now','-60 seconds')))" );
+        $claim->execute([(int)$call['id']]);
+        if ($claim->rowCount() !== 1) continue;
+
+        $batchIds[(int)$call['dial_batch_id']] = true;
+        try {
+            $campaign = one('SELECT * FROM campaigns WHERE id=? AND company_id=?', [(int)$call['campaign_id'], (int)$call['company_id']]);
+            $contact = one('SELECT * FROM contacts WHERE id=? AND company_id=?', [(int)$call['contact_id'], (int)$call['company_id']]);
+            $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
+            if (!$campaign || !$contact) throw new RuntimeException('Campanha ou contato indisponivel para originacao Asterisk.');
+
+            $config = asterisk_config();
+            $config['active_route'] = (string)$call['telephony_trunk'];
+            $provider = new AsteriskProvider($config);
+            $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$call['external_call_id']);
+            db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND provider_status_raw='ARI_ORIGINATE_CLAIMED'")
+                ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$call['id']]);
+        } catch (Throwable $e) {
+            db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND finalized_at IS NULL")
+                ->execute([$e->getMessage(), (int)$call['id']]);
+            db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
+                ->execute([(int)$call['contact_id'], (int)$call['company_id']]);
+        }
+        $processed++;
+    }
+    foreach (array_keys($batchIds) as $batchId) asterisk_continue_batch_if_exhausted((int)$batchId);
+    return $processed;
 }
 
 function asterisk_batch_answered(int $callId): void
@@ -6442,11 +6469,17 @@ function asterisk_continue_batch_if_exhausted(int $batchId): bool
     if (!$batch || !empty($batch['winner_call_id']) || !in_array((string)$batch['status'], ['ORIGINATING', 'RINGING'], true)) return false;
     $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
     if ($live > 0) return false;
+    $originated = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND provider_status_raw <> 'ARI_ORIGINATE_FAILED'", [$batchId]);
     $claim = db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL AND status IN ('ORIGINATING','RINGING')");
     $claim->execute([$batchId]);
     if ($claim->rowCount() !== 1) return false;
     db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id=?) AND status IN ('reservado','em_ligacao')")
         ->execute([$batchId]);
+    if ($originated === 0) {
+        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+            ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
+        return false;
+    }
     $agent = one('SELECT status FROM users WHERE id=? AND company_id=?', [(int)$batch['agent_id'], (int)$batch['company_id']]);
     $campaign = one('SELECT * FROM campaigns WHERE id=? AND company_id=? AND status="Ativa"', [(int)$batch['campaign_id'], (int)$batch['company_id']]);
     if ($agent && (string)$agent['status'] === 'Discando automatico' && $campaign) {
@@ -7968,6 +8001,12 @@ final class AsteriskAriWebSocket
         if ($opcode !== 1 || $payload === '') return null;
         $event = json_decode($payload, true);
         return is_array($event) ? $event : null;
+    }
+    public function timedOut(): bool
+    {
+        if (!is_resource($this->socket)) return false;
+        $meta = stream_get_meta_data($this->socket);
+        return !empty($meta['timed_out']);
     }
     public function close(): void { if (is_resource($this->socket)) fclose($this->socket); $this->socket = null; }
 }
