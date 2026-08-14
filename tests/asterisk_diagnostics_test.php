@@ -44,4 +44,10 @@ $assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'effective_p
 $assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'telephony_trunk'"), 'legacy dial batches gain telephony trunk');
 $assert(str_contains($source, "ensure_column(\$pdo, 'dial_batches', 'next_started_at'"), 'legacy dial batches gain continuation timestamp');
 
+$workerSource = file_get_contents(__DIR__ . '/../asterisk_ari_worker.php') ?: '';
+$deploySource = file_get_contents(__DIR__ . '/../.cpanel.yml') ?: '';
+$assert(str_contains($workerSource, 'LOCK_EX | LOCK_NB'), 'ARI worker prevents duplicate instances');
+$assert(str_contains($deploySource, 'asterisk_ari_worker.php $DEPLOYPATH/'), 'cPanel deploy includes the ARI worker');
+$assert(str_contains($deploySource, '/usr/bin/nohup /usr/bin/env php'), 'cPanel deploy starts the ARI worker');
+
 echo "OK - {$tests} tests\n";

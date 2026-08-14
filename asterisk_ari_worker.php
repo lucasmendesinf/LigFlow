@@ -8,6 +8,22 @@ if (PHP_SAPI !== 'cli') {
     exit(1);
 }
 
+$lockHandle = fopen(DATA_DIR . '/asterisk_ari_worker.lock', 'c');
+if ($lockHandle === false) {
+    error_log('LigFlow Asterisk ARI worker: lock unavailable.');
+    exit(1);
+}
+if (!flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    fclose($lockHandle);
+    exit(0);
+}
+ftruncate($lockHandle, 0);
+fwrite($lockHandle, (string)getmypid());
+register_shutdown_function(static function () use ($lockHandle): void {
+    flock($lockHandle, LOCK_UN);
+    fclose($lockHandle);
+});
+
 $backoff = 2;
 while (true) {
     $config = asterisk_config();
