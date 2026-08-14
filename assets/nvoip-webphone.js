@@ -403,6 +403,7 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
         const response = await fetch('?page=sip_config', { credentials: 'same-origin' });
         const json = await response.json();
         if (!json.ok) throw new Error(json.error || 'Falha ao obter configuracao SIP');
+        root.setAttribute('data-outbound-via-ari', json.provider === 'ASTERISK' ? '1' : '0');
         const manual = readManualConfig();
         root.querySelector('[data-sip-wss]').value = json.wssUrl || manual.wssUrl || '';
         root.querySelector('[data-sip-domain]').value = json.domain || manual.domain || '';
@@ -413,6 +414,7 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
             sipUsername: json.sipUsername || manual.sipUsername,
             sipPassword: manual.sipPassword || json.sipPassword,
             autoAnswer: manual.autoAnswer ?? json.autoAnswer,
+            provider: json.provider || '',
         };
     };
 
@@ -427,6 +429,20 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
     root.querySelector('[data-sip-answer]')?.addEventListener('click', () => service.answer());
     root.querySelector('[data-sip-place-call]')?.addEventListener('click', async () => {
         const config = await loadConfig();
+        if (root.getAttribute('data-outbound-via-ari') === '1') {
+            const outboundForm = document.createElement('form');
+            outboundForm.method = 'post';
+            [['action', 'manual_call'], ['campaign_id', '0'], ['manual_phone', root.querySelector('[data-sip-destination]')?.value || '']].forEach(([name, value]) => {
+                const field = document.createElement('input');
+                field.type = 'hidden';
+                field.name = name;
+                field.value = value;
+                outboundForm.appendChild(field);
+            });
+            document.body.appendChild(outboundForm);
+            outboundForm.submit();
+            return;
+        }
         service.call(root.querySelector('[data-sip-destination]')?.value, config.domain);
     });
     root.querySelector('[data-sip-reject]')?.addEventListener('click', () => service.reject());
@@ -498,6 +514,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const isAutoDialing = () => root.getAttribute('data-auto-dialing') === '1';
+    const usesAsteriskOutbound = () => root.getAttribute('data-outbound-via-ari') === '1';
 
     const blockManualCallDuringAutoDialing = () => {
         if (!isAutoDialing()) return false;
@@ -1129,6 +1146,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         const response = await fetch('?page=sip_config', { credentials: 'same-origin', cache: 'no-store' });
         const json = await response.json();
         if (!json.ok) throw new Error(json.error || 'Falha ao obter configuracao SIP');
+        root.setAttribute('data-outbound-via-ari', json.provider === 'ASTERISK' ? '1' : '0');
         config = json;
         return config;
     };
@@ -1266,6 +1284,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         panel?.classList.remove('is-hidden');
         root.querySelector('[data-phone-tab="teclado"]')?.click();
+        if (usesAsteriskOutbound()) {
+            form?.requestSubmit();
+            return true;
+        }
         await placeCall(cleanNumber);
         return true;
     };
@@ -1274,6 +1296,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     refreshCallButtonReady();
 
     form?.addEventListener('submit', async (event) => {
+        if (usesAsteriskOutbound() && !service.session && !currentSipCallId) return;
         event.preventDefault();
         if (service.session || currentSipCallId) {
             if (isAutoDialing()) {
@@ -1290,6 +1313,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     root.querySelector('[data-phone-tab="recentes"]')?.addEventListener('click', refreshPhoneHistory);
 
     callButton?.addEventListener('click', async (event) => {
+        if (usesAsteriskOutbound() && !service.session && !currentSipCallId) return;
         event.preventDefault();
         if (service.session || currentSipCallId) {
             if (isAutoDialing()) {
