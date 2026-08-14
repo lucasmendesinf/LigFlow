@@ -2258,6 +2258,12 @@ function asterisk_config(): array
         'environment' => (string)($row['environment'] ?? 'test'),
         'active_mode' => strtoupper((string)($row['active_mode'] ?? 'NVOIP_DIRECT')),
         'active_route' => $route,
+        'config_version' => substr(hash('sha256', implode('|', [
+            (string)($row['updated_at'] ?? ''),
+            (string)($row['enabled'] ?? 0),
+            (string)($row['active_mode'] ?? 'NVOIP_DIRECT'),
+            $route,
+        ])), 0, 16),
         'ari_url' => rtrim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL')), '/'),
         'ari_ws_url' => (string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')),
         'ari_username' => (string)($row['ari_username'] ?? env_value('ASTERISK_ARI_USERNAME')),
@@ -7112,6 +7118,7 @@ function handle_sip_config(): never
             'sipPassword' => $sipPassword,
             'provider' => 'ASTERISK',
             'providerLabel' => 'Asterisk WebRTC',
+            'configVersion' => $asterisk['config_version'],
             'autoAnswer' => false,
             'callbackTimeoutSeconds' => max(10, (int)$asterisk['originate_timeout_seconds']),
             'secureContext' => is_secure_or_local_request(),
@@ -7124,12 +7131,16 @@ function handle_sip_config(): never
     $sipPassword = (string)$config['sip_password'];
     audit('consultou_config_sip', 'users:' . $user['id'], null, ['has_sip_user' => $sipUsername !== '', 'has_sip_password' => $sipPassword !== '']);
     header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store, private');
     echo json_encode([
         'ok' => true,
         'wssUrl' => $config['sip_wss_url'] ?: 'wss://app.nvoip.com.br:7443',
         'domain' => $config['sip_domain'] ?: 'app.nvoip.com.br',
         'sipUsername' => $sipUsername,
         'sipPassword' => $sipPassword,
+        'provider' => 'NVOIP_DIRECT',
+        'providerLabel' => 'Nvoip',
+        'configVersion' => $asterisk['config_version'],
         'autoAnswer' => (int)$config['auto_answer_nvoip_callback'] === 1,
         'callbackTimeoutSeconds' => max(10, (int)$config['sip_callback_timeout_seconds']),
         'secureContext' => is_secure_or_local_request(),

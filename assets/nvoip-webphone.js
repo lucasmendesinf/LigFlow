@@ -460,6 +460,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     const stopCallButtons = Array.from(document.querySelectorAll('[data-floating-stop-call]'));
     let config = null;
     let connecting = false;
+    let configSyncing = false;
     let autoCallStarted = false;
     let currentSipCallId = null;
     let currentSipStartedAt = null;
@@ -1125,11 +1126,29 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const loadConfig = async () => {
-        const response = await fetch('?page=sip_config', { credentials: 'same-origin' });
+        const response = await fetch('?page=sip_config', { credentials: 'same-origin', cache: 'no-store' });
         const json = await response.json();
         if (!json.ok) throw new Error(json.error || 'Falha ao obter configuracao SIP');
         config = json;
         return config;
+    };
+
+    const syncGlobalTelephonyConfig = async () => {
+        if (service.session || currentSipCallId || connecting || configSyncing || isAutoDialing()) return;
+        configSyncing = true;
+        const previousVersion = config?.configVersion || '';
+        try {
+            const loaded = await loadConfig();
+            const changed = previousVersion !== '' && previousVersion !== loaded.configVersion;
+            if (changed || !service.ua?.isRegistered()) {
+                service.connect(loaded);
+                setText(registerEl, changed ? 'Atualizando' : 'Registrando');
+            }
+        } catch (error) {
+            setText(callDetail, error.message);
+        } finally {
+            configSyncing = false;
+        }
     };
 
     const ensureRegistered = async () => {
@@ -1161,6 +1180,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         return false;
     };
+
+    window.setTimeout(syncGlobalTelephonyConfig, 300);
+    window.setInterval(syncGlobalTelephonyConfig, 15000);
+    window.addEventListener('focus', syncGlobalTelephonyConfig);
 
     root.querySelector('[data-webphone-toggle]')?.addEventListener('click', () => {
         if (!panel?.classList.contains('is-hidden')) {
