@@ -403,7 +403,6 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
         const response = await fetch('?page=sip_config', { credentials: 'same-origin' });
         const json = await response.json();
         if (!json.ok) throw new Error(json.error || 'Falha ao obter configuracao SIP');
-        root.setAttribute('data-outbound-via-ari', json.provider === 'ASTERISK' ? '1' : '0');
         const manual = readManualConfig();
         root.querySelector('[data-sip-wss]').value = json.wssUrl || manual.wssUrl || '';
         root.querySelector('[data-sip-domain]').value = json.domain || manual.domain || '';
@@ -414,7 +413,6 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
             sipUsername: json.sipUsername || manual.sipUsername,
             sipPassword: manual.sipPassword || json.sipPassword,
             autoAnswer: manual.autoAnswer ?? json.autoAnswer,
-            provider: json.provider || '',
         };
     };
 
@@ -429,20 +427,6 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
     root.querySelector('[data-sip-answer]')?.addEventListener('click', () => service.answer());
     root.querySelector('[data-sip-place-call]')?.addEventListener('click', async () => {
         const config = await loadConfig();
-        if (config.provider === 'ASTERISK') {
-            const outboundForm = document.createElement('form');
-            outboundForm.method = 'post';
-            [['action', 'manual_call'], ['campaign_id', '0'], ['manual_phone', root.querySelector('[data-sip-destination]')?.value || '']].forEach(([name, value]) => {
-                const field = document.createElement('input');
-                field.type = 'hidden';
-                field.name = name;
-                field.value = value;
-                outboundForm.appendChild(field);
-            });
-            document.body.appendChild(outboundForm);
-            outboundForm.submit();
-            return;
-        }
         service.call(root.querySelector('[data-sip-destination]')?.value, config.domain);
     });
     root.querySelector('[data-sip-reject]')?.addEventListener('click', () => service.reject());
@@ -476,7 +460,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     const stopCallButtons = Array.from(document.querySelectorAll('[data-floating-stop-call]'));
     let config = null;
     let connecting = false;
-    let configSyncing = false;
     let autoCallStarted = false;
     let currentSipCallId = null;
     let currentSipStartedAt = null;
@@ -514,6 +497,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const isAutoDialing = () => root.getAttribute('data-auto-dialing') === '1';
+
     const blockManualCallDuringAutoDialing = () => {
         if (!isAutoDialing()) return false;
         setText(callDetail, 'Ligacao manual bloqueada enquanto o atendimento automatico estiver ativo.');
@@ -1141,30 +1125,11 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const loadConfig = async () => {
-        const response = await fetch('?page=sip_config', { credentials: 'same-origin', cache: 'no-store' });
+        const response = await fetch('?page=sip_config', { credentials: 'same-origin' });
         const json = await response.json();
         if (!json.ok) throw new Error(json.error || 'Falha ao obter configuracao SIP');
-        root.setAttribute('data-outbound-via-ari', json.provider === 'ASTERISK' ? '1' : '0');
         config = json;
         return config;
-    };
-
-    const syncGlobalTelephonyConfig = async () => {
-        if (service.session || currentSipCallId || connecting || configSyncing || isAutoDialing()) return;
-        configSyncing = true;
-        const previousVersion = config?.configVersion || '';
-        try {
-            const loaded = await loadConfig();
-            const changed = previousVersion !== '' && previousVersion !== loaded.configVersion;
-            if (changed || !service.ua?.isRegistered()) {
-                service.connect(loaded);
-                setText(registerEl, changed ? 'Atualizando' : 'Registrando');
-            }
-        } catch (error) {
-            setText(callDetail, error.message);
-        } finally {
-            configSyncing = false;
-        }
     };
 
     const ensureRegistered = async () => {
@@ -1196,10 +1161,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         return false;
     };
-
-    window.setTimeout(syncGlobalTelephonyConfig, 300);
-    window.setInterval(syncGlobalTelephonyConfig, 15000);
-    window.addEventListener('focus', syncGlobalTelephonyConfig);
 
     root.querySelector('[data-webphone-toggle]')?.addEventListener('click', () => {
         if (!panel?.classList.contains('is-hidden')) {
@@ -1282,7 +1243,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         panel?.classList.remove('is-hidden');
         root.querySelector('[data-phone-tab="teclado"]')?.click();
-        form?.requestSubmit();
+        await placeCall(cleanNumber);
         return true;
     };
 
@@ -1300,30 +1261,23 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             return;
         }
         if (blockManualCallDuringAutoDialing()) return;
-        try {
-            const loaded = await loadConfig();
-            if (loaded.provider === 'ASTERISK') {
-                HTMLFormElement.prototype.submit.call(form);
-                return;
-            }
-        } catch (error) {
-            setText(callDetail, error.message);
-            return;
-        }
         await placeCall(input?.value || '');
     });
 
     root.querySelector('[data-phone-tab="recentes"]')?.addEventListener('click', refreshPhoneHistory);
 
     callButton?.addEventListener('click', async (event) => {
+        event.preventDefault();
         if (service.session || currentSipCallId) {
-            event.preventDefault();
             if (isAutoDialing()) {
                 await window.ligflowSkipCurrentCampaignCall({ playSound: true });
             } else {
                 await window.ligflowStopWebphoneCall({ playSound: true });
             }
+            return;
         }
+        if (blockManualCallDuringAutoDialing()) return;
+        await placeCall(input?.value || '');
     });
 
     const autoCallPhone = root.getAttribute('data-auto-call-phone');

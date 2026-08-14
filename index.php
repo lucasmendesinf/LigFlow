@@ -357,7 +357,6 @@ function migrate(PDO $pdo): void
             provider TEXT DEFAULT 'Nvoip',
             external_call_id TEXT,
             provider_call_id TEXT,
-            provider_consultant_channel_id TEXT,
             origin_number TEXT,
             destination_number TEXT,
             status TEXT DEFAULT 'queued',
@@ -771,7 +770,6 @@ function migrate(PDO $pdo): void
     ensure_column($pdo, 'calls', 'provider_channel_id', 'TEXT');
     ensure_column($pdo, 'calls', 'provider_linked_id', 'TEXT');
     ensure_column($pdo, 'calls', 'provider_bridge_id', 'TEXT');
-    ensure_column($pdo, 'calls', 'provider_consultant_channel_id', 'TEXT');
     ensure_column($pdo, 'calls', 'event_origin', 'TEXT');
     ensure_column($pdo, 'calls', 'last_event_at', 'TEXT');
     ensure_column($pdo, 'calls', 'connected_at', 'TEXT');
@@ -2248,49 +2246,20 @@ function valid_asterisk_webrtc_wss_url(string $url): bool
     if ($scheme === 'wss') return true;
     return $scheme === 'ws' && in_array($host, ['localhost', '127.0.0.1', '::1'], true);
 }
-function asterisk_url_uses_loopback(string $url): bool
-{
-    $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
-    return in_array($host, ['localhost', '127.0.0.1', '::1'], true);
-}
-function asterisk_effective_ari_urls(array $row): array
-{
-    $ariUrl = rtrim(trim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL'))), '/');
-    $ariWsUrl = trim((string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')));
-    $environment = strtolower((string)($row['environment'] ?? 'test'));
-    $sipDomain = strtolower(trim((string)($row['sip_domain'] ?? '')));
-    if ($environment === 'production' && $sipDomain === 'telefonia.calutec.com.br') {
-        if (asterisk_url_uses_loopback($ariUrl)) $ariUrl = 'https://telefonia.calutec.com.br/ari';
-        if (asterisk_url_uses_loopback($ariWsUrl)) $ariWsUrl = 'wss://telefonia.calutec.com.br/ari/events';
-    }
-    return [$ariUrl, $ariWsUrl];
-}
 function asterisk_config(): array
 {
     $row = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
-    [$ariUrl, $ariWsUrl] = asterisk_effective_ari_urls($row);
     $route = strtoupper((string)($row['active_route'] ?? 'NVOIP_TRUNK'));
     if (!in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) $route = 'NVOIP_TRUNK';
     $nvoipTrunk = trim((string)($row['nvoip_trunk'] ?? 'nvoip'));
     if ($nvoipTrunk === '' || strtoupper($nvoipTrunk) === 'NVOIP_TRUNK') $nvoipTrunk = 'nvoip';
-    $nvoipTrunkConfig = json_decode((string)($row['nvoip_trunk_config_json'] ?? '{}'), true);
-    if (!is_array($nvoipTrunkConfig)) $nvoipTrunkConfig = [];
-    $nvoipCallerId = nvoip_phone_digits((string)($nvoipTrunkConfig['caller_id'] ?? ''));
     return [
         'enabled' => (int)($row['enabled'] ?? 0) === 1,
         'environment' => (string)($row['environment'] ?? 'test'),
         'active_mode' => strtoupper((string)($row['active_mode'] ?? 'NVOIP_DIRECT')),
         'active_route' => $route,
-        'config_version' => substr(hash('sha256', implode('|', [
-            (string)($row['updated_at'] ?? ''),
-            (string)($row['enabled'] ?? 0),
-            (string)($row['active_mode'] ?? 'NVOIP_DIRECT'),
-            $route,
-            $ariUrl,
-            $ariWsUrl,
-        ])), 0, 16),
-        'ari_url' => $ariUrl,
-        'ari_ws_url' => $ariWsUrl,
+        'ari_url' => rtrim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL')), '/'),
+        'ari_ws_url' => (string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')),
         'ari_username' => (string)($row['ari_username'] ?? env_value('ASTERISK_ARI_USERNAME')),
         'ari_password' => !empty($row['ari_password_encrypted']) ? decrypt_secret((string)$row['ari_password_encrypted']) : env_value('ASTERISK_ARI_PASSWORD'),
         'stasis_app' => trim((string)($row['stasis_app'] ?? 'ligflow')) ?: 'ligflow',
@@ -2304,7 +2273,6 @@ function asterisk_config(): array
         'webrtc_password' => !empty($row['webrtc_password_encrypted']) ? decrypt_secret((string)$row['webrtc_password_encrypted']) : '',
         'webrtc_context' => trim((string)($row['webrtc_context'] ?? '')),
         'nvoip_trunk' => $nvoipTrunk,
-        'nvoip_caller_id' => $nvoipCallerId,
         'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'directcall')) ?: 'directcall',
         'extension_start' => (int)($row['extension_start'] ?? 1000),
         'extension_end' => (int)($row['extension_end'] ?? 9999),
@@ -2329,8 +2297,7 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
         CURLOPT_USERPWD => $config['ari_username'] . ':' . $config['ari_password'],
         CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
         CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json'],
-        CURLOPT_CONNECTTIMEOUT => 3,
-        CURLOPT_TIMEOUT => 8,
+        CURLOPT_TIMEOUT => max(5, (int)$config['originate_timeout_seconds']),
     ]);
     if ($payload !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE));
     $body = curl_exec($ch);
@@ -2339,10 +2306,7 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
     curl_close($ch);
     $decoded = json_decode((string)$body, true);
     if ($body === false || $status < 200 || $status >= 300) {
-        $message = trim((string)($decoded['message'] ?? ''));
-        if ($message === '') $message = trim($error);
-        if ($message === '' && $status > 0) $message = 'HTTP ' . $status;
-        if ($message === '') $message = 'Falha na requisicao ARI.';
+        $message = (string)($decoded['message'] ?? $error ?: 'Falha na requisicao ARI.');
         throw new RuntimeException('ARI: ' . $message);
     }
     return is_array($decoded) ? $decoded : [];
@@ -2381,21 +2345,6 @@ final class AsteriskProvider implements TelephonyProvider
         if (!preg_match('/^[A-Za-z0-9_.-]+$/', $endpoint)) throw new RuntimeException('Endpoint Asterisk invalido.');
         return $endpoint;
     }
-    private function outboundEndpoint(string $destination): string
-    {
-        $trunk = $this->safeEndpoint($this->routeTrunk());
-        return $this->trunk() === 'NVOIP_TRUNK'
-            ? 'PJSIP/' . $destination . '@' . $trunk
-            : 'PJSIP/' . $trunk . '/' . $destination;
-    }
-    private function outboundCallerId(array $campaign): string
-    {
-        if ($this->trunk() === 'NVOIP_TRUNK') {
-            // The registered Nvoip endpoint owns its authorized caller identity.
-            return '';
-        }
-        return nvoip_phone_digits((string)($campaign['caller_id'] ?? ''));
-    }
     public function createBridge(string $bridgeId): array
     {
         return asterisk_ari_request($this->config, 'POST', '/bridges/' . rawurlencode($bridgeId), ['type' => 'mixing', 'name' => 'LigFlow ' . $bridgeId]);
@@ -2422,34 +2371,25 @@ final class AsteriskProvider implements TelephonyProvider
             'timeout' => $this->config['bridge_timeout_seconds'],
         ]);
     }
-    private function consultantEndpoint(array $agent): string
-    {
-        if (!asterisk_uses_local_ari($this->config) && !empty($agent['company_id']) && !empty($agent['id'])) {
-            $extension = asterisk_user_extension_record((int)$agent['company_id'], (int)$agent['id']);
-            if (asterisk_user_extension_ready($extension)) return (string)$extension['extension'];
-        }
-        return preg_replace('/^PJSIP\//i', '', (string)($this->config['consultant_endpoint'] ?? '')) ?: '';
-    }
     public function originate(array $campaign, array $contact, array $agent): array
     {
         if (!$this->config['enabled']) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)$contact['phone_e164']);
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
+        $trunk = $this->safeEndpoint($this->routeTrunk());
         $externalId = 'ARI-' . bin2hex(random_bytes(12));
         $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
         try {
             $this->createBridge($bridgeId);
-            $payload = [
+            $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
                 'channelId' => $externalId,
-                'endpoint' => $this->outboundEndpoint($destination),
+                'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
                 'app' => $this->config['stasis_app'],
                 'appArgs' => 'ligflow,' . $externalId,
+                'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
                 'timeout' => $this->config['originate_timeout_seconds'],
                 'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
-            ];
-            $callerId = $this->outboundCallerId($campaign);
-            if ($callerId !== '') $payload['callerId'] = $callerId;
-            $channel = asterisk_ari_request($this->config, 'POST', '/channels', $payload);
+            ]);
             return [
                 'ok' => true,
                 'provider' => 'Asterisk ARI',
@@ -2473,17 +2413,16 @@ final class AsteriskProvider implements TelephonyProvider
         if (empty($this->config['enabled'])) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)($contact['phone_e164'] ?? ''));
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $payload = [
+        $trunk = $this->safeEndpoint($this->routeTrunk());
+        $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
             'channelId' => $externalId,
-            'endpoint' => $this->outboundEndpoint($destination),
+            'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
             'app' => $this->config['stasis_app'],
             'appArgs' => 'ligflow,' . $externalId,
+            'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
             'timeout' => $this->config['originate_timeout_seconds'],
             'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
-        ];
-        $callerId = $this->outboundCallerId($campaign);
-        if ($callerId !== '') $payload['callerId'] = $callerId;
-        $channel = asterisk_ari_request($this->config, 'POST', '/channels', $payload);
+        ]);
         return [
             'provider' => 'Asterisk ARI',
             'external_call_id' => $externalId,
@@ -2502,7 +2441,8 @@ final class AsteriskProvider implements TelephonyProvider
         try {
             $this->createBridge($bridgeId);
             $this->addChannelToBridge($bridgeId, $channelId);
-            $consultant = $this->connectConsultant($bridgeId, $this->consultantEndpoint($agent));
+            $consultantEndpoint = preg_replace('/^PJSIP\//i', '', (string)($this->config['consultant_endpoint'] ?? ''));
+            $consultant = $this->connectConsultant($bridgeId, (string)$consultantEndpoint);
             return ['bridge_id' => $bridgeId, 'consultant_channel_id' => (string)($consultant['id'] ?? '')];
         } catch (Throwable $e) {
             try { $this->destroyBridge($bridgeId); } catch (Throwable) { }
@@ -2510,23 +2450,11 @@ final class AsteriskProvider implements TelephonyProvider
         }
     }
 
-    public function connectSingleCall(array $call, array $agent): array
-    {
-        $channelId = (string)($call['provider_channel_id'] ?? '');
-        $bridgeId = (string)($call['provider_bridge_id'] ?? '');
-        if ($channelId === '' || $bridgeId === '') throw new RuntimeException('Canal ou bridge Asterisk indisponivel para conectar o consultor.');
-        $this->addChannelToBridge($bridgeId, $channelId);
-        $consultant = $this->connectConsultant($bridgeId, $this->consultantEndpoint($agent));
-        return ['bridge_id' => $bridgeId, 'consultant_channel_id' => (string)($consultant['id'] ?? '')];
-    }
-
     public function hangup(array $call): void
     {
         $channelId = (string)($call['provider_channel_id'] ?? $call['provider_call_id'] ?? '');
-        $consultantChannelId = (string)($call['provider_consultant_channel_id'] ?? '');
-        if ($channelId !== '') { try { asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($channelId)); } catch (Throwable) { } }
-        if ($consultantChannelId !== '') { try { asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($consultantChannelId)); } catch (Throwable) { } }
-        if (!empty($call['provider_bridge_id'])) { try { $this->destroyBridge((string)$call['provider_bridge_id']); } catch (Throwable) { } }
+        if ($channelId !== '') asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($channelId));
+        if (!empty($call['provider_bridge_id'])) $this->destroyBridge((string)$call['provider_bridge_id']);
     }
     public function health(): array
     {
@@ -3777,28 +3705,8 @@ function handle_post(): void
         $nvoipTrunk = trim((string)post('nvoip_trunk', 'nvoip'));
         if ($nvoipTrunk === '' || strtoupper($nvoipTrunk) === 'NVOIP_TRUNK') $nvoipTrunk = 'nvoip';
         $directcallTrunk = trim((string)post('directcall_trunk'));
-        $nvoipTrunkConfig = json_decode(trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', true);
-        if (!is_array($nvoipTrunkConfig)) {
-            flash('A configuracao operacional Nvoip deve ser um JSON valido.', 'error'); redirect('?page=settings#asterisk');
-        }
-        $nvoipCallerId = nvoip_phone_digits((string)post('nvoip_caller_id'));
-        if ($nvoipCallerId !== '' && (strlen($nvoipCallerId) < 10 || strlen($nvoipCallerId) > 15)) {
-            flash('O Caller ID global da Nvoip deve conter entre 10 e 15 digitos.', 'error'); redirect('?page=settings#asterisk');
-        }
-        if ($nvoipCallerId === '') {
-            unset($nvoipTrunkConfig['caller_id']);
-        } else {
-            $nvoipTrunkConfig['caller_id'] = $nvoipCallerId;
-        }
-        $nvoipTrunkConfigJson = json_encode($nvoipTrunkConfig, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if ($nvoipTrunkConfigJson === false) {
-            flash('Nao foi possivel salvar a configuracao operacional Nvoip.', 'error'); redirect('?page=settings#asterisk');
-        }
         if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true) || !in_array($environment, ['test', 'production'], true)) {
             flash('Modo, rota ou ambiente Asterisk invalido.', 'error'); redirect('?page=settings#asterisk');
-        }
-        if ($environment === 'production' && (asterisk_url_uses_loopback($ariUrl) || asterisk_url_uses_loopback($ariWsUrl))) {
-            flash('Em producao, informe as URLs publicas do ARI e do WebSocket ARI. Enderecos 127.0.0.1/localhost apontam para o servidor do LigFlow.', 'error'); redirect('?page=settings#asterisk');
         }
         if (!valid_asterisk_trunk_identifier($nvoipTrunk) || $directcallTrunk === '' || !valid_asterisk_trunk_identifier($directcallTrunk) || ($webrtcContext !== '' && !valid_asterisk_trunk_identifier($webrtcContext))) {
             flash('Contexto WebRTC ou tronco Asterisk invalido. Use apenas letras, numeros, hifen e underscore.', 'error'); redirect('?page=settings#asterisk');
@@ -3829,8 +3737,8 @@ function handle_post(): void
         db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, extension_start, extension_end, provisioning_agent_url, provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds, updated_by, updated_at)
             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, extension_start=excluded.extension_start, extension_end=excluded.extension_end, provisioning_agent_url=excluded.provisioning_agent_url, provisioning_agent_secret_encrypted=excluded.provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds=excluded.provisioning_agent_timeout_seconds, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
-            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, $nvoipTrunk, $directcallTrunk, $nvoipTrunkConfigJson, trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
-        audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? ''), 'nvoip_caller_id_configured' => $nvoipCallerId !== '']);
+            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, $nvoipTrunk, $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
+        audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? '')]);
         flash('Configuracao Asterisk salva. O modo atual para novas chamadas e ' . $mode . '.');
         redirect('?page=settings#asterisk');
     }
@@ -6195,12 +6103,6 @@ function campaign_uses_asterisk_parallelism(array $campaign, int $companyId): bo
         && ($config['active_mode'] ?? '') === 'ASTERISK'
         && campaign_requested_parallelism($campaign) > 1;
 }
-
-function campaign_uses_asterisk_outbound(array $campaign, int $companyId): bool
-{
-    $config = asterisk_config();
-    return !empty($config['enabled']) && ($config['active_mode'] ?? '') === 'ASTERISK';
-}
 function active_dial_batch(int $agentId, int $companyId): ?array
 {
     return one("SELECT * FROM dial_batches WHERE company_id = ? AND agent_id = ? AND status IN ('ORIGINATING','RINGING','WINNER','CONNECTED') ORDER BY id DESC LIMIT 1", [$companyId, $agentId]) ?: null;
@@ -6209,7 +6111,7 @@ function active_dial_batch(int $agentId, int $companyId): ?array
 function agent_parallel_batch_state(int $agentId, int $companyId): ?array
 {
     $batch = active_dial_batch($agentId, $companyId);
-    if (!$batch || (int)($batch['effective_parallelism'] ?? 1) <= 1) return null;
+    if (!$batch || (int)($batch['requested_parallelism'] ?? 1) <= 1) return null;
     $counts = one("SELECT
             COUNT(*) originated_count,
             COALESCE(SUM(CASE WHEN finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected') THEN 1 ELSE 0 END), 0) active_count,
@@ -6303,7 +6205,7 @@ function reserve_parallel_contacts(array $campaign, int $agentId, int $companyId
             if ($guard->rowCount() !== 1) continue;
             $externalId = 'ARI-' . bin2hex(random_bytes(12));
             $pdo->prepare("INSERT INTO calls (company_id,campaign_id,contact_id,agent_id,provider,external_call_id,provider_call_id,destination_number,status,provider_status_raw,internal_status,attempt_number,billing_rate_micros,telephony_period_id,telephony_mode,telephony_trunk,provider_channel_id,dial_batch_id,race_outcome,started_at,ringing_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))")
-                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATE_PENDING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), $telephonyPeriodId, 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
+                ->execute([$companyId, (int)$campaign['id'], (int)$contact['id'], $agentId, 'Asterisk ARI', $externalId, $externalId, (string)$contact['phone_e164'], 'in_progress', 'ARI_ORIGINATING', 'iniciada', max(1, (int)$contact['attempts'] + 1), call_plan_rate_micros($companyId), $telephonyPeriodId, 'ASTERISK', $trunk, $externalId, $batchId, 'PENDING']);
             $contact['call_id'] = (int)$pdo->lastInsertId();
             $contact['external_call_id'] = $externalId;
             $reserved[] = $contact;
@@ -6368,57 +6270,31 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit, (int)$allowed['state']['period_id']);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
     if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
+    $agent = one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$agentId, $companyId]) ?: [];
+    $provider = telephony_provider_for_company($companyId);
+    if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para este lote.');
+    $originatedCount = 0;
+    foreach ($batch['contacts'] as $contact) {
+        try {
+            $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$contact['external_call_id']);
+            db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND dial_batch_id=?")
+                ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$contact['call_id'], (int)$batch['id']]);
+            $originatedCount++;
+        } catch (Throwable $e) {
+            db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND dial_batch_id=? AND finalized_at IS NULL")
+                ->execute([$e->getMessage(), (int)$contact['call_id'], (int)$batch['id']]);
+            db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=?")->execute([(int)$contact['id']]);
+        }
+    }
+    asterisk_continue_batch_if_exhausted((int)$batch['id']);
+    if ($originatedCount === 0) {
+        flash('Nenhuma chamada foi iniciada. Atendimento automatico encerrado.', 'error');
+        return false;
+    }
     db()->prepare("UPDATE users SET status='Discando automatico' WHERE id=? AND company_id=?")->execute([$agentId, $companyId]);
     audit('iniciou_lote_asterisk', 'dial_batches:' . (int)$batch['id'], null, ['parallelism' => $limit]);
-    flash('Lote Asterisk preparado com ' . count($batch['contacts']) . ' chamadas.');
+    flash('Lote Asterisk iniciado com ' . $originatedCount . ' chamadas.');
     return true;
-}
-
-function asterisk_process_pending_originations(int $limit = 10): int
-{
-    $pending = rows("SELECT ca.* FROM calls ca
-        JOIN dial_batches b ON b.id = ca.dial_batch_id AND b.company_id = ca.company_id
-        WHERE ca.telephony_mode = 'ASTERISK'
-          AND ca.finalized_at IS NULL
-          AND b.status IN ('ORIGINATING','RINGING')
-          AND (ca.provider_status_raw = 'ARI_ORIGINATE_PENDING'
-               OR (ca.provider_status_raw = 'ARI_ORIGINATE_CLAIMED' AND ca.last_event_at < datetime('now','-60 seconds')))
-        ORDER BY ca.id ASC LIMIT " . max(1, min(10, $limit)));
-    if (!$pending) return 0;
-
-    $processed = 0;
-    $batchIds = [];
-    foreach ($pending as $call) {
-        $claim = db()->prepare("UPDATE calls SET provider_status_raw='ARI_ORIGINATE_CLAIMED', last_event_at=datetime('now')
-            WHERE id=? AND finalized_at IS NULL
-              AND (provider_status_raw='ARI_ORIGINATE_PENDING'
-                   OR (provider_status_raw='ARI_ORIGINATE_CLAIMED' AND last_event_at < datetime('now','-60 seconds')))" );
-        $claim->execute([(int)$call['id']]);
-        if ($claim->rowCount() !== 1) continue;
-
-        $batchIds[(int)$call['dial_batch_id']] = true;
-        try {
-            $campaign = one('SELECT * FROM campaigns WHERE id=? AND company_id=?', [(int)$call['campaign_id'], (int)$call['company_id']]);
-            $contact = one('SELECT * FROM contacts WHERE id=? AND company_id=?', [(int)$call['contact_id'], (int)$call['company_id']]);
-            $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
-            if (!$campaign || !$contact) throw new RuntimeException('Campanha ou contato indisponivel para originacao Asterisk.');
-
-            $config = asterisk_config();
-            $config['active_route'] = (string)$call['telephony_trunk'];
-            $provider = new AsteriskProvider($config);
-            $originated = $provider->originateParallel($campaign, $contact, $agent, (string)$call['external_call_id']);
-            db()->prepare("UPDATE calls SET provider_channel_id=?, provider_linked_id=?, provider_status_raw='ARI_ORIGINATING', last_event_at=datetime('now') WHERE id=? AND provider_status_raw='ARI_ORIGINATE_CLAIMED'")
-                ->execute([(string)$originated['provider_channel_id'], (string)$originated['provider_linked_id'], (int)$call['id']]);
-        } catch (Throwable $e) {
-            db()->prepare("UPDATE calls SET status='failed', internal_status='falha', provider_status_raw='ARI_ORIGINATE_FAILED', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), race_outcome='ORIGINATE_FAILED' WHERE id=? AND finalized_at IS NULL")
-                ->execute([$e->getMessage(), (int)$call['id']]);
-            db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
-                ->execute([(int)$call['contact_id'], (int)$call['company_id']]);
-        }
-        $processed++;
-    }
-    foreach (array_keys($batchIds) as $batchId) asterisk_continue_batch_if_exhausted((int)$batchId);
-    return $processed;
 }
 
 function asterisk_batch_answered(int $callId): void
@@ -6465,52 +6341,18 @@ function asterisk_batch_answered(int $callId): void
     } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
 }
 
-function asterisk_single_call_answered(int $callId): void
-{
-    $claim = db()->prepare("UPDATE calls SET internal_status='conectando_consultor' WHERE id=? AND telephony_mode='ASTERISK' AND dial_batch_id IS NULL AND connected_at IS NULL AND internal_status='atendida'");
-    $claim->execute([$callId]);
-    if ($claim->rowCount() !== 1) return;
-    $call = one('SELECT * FROM calls WHERE id=?', [$callId]);
-    if (!$call) return;
-    try {
-        $provider = telephony_provider_for_company((int)$call['company_id']);
-        if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para conectar o consultor.');
-        $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
-        $bridge = $provider->connectSingleCall($call, $agent);
-        db()->prepare("UPDATE calls SET provider_consultant_channel_id=?, status='connected', internal_status='conectada', connected_at=COALESCE(connected_at,datetime('now')) WHERE id=?")
-            ->execute([(string)$bridge['consultant_channel_id'], $callId]);
-    } catch (Throwable $e) {
-        db()->prepare("UPDATE calls SET internal_status='atendida', error_message=? WHERE id=? AND connected_at IS NULL")
-            ->execute([$e->getMessage(), $callId]);
-        error_log('Falha ao conectar consultor na chamada Asterisk ' . $callId . ': ' . $e->getMessage());
-    }
-}
-
-function asterisk_continue_batch_if_exhausted(int $batchId): bool
+function asterisk_continue_batch_if_exhausted(int $batchId): void
 {
     $batch = one('SELECT * FROM dial_batches WHERE id=?', [$batchId]);
-    if (!$batch || !empty($batch['winner_call_id']) || !in_array((string)$batch['status'], ['ORIGINATING', 'RINGING'], true)) return false;
+    if (!$batch || !empty($batch['winner_call_id'])) return;
     $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
-    if ($live > 0) return false;
-    $originated = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND provider_status_raw <> 'ARI_ORIGINATE_FAILED'", [$batchId]);
-    $claim = db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL AND status IN ('ORIGINATING','RINGING')");
-    $claim->execute([$batchId]);
-    if ($claim->rowCount() !== 1) return false;
+    if ($live > 0) return;
+    db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL")
+        ->execute([$batchId]);
     db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id=?) AND status IN ('reservado','em_ligacao')")
         ->execute([$batchId]);
-    if ($originated === 0) {
-        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
-            ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
-        return false;
-    }
-    $agent = one('SELECT status FROM users WHERE id=? AND company_id=?', [(int)$batch['agent_id'], (int)$batch['company_id']]);
-    $campaign = one('SELECT * FROM campaigns WHERE id=? AND company_id=? AND status="Ativa"', [(int)$batch['campaign_id'], (int)$batch['company_id']]);
-    if ($agent && (string)$agent['status'] === 'Discando automatico' && $campaign) {
-        if (start_asterisk_parallel_batch($campaign, (int)$batch['agent_id'], (int)$batch['company_id'])) return true;
-    }
     db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
         ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
-    return false;
 }
 
 function cancel_active_asterisk_batch(int $agentId, int $companyId): void
@@ -6547,7 +6389,7 @@ function start_next_progressive_call(int $campaignId, int $agentId, int $company
         flash('Campanha indisponivel.', 'error');
         return false;
     }
-    if (campaign_uses_asterisk_outbound($campaign, $companyId)) {
+    if (campaign_uses_asterisk_parallelism($campaign, $companyId)) {
         return start_asterisk_parallel_batch($campaign, $agentId, $companyId);
     }
     if (get_live_call($agentId, $companyId)) {
@@ -7255,7 +7097,6 @@ function handle_sip_config(): never
             'sipPassword' => $sipPassword,
             'provider' => 'ASTERISK',
             'providerLabel' => 'Asterisk WebRTC',
-            'configVersion' => $asterisk['config_version'],
             'autoAnswer' => false,
             'callbackTimeoutSeconds' => max(10, (int)$asterisk['originate_timeout_seconds']),
             'secureContext' => is_secure_or_local_request(),
@@ -7268,16 +7109,12 @@ function handle_sip_config(): never
     $sipPassword = (string)$config['sip_password'];
     audit('consultou_config_sip', 'users:' . $user['id'], null, ['has_sip_user' => $sipUsername !== '', 'has_sip_password' => $sipPassword !== '']);
     header('Content-Type: application/json; charset=utf-8');
-    header('Cache-Control: no-store, private');
     echo json_encode([
         'ok' => true,
         'wssUrl' => $config['sip_wss_url'] ?: 'wss://app.nvoip.com.br:7443',
         'domain' => $config['sip_domain'] ?: 'app.nvoip.com.br',
         'sipUsername' => $sipUsername,
         'sipPassword' => $sipPassword,
-        'provider' => 'NVOIP_DIRECT',
-        'providerLabel' => 'Nvoip',
-        'configVersion' => $asterisk['config_version'],
         'autoAnswer' => (int)$config['auto_answer_nvoip_callback'] === 1,
         'callbackTimeoutSeconds' => max(10, (int)$config['sip_callback_timeout_seconds']),
         'secureContext' => is_secure_or_local_request(),
@@ -7946,10 +7783,7 @@ function asterisk_handle_event(array $event): void
         $pdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, ?, ?, ?)")
             ->execute([(int)$call['company_id'], (int)$call['id'], 'asterisk.' . strtolower($eventType), (string)$call['status'], $status, json_encode_safe($event)]);
         $pdo->commit();
-        if ($internal === 'atendida') {
-            if (!empty($call['dial_batch_id'])) asterisk_batch_answered((int)$call['id']);
-            else asterisk_single_call_answered((int)$call['id']);
-        }
+        if ($internal === 'atendida' && !empty($call['dial_batch_id'])) asterisk_batch_answered((int)$call['id']);
         if ($isFinal) {
             $updated = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)$call['id'], (int)$call['company_id']]);
             if ($updated) {
@@ -7961,13 +7795,6 @@ function asterisk_handle_event(array $event): void
                 db()->prepare("UPDATE calls SET duration_seconds = ?, billable_seconds = ?, estimated_cost_micros = ?, confirmed_cost = ? WHERE id = ? AND finalized_at IS NOT NULL")
                     ->execute([$duration, $billable, (int)$billing['cost_micros'], (int)$billing['cost_micros'] / 1000000, (int)$updated['id']]);
                 telephony_record_call_debit($updated, $billing, (int)$updated['agent_id']);
-                if (empty($updated['dial_batch_id'])) {
-                    db()->prepare("UPDATE contacts SET status=?, reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
-                        ->execute([$answered ? 'pos_atendimento' : 'concluido', (int)$updated['contact_id'], (int)$updated['company_id']]);
-                    db()->prepare('UPDATE users SET status=? WHERE id=? AND company_id=?')
-                        ->execute([$answered ? 'Pos-atendimento' : 'Disponivel', (int)$updated['agent_id'], (int)$updated['company_id']]);
-                    try { telephony_provider_for_company((int)$updated['company_id'])->hangup($updated); } catch (Throwable) { }
-                }
             }
         }
         if ($isFinal && !empty($call['dial_batch_id'])) asterisk_continue_batch_if_exhausted((int)$call['dial_batch_id']);
@@ -8024,12 +7851,6 @@ final class AsteriskAriWebSocket
         if ($opcode !== 1 || $payload === '') return null;
         $event = json_decode($payload, true);
         return is_array($event) ? $event : null;
-    }
-    public function timedOut(): bool
-    {
-        if (!is_resource($this->socket)) return false;
-        $meta = stream_get_meta_data($this->socket);
-        return !empty($meta['timed_out']);
     }
     public function close(): void { if (is_resource($this->socket)) fclose($this->socket); $this->socket = null; }
 }
@@ -8296,7 +8117,7 @@ function layout(string $page, callable $content): void
 <script src="assets/app.js?v=<?= (int)(@filemtime(__DIR__ . '/assets/app.js') ?: 1) ?>"></script>
 <?php if ($user && can('agent')): ?>
 <script src="assets/vendor/jssip.min.js"></script>
-<script src="assets/nvoip-webphone.js?v=<?= h(substr((string)(@hash_file('sha256', __DIR__ . '/assets/nvoip-webphone.js') ?: '1'), 0, 16)) ?>"></script>
+<script src="assets/nvoip-webphone.js?v=<?= (int)(@filemtime(__DIR__ . '/assets/nvoip-webphone.js') ?: 1) ?>"></script>
 <?php endif; ?>
 </body>
 </html>
@@ -8385,16 +8206,14 @@ function render_floating_webphone_panel(): void
     $recentMissed = $recentHistory['perdidas'];
     $phoneContacts = rows("SELECT name, phone_e164, product, status FROM contacts WHERE company_id = ? AND status <> 'excluido' ORDER BY last_call_at DESC, id DESC LIMIT 8", [(int)$user['company_id']]);
     ?>
-    <?php $floatingAsterisk = asterisk_config(); ?>
-    <section class="webphone-panel" data-sip-floating data-outbound-via-ari="<?= !empty($floatingAsterisk['enabled']) && ($floatingAsterisk['active_mode'] ?? '') === 'ASTERISK' ? '1' : '0' ?>">
+    <section class="webphone-panel" data-sip-floating>
         <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
         <article class="webphone is-hidden" data-webphone>
             <header>
                 <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong>Webfone manual</strong></div>
                 <button type="button" class="icon-button" data-webphone-close aria-label="Fechar webfone">x</button>
             </header>
-            <form class="webphone-form" method="post" data-floating-webphone-form>
-                <input type="hidden" name="action" value="manual_call">
+            <form class="webphone-form" data-floating-webphone-form>
                 <button type="button" class="phone-backspace" data-clear-phone aria-label="Limpar numero">&#9003;</button>
                 <input type="hidden" name="campaign_id" value="<?= (int)$campaignId ?>">
                 <input name="manual_phone" class="dial-display" placeholder="Pesquisar ou digitar numero" inputmode="tel" autocomplete="off" data-phone-search-input>
@@ -9936,33 +9755,18 @@ function render_agent(): void
             FROM calls c
             WHERE {$agentStatsClause} AND c.created_at >= ? AND c.created_at < ?",
             array_merge($agentStatsParams, [$todayStartUtc, $todayEndUtc])) ?: [];
-        $remainingLeads = 0;
-        if ($campaign && !empty($campaign['company_id']) && !empty($campaign['list_id'])) {
-            $remainingLeads = (int)(one("SELECT COUNT(*) v
-                FROM contacts
-                WHERE company_id = ?
-                  AND list_id = ?
-                  AND status <> 'excluido'
-                  AND COALESCE(attempts, 0) = 0
-                  AND last_call_at IS NULL", [(int)$campaign['company_id'], (int)$campaign['list_id']])['v'] ?? 0);
-        }
         $agentCards = [
             'Chamadas hoje' => (int)($agentStats['chamadas_hoje'] ?? 0),
             'Minutos hoje' => number_format(((float)($agentStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
             'Gasto hoje' => money(((int)($agentStats['gasto_hoje_micros'] ?? 0)) / 1000000),
-            'Leads restantes' => $remainingLeads,
+            'Leads restantes' => (int)(one("SELECT COUNT(*) v FROM contacts c WHERE {$agentStatsClause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $agentStatsParams)['v'] ?? 0),
         ];
-        // The persisted Asterisk batch is the authoritative source for the aggregate UI.
-        // The user status can lag behind the worker while a new wave is being started.
-        $batchState = agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']);
-        if ($batchState) {
-            $isAutoDialing = true;
-        }
+        $batchState = $isAutoDialing ? agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']) : null;
         $activeBatch = $batchState['batch'] ?? null;
         if ($batchState && (int)$batchState['active_count'] === 0 && empty($batchState['winner_call_id'])) {
-            $continued = asterisk_continue_batch_if_exhausted((int)$batchState['batch_id']);
-            $batchState = $continued ? agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']) : null;
-            $activeBatch = $batchState['batch'] ?? null;
+            asterisk_continue_batch_if_exhausted((int)$batchState['batch_id']);
+            $batchState = null;
+            $activeBatch = null;
         }
         if ($activeBatch && !empty($activeBatch['winner_call_id'])) {
             $activeCall = one("SELECT * FROM calls WHERE id = ? AND agent_id = ? AND company_id = ? AND race_outcome = 'WINNER' LIMIT 1", [(int)$activeBatch['winner_call_id'], (int)$user['id'], (int)$user['company_id']]);
@@ -10286,19 +10090,14 @@ function render_agent(): void
                 </div>
             <?php endif; ?>
         </section>
-        <?php
-        $agentAsteriskConfig = asterisk_config();
-        $agentAsteriskOutbound = !empty($agentAsteriskConfig['enabled']) && ($agentAsteriskConfig['active_mode'] ?? '') === 'ASTERISK';
-        ?>
-        <section class="webphone-panel" data-sip-floating data-outbound-via-ari="<?= $agentAsteriskOutbound ? '1' : '0' ?>" data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= !$agentAsteriskOutbound && $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= !$agentAsteriskOutbound && $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
+        <section class="webphone-panel" data-sip-floating data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
             <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
             <article class="webphone is-hidden" data-webphone>
                 <header>
                     <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong><?= $isAutoDialing ? 'Discador automatico' : 'Webfone manual' ?></strong></div>
                     <button type="button" class="icon-button" data-webphone-close aria-label="Fechar webfone">x</button>
                 </header>
-                <form class="webphone-form" method="post" data-floating-webphone-form>
-                    <input type="hidden" name="action" value="manual_call">
+                <form class="webphone-form" data-floating-webphone-form>
                     <button type="button" class="phone-backspace" data-clear-phone aria-label="Limpar numero">&#9003;</button>
                     <input type="hidden" name="campaign_id" value="<?= $campaignId ?>">
                     <input name="manual_phone" class="dial-display" value="<?= h($isAutoDialing && $activeCall ? nvoip_phone_digits((string)$activeCall['destination_number']) : '') ?>" placeholder="Pesquisar ou digitar numero" inputmode="tel" autocomplete="off" data-phone-search-input>
@@ -11329,8 +11128,6 @@ function render_asterisk_settings_section(): void
                 <label>Dominio SIP/WebRTC<input name="sip_domain" value="<?= h($config['sip_domain']) ?>"></label>
                 <label>Tronco Nvoip<input name="nvoip_trunk" value="<?= h($config['nvoip_trunk']) ?>" readonly></label>
                 <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" pattern="[A-Za-z0-9_-]+"></label>
-                <label>Caller ID global Nvoip<input name="nvoip_caller_id" inputmode="numeric" value="<?= h($config['nvoip_caller_id']) ?>" placeholder="Numero virtual autorizado"></label>
-                <p class="hint">Aplicado a todos os usuarios somente quando a rota ativa for NVOIP_TRUNK.</p>
                 <label>Inicio da faixa de ramais<input name="extension_start" type="number" min="1" value="<?= (int)$config['extension_start'] ?>"></label>
                 <label>Fim da faixa de ramais<input name="extension_end" type="number" min="1" value="<?= (int)$config['extension_end'] ?>"></label>
                 <label>URL do agente de provisionamento<input name="provisioning_agent_url" type="url" value="<?= h($config['provisioning_agent_url']) ?>" placeholder="https://agente.exemplo/asterisk"></label>
@@ -11349,12 +11146,11 @@ function render_asterisk_settings_section(): void
 function render_sip_diagnostic_sections(): void
 {
     $config = nvoip_config((int)current_user()['company_id']);
-    $asteriskOutbound = asterisk_config();
     ?>
         <section>
             <details class="panel import-history-disclosure" id="diagnostico-sip" <?= isset($_GET['sip']) ? 'open' : '' ?>>
                 <summary><span>Diagnostico SIP/WebRTC e status do webphone</span><span class="import-history-chevron" aria-hidden="true"></span></summary>
-            <form class="form-grid import-history-content" method="post" data-sip-diagnostic data-outbound-via-ari="<?= !empty($asteriskOutbound['enabled']) && ($asteriskOutbound['active_mode'] ?? '') === 'ASTERISK' ? '1' : '0' ?>">
+            <form class="form-grid import-history-content" method="post" data-sip-diagnostic>
                 <input type="hidden" name="action" value="save_sip_diagnostic_config">
                 <h2>Diagnostico SIP/WebRTC Nvoip</h2>
                 <p class="hint wide">Use esta tela para provar o registro SIP no navegador. O discador e o webfone flutuante usam este mesmo caminho de chamada.</p>
