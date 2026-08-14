@@ -63,4 +63,9 @@ $assert((string)$db->query('SELECT status FROM contacts WHERE id=3')->fetchColum
 $tenantA = ['company' => 1, 'agent' => 7];
 $tenantB = ['company' => 2, 'agent' => 8];
 $assert($tenantA['company'] !== $tenantB['company'], 'batches remain tenant isolated');
+
+$source = file_get_contents(dirname(__DIR__) . '/index.php') ?: '';
+$assert(str_contains($source, "? 'PJSIP/' . \$destination . '@' . \$trunk"), 'Nvoip uses the registered PJSIP trunk dial string');
+$assert(str_contains($source, ": 'PJSIP/' . \$trunk . '/' . \$destination"), 'DirectCall keeps its established dial string');
+$assert(substr_count($source, "'endpoint' => \$this->outboundEndpoint(\$destination)") === 2, 'single and parallel calls share the route endpoint builder');
 echo "OK - {$tests} tests\n";

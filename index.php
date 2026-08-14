@@ -2348,6 +2348,13 @@ final class AsteriskProvider implements TelephonyProvider
         if (!preg_match('/^[A-Za-z0-9_.-]+$/', $endpoint)) throw new RuntimeException('Endpoint Asterisk invalido.');
         return $endpoint;
     }
+    private function outboundEndpoint(string $destination): string
+    {
+        $trunk = $this->safeEndpoint($this->routeTrunk());
+        return $this->trunk() === 'NVOIP_TRUNK'
+            ? 'PJSIP/' . $destination . '@' . $trunk
+            : 'PJSIP/' . $trunk . '/' . $destination;
+    }
     public function createBridge(string $bridgeId): array
     {
         return asterisk_ari_request($this->config, 'POST', '/bridges/' . rawurlencode($bridgeId), ['type' => 'mixing', 'name' => 'LigFlow ' . $bridgeId]);
@@ -2379,14 +2386,13 @@ final class AsteriskProvider implements TelephonyProvider
         if (!$this->config['enabled']) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)$contact['phone_e164']);
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $trunk = $this->safeEndpoint($this->routeTrunk());
         $externalId = 'ARI-' . bin2hex(random_bytes(12));
         $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
         try {
             $this->createBridge($bridgeId);
             $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
                 'channelId' => $externalId,
-                'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+                'endpoint' => $this->outboundEndpoint($destination),
                 'app' => $this->config['stasis_app'],
                 'appArgs' => 'ligflow,' . $externalId,
                 'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
@@ -2416,10 +2422,9 @@ final class AsteriskProvider implements TelephonyProvider
         if (empty($this->config['enabled'])) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)($contact['phone_e164'] ?? ''));
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $trunk = $this->safeEndpoint($this->routeTrunk());
         $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
             'channelId' => $externalId,
-            'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+            'endpoint' => $this->outboundEndpoint($destination),
             'app' => $this->config['stasis_app'],
             'appArgs' => 'ligflow,' . $externalId,
             'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
