@@ -18,10 +18,13 @@ $assert(str_contains($source, "campaign_requested_parallelism(\$campaign) > 1"),
 
 $assert(substr_count($source, 'name="action" value="manual_call"') >= 2, 'both floating webphones can submit manual calls to the backend');
 $assert(substr_count($source, 'data-outbound-via-ari=') >= 3, 'agent, floating and SIP diagnostic surfaces receive the global route marker');
-$assert(str_contains($javascript, "root.getAttribute('data-outbound-via-ari') === '1'"), 'the webphone reads the global Asterisk route marker');
 $assert(substr_count($javascript, "json.provider === 'ASTERISK' ? '1' : '0'") === 2, 'open agent and diagnostic screens refresh the global route marker');
 $assert(str_contains($javascript, "['action', 'manual_call']"), 'SIP test submits through the same backend manual call action');
 $assert(str_contains($javascript, 'form?.requestSubmit();'), 'manual webphone calls submit through the backend in Asterisk mode');
+$assert(substr_count($javascript, "loaded.provider === 'ASTERISK'") >= 1, 'floating manual calls resolve the active provider at click time');
+$assert(str_contains($javascript, "config.provider === 'ASTERISK'"), 'SIP diagnostics resolve the active provider at click time');
+$assert(str_contains($javascript, 'HTMLFormElement.prototype.submit.call(form);'), 'Asterisk manual calls bypass direct browser SIP origination');
+$assert(str_contains($source, "hash_file('sha256', __DIR__ . '/assets/nvoip-webphone.js')"), 'webphone asset uses content-based cache busting');
 
 $assert(str_contains($source, 'public function connectSingleCall'), 'answered manual Asterisk calls connect the consultant to their bridge');
 $assert(str_contains($source, 'else asterisk_single_call_answered((int)$call[\'id\']);'), 'ARI answer events connect non-batch calls');

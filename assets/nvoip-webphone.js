@@ -429,7 +429,7 @@ document.querySelectorAll('[data-sip-diagnostic]').forEach((root) => {
     root.querySelector('[data-sip-answer]')?.addEventListener('click', () => service.answer());
     root.querySelector('[data-sip-place-call]')?.addEventListener('click', async () => {
         const config = await loadConfig();
-        if (root.getAttribute('data-outbound-via-ari') === '1') {
+        if (config.provider === 'ASTERISK') {
             const outboundForm = document.createElement('form');
             outboundForm.method = 'post';
             [['action', 'manual_call'], ['campaign_id', '0'], ['manual_phone', root.querySelector('[data-sip-destination]')?.value || '']].forEach(([name, value]) => {
@@ -514,8 +514,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const isAutoDialing = () => root.getAttribute('data-auto-dialing') === '1';
-    const usesAsteriskOutbound = () => root.getAttribute('data-outbound-via-ari') === '1';
-
     const blockManualCallDuringAutoDialing = () => {
         if (!isAutoDialing()) return false;
         setText(callDetail, 'Ligacao manual bloqueada enquanto o atendimento automatico estiver ativo.');
@@ -1284,11 +1282,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         panel?.classList.remove('is-hidden');
         root.querySelector('[data-phone-tab="teclado"]')?.click();
-        if (usesAsteriskOutbound()) {
-            form?.requestSubmit();
-            return true;
-        }
-        await placeCall(cleanNumber);
+        form?.requestSubmit();
         return true;
     };
 
@@ -1296,7 +1290,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     refreshCallButtonReady();
 
     form?.addEventListener('submit', async (event) => {
-        if (usesAsteriskOutbound() && !service.session && !currentSipCallId) return;
         event.preventDefault();
         if (service.session || currentSipCallId) {
             if (isAutoDialing()) {
@@ -1307,24 +1300,30 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             return;
         }
         if (blockManualCallDuringAutoDialing()) return;
+        try {
+            const loaded = await loadConfig();
+            if (loaded.provider === 'ASTERISK') {
+                HTMLFormElement.prototype.submit.call(form);
+                return;
+            }
+        } catch (error) {
+            setText(callDetail, error.message);
+            return;
+        }
         await placeCall(input?.value || '');
     });
 
     root.querySelector('[data-phone-tab="recentes"]')?.addEventListener('click', refreshPhoneHistory);
 
     callButton?.addEventListener('click', async (event) => {
-        if (usesAsteriskOutbound() && !service.session && !currentSipCallId) return;
-        event.preventDefault();
         if (service.session || currentSipCallId) {
+            event.preventDefault();
             if (isAutoDialing()) {
                 await window.ligflowSkipCurrentCampaignCall({ playSound: true });
             } else {
                 await window.ligflowStopWebphoneCall({ playSound: true });
             }
-            return;
         }
-        if (blockManualCallDuringAutoDialing()) return;
-        await placeCall(input?.value || '');
     });
 
     const autoCallPhone = root.getAttribute('data-auto-call-phone');

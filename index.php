@@ -8296,7 +8296,7 @@ function layout(string $page, callable $content): void
 <script src="assets/app.js?v=<?= (int)(@filemtime(__DIR__ . '/assets/app.js') ?: 1) ?>"></script>
 <?php if ($user && can('agent')): ?>
 <script src="assets/vendor/jssip.min.js"></script>
-<script src="assets/nvoip-webphone.js?v=<?= (int)(@filemtime(__DIR__ . '/assets/nvoip-webphone.js') ?: 1) ?>"></script>
+<script src="assets/nvoip-webphone.js?v=<?= h(substr((string)(@hash_file('sha256', __DIR__ . '/assets/nvoip-webphone.js') ?: '1'), 0, 16)) ?>"></script>
 <?php endif; ?>
 </body>
 </html>
