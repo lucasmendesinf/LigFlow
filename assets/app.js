@@ -352,6 +352,38 @@ function tickTimers() {
 tickTimers();
 setInterval(tickTimers, 1000);
 
+const parallelBatchState = document.querySelector('[data-parallel-batch-state]');
+if (parallelBatchState) {
+    let batchPollingStopped = false;
+    const updateBatchCounter = (name, value) => {
+        document.querySelectorAll(`[data-batch-${name}]`).forEach((target) => {
+            target.textContent = String(Number(value || 0));
+        });
+    };
+    const pollParallelBatch = async () => {
+        if (batchPollingStopped) return;
+        try {
+            const response = await fetch('?page=agent_batch_state', { headers: { Accept: 'application/json' }, cache: 'no-store' });
+            const data = await response.json();
+            if (!response.ok || !data?.ok) throw new Error('Falha ao consultar lote.');
+            if (!data.active || !data.batch?.awaiting_winner || Number(data.batch?.winner_call_id || 0) > 0) {
+                batchPollingStopped = true;
+                window.location.reload();
+                return;
+            }
+            updateBatchCounter('active', data.batch.active_count);
+            updateBatchCounter('originated', data.batch.originated_count);
+            updateBatchCounter('ringing', data.batch.ringing_count);
+            updateBatchCounter('answered', data.batch.answered_count);
+            updateBatchCounter('finalized', data.batch.finalized_count);
+        } catch (error) {
+            // Keep the current aggregate state visible and retry without affecting the call.
+        }
+        window.setTimeout(pollParallelBatch, 2000);
+    };
+    window.setTimeout(pollParallelBatch, 1200);
+}
+
 document.querySelectorAll('[data-dialpad]').forEach((dialpad) => {
     const form = dialpad.closest('form');
     const input = form ? form.querySelector('.dial-display') : null;

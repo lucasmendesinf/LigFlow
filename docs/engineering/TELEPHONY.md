@@ -81,6 +81,27 @@ A implementação deve respeitar:
 - cobrança idempotente;
 - isolamento por tenant e consultor.
 
+### Experiência do consultor
+
+#### Discagem serial
+
+Com `simultaneous_calls = 1`, o discador mantém o comportamento visual tradicional e apresenta o contato individual em processamento. Esse fluxo não usa o estado agregado de lote.
+
+#### Discagem simultânea
+
+Com `simultaneous_calls > 1`, o fluxo visual é:
+
+```text
+Lista -> lote de N chamadas -> aguardando atendimento -> primeira atendida = WINNER -> perdedoras encerradas -> somente WINNER apresentada ao consultor
+```
+
+- durante a corrida, o consultor vê somente o estado agregado e os contadores do lote;
+- nomes e telefones das chamadas concorrentes não são exibidos na tela principal;
+- o Diagnóstico Asterisk continua sendo a área técnica para inspecionar individualmente as chamadas;
+- somente a chamada `WINNER` entra no fluxo normal de atendimento, cronômetro, anotações e resultado;
+- `LOSER` e `LATE_ANSWERED` não são apresentadas como chamada ativa;
+- a alteração é visual e não modifica eleição da vencedora, hangup, bridges ou regras de discagem paralela.
+
 ## Segurança
 
 - nunca usar senha ARI como senha WebRTC;

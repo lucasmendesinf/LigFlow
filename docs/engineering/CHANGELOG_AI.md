@@ -1,5 +1,11 @@
 # LigFlow Architecture Changelog
 
+## 14/08/2026
+
+- Adicionado estado visual agregado no Discador enquanto um lote Asterisk aguarda a primeira chamada atendida.
+- Exibidos contadores de chamadas solicitadas, originadas, ativas, chamando, atendidas e finalizadas sem revelar os contatos concorrentes.
+- Mantido o fluxo serial inalterado e limitada a interface normal de atendimento à chamada `WINNER`.
+
 ## 05/08/2026
 
 - Homologado WebRTC próprio com Asterisk.
