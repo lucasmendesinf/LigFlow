@@ -2253,6 +2253,9 @@ function asterisk_config(): array
     if (!in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) $route = 'NVOIP_TRUNK';
     $nvoipTrunk = trim((string)($row['nvoip_trunk'] ?? 'nvoip'));
     if ($nvoipTrunk === '' || strtoupper($nvoipTrunk) === 'NVOIP_TRUNK') $nvoipTrunk = 'nvoip';
+    $nvoipTrunkConfig = json_decode((string)($row['nvoip_trunk_config_json'] ?? '{}'), true);
+    if (!is_array($nvoipTrunkConfig)) $nvoipTrunkConfig = [];
+    $nvoipCallerId = nvoip_phone_digits((string)($nvoipTrunkConfig['caller_id'] ?? ''));
     return [
         'enabled' => (int)($row['enabled'] ?? 0) === 1,
         'environment' => (string)($row['environment'] ?? 'test'),
@@ -2279,6 +2282,7 @@ function asterisk_config(): array
         'webrtc_password' => !empty($row['webrtc_password_encrypted']) ? decrypt_secret((string)$row['webrtc_password_encrypted']) : '',
         'webrtc_context' => trim((string)($row['webrtc_context'] ?? '')),
         'nvoip_trunk' => $nvoipTrunk,
+        'nvoip_caller_id' => $nvoipCallerId,
         'directcall_trunk' => trim((string)($row['directcall_trunk'] ?? 'directcall')) ?: 'directcall',
         'extension_start' => (int)($row['extension_start'] ?? 1000),
         'extension_end' => (int)($row['extension_end'] ?? 9999),
@@ -2361,6 +2365,13 @@ final class AsteriskProvider implements TelephonyProvider
             ? 'PJSIP/' . $destination . '@' . $trunk
             : 'PJSIP/' . $trunk . '/' . $destination;
     }
+    private function outboundCallerId(array $campaign): string
+    {
+        if ($this->trunk() === 'NVOIP_TRUNK' && $this->config['nvoip_caller_id'] !== '') {
+            return $this->config['nvoip_caller_id'];
+        }
+        return nvoip_phone_digits((string)($campaign['caller_id'] ?? ''));
+    }
     public function createBridge(string $bridgeId): array
     {
         return asterisk_ari_request($this->config, 'POST', '/bridges/' . rawurlencode($bridgeId), ['type' => 'mixing', 'name' => 'LigFlow ' . $bridgeId]);
@@ -2401,7 +2412,7 @@ final class AsteriskProvider implements TelephonyProvider
                 'endpoint' => $this->outboundEndpoint($destination),
                 'app' => $this->config['stasis_app'],
                 'appArgs' => 'ligflow,' . $externalId,
-                'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
+                'callerId' => $this->outboundCallerId($campaign),
                 'timeout' => $this->config['originate_timeout_seconds'],
                 'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
             ]);
@@ -2433,7 +2444,7 @@ final class AsteriskProvider implements TelephonyProvider
             'endpoint' => $this->outboundEndpoint($destination),
             'app' => $this->config['stasis_app'],
             'appArgs' => 'ligflow,' . $externalId,
-            'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
+            'callerId' => $this->outboundCallerId($campaign),
             'timeout' => $this->config['originate_timeout_seconds'],
             'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
         ]);
@@ -3719,6 +3730,23 @@ function handle_post(): void
         $nvoipTrunk = trim((string)post('nvoip_trunk', 'nvoip'));
         if ($nvoipTrunk === '' || strtoupper($nvoipTrunk) === 'NVOIP_TRUNK') $nvoipTrunk = 'nvoip';
         $directcallTrunk = trim((string)post('directcall_trunk'));
+        $nvoipTrunkConfig = json_decode(trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', true);
+        if (!is_array($nvoipTrunkConfig)) {
+            flash('A configuracao operacional Nvoip deve ser um JSON valido.', 'error'); redirect('?page=settings#asterisk');
+        }
+        $nvoipCallerId = nvoip_phone_digits((string)post('nvoip_caller_id'));
+        if ($nvoipCallerId !== '' && (strlen($nvoipCallerId) < 10 || strlen($nvoipCallerId) > 15)) {
+            flash('O Caller ID global da Nvoip deve conter entre 10 e 15 digitos.', 'error'); redirect('?page=settings#asterisk');
+        }
+        if ($nvoipCallerId === '') {
+            unset($nvoipTrunkConfig['caller_id']);
+        } else {
+            $nvoipTrunkConfig['caller_id'] = $nvoipCallerId;
+        }
+        $nvoipTrunkConfigJson = json_encode($nvoipTrunkConfig, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if ($nvoipTrunkConfigJson === false) {
+            flash('Nao foi possivel salvar a configuracao operacional Nvoip.', 'error'); redirect('?page=settings#asterisk');
+        }
         if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true) || !in_array($environment, ['test', 'production'], true)) {
             flash('Modo, rota ou ambiente Asterisk invalido.', 'error'); redirect('?page=settings#asterisk');
         }
@@ -3751,8 +3779,8 @@ function handle_post(): void
         db()->prepare("INSERT INTO asterisk_settings (id, enabled, environment, active_mode, active_route, ari_url, ari_ws_url, ari_username, ari_password_encrypted, stasis_app, originate_timeout_seconds, bridge_timeout_seconds, reconnect_initial_seconds, reconnect_max_seconds, sip_wss_url, sip_domain, consultant_endpoint, webrtc_password_encrypted, webrtc_context, nvoip_trunk, directcall_trunk, nvoip_trunk_config_json, directcall_trunk_config_json, extension_start, extension_end, provisioning_agent_url, provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds, updated_by, updated_at)
             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, environment=excluded.environment, active_mode=excluded.active_mode, active_route=excluded.active_route, ari_url=excluded.ari_url, ari_ws_url=excluded.ari_ws_url, ari_username=excluded.ari_username, ari_password_encrypted=excluded.ari_password_encrypted, stasis_app=excluded.stasis_app, originate_timeout_seconds=excluded.originate_timeout_seconds, bridge_timeout_seconds=excluded.bridge_timeout_seconds, reconnect_initial_seconds=excluded.reconnect_initial_seconds, reconnect_max_seconds=excluded.reconnect_max_seconds, sip_wss_url=excluded.sip_wss_url, sip_domain=excluded.sip_domain, consultant_endpoint=excluded.consultant_endpoint, webrtc_password_encrypted=excluded.webrtc_password_encrypted, webrtc_context=excluded.webrtc_context, nvoip_trunk=excluded.nvoip_trunk, directcall_trunk=excluded.directcall_trunk, nvoip_trunk_config_json=excluded.nvoip_trunk_config_json, directcall_trunk_config_json=excluded.directcall_trunk_config_json, extension_start=excluded.extension_start, extension_end=excluded.extension_end, provisioning_agent_url=excluded.provisioning_agent_url, provisioning_agent_secret_encrypted=excluded.provisioning_agent_secret_encrypted, provisioning_agent_timeout_seconds=excluded.provisioning_agent_timeout_seconds, updated_by=excluded.updated_by, updated_at=excluded.updated_at")
-            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, $nvoipTrunk, $directcallTrunk, trim((string)post('nvoip_trunk_config_json', '{}')) ?: '{}', trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
-        audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? '')]);
+            ->execute([(int)post('enabled'), $environment, $mode, $route, $ariUrl, $ariWsUrl, trim((string)post('ari_username')), $ariPasswordEncrypted, trim((string)post('stasis_app', 'ligflow')) ?: 'ligflow', max(5, (int)post('originate_timeout_seconds', 30)), max(5, (int)post('bridge_timeout_seconds', 15)), max(1, (int)post('reconnect_initial_seconds', 2)), max(2, (int)post('reconnect_max_seconds', 30)), $sipWssUrl, $sipDomain, $consultantEndpoint, $webrtcPasswordEncrypted, $webrtcContext, $nvoipTrunk, $directcallTrunk, $nvoipTrunkConfigJson, trim((string)post('directcall_trunk_config_json', '{}')) ?: '{}', $extensionStart, $extensionEnd, $agentUrl, $agentSecretEncrypted, $agentTimeout, (int)$user['id']]);
+        audit('atualizou_asterisk', 'asterisk_settings:1', null, ['webrtc_password' => $webrtcPasswordChange, 'webrtc_context_changed' => $webrtcContext !== (string)($existing['webrtc_context'] ?? ''), 'nvoip_caller_id_configured' => $nvoipCallerId !== '']);
         flash('Configuracao Asterisk salva. O modo atual para novas chamadas e ' . $mode . '.');
         redirect('?page=settings#asterisk');
     }
@@ -11154,6 +11182,8 @@ function render_asterisk_settings_section(): void
                 <label>Dominio SIP/WebRTC<input name="sip_domain" value="<?= h($config['sip_domain']) ?>"></label>
                 <label>Tronco Nvoip<input name="nvoip_trunk" value="<?= h($config['nvoip_trunk']) ?>" readonly></label>
                 <label>Tronco DirectCall<input name="directcall_trunk" value="<?= h($config['directcall_trunk']) ?>" pattern="[A-Za-z0-9_-]+"></label>
+                <label>Caller ID global Nvoip<input name="nvoip_caller_id" inputmode="numeric" value="<?= h($config['nvoip_caller_id']) ?>" placeholder="Numero virtual autorizado"></label>
+                <p class="hint">Aplicado a todos os usuarios somente quando a rota ativa for NVOIP_TRUNK.</p>
                 <label>Inicio da faixa de ramais<input name="extension_start" type="number" min="1" value="<?= (int)$config['extension_start'] ?>"></label>
                 <label>Fim da faixa de ramais<input name="extension_end" type="number" min="1" value="<?= (int)$config['extension_end'] ?>"></label>
                 <label>URL do agente de provisionamento<input name="provisioning_agent_url" type="url" value="<?= h($config['provisioning_agent_url']) ?>" placeholder="https://agente.exemplo/asterisk"></label>
