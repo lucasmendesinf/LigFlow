@@ -2367,7 +2367,7 @@ final class AsteriskProvider implements TelephonyProvider
     }
     private function outboundCallerId(array $campaign): string
     {
-        if ($this->trunk() === 'NVOIP_TRUNK' && $this->config['nvoip_caller_id'] !== '') {
+        if ($this->trunk() === 'NVOIP_TRUNK') {
             return $this->config['nvoip_caller_id'];
         }
         return nvoip_phone_digits((string)($campaign['caller_id'] ?? ''));
@@ -2407,15 +2407,17 @@ final class AsteriskProvider implements TelephonyProvider
         $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
         try {
             $this->createBridge($bridgeId);
-            $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
+            $payload = [
                 'channelId' => $externalId,
                 'endpoint' => $this->outboundEndpoint($destination),
                 'app' => $this->config['stasis_app'],
                 'appArgs' => 'ligflow,' . $externalId,
-                'callerId' => $this->outboundCallerId($campaign),
                 'timeout' => $this->config['originate_timeout_seconds'],
                 'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
-            ]);
+            ];
+            $callerId = $this->outboundCallerId($campaign);
+            if ($callerId !== '') $payload['callerId'] = $callerId;
+            $channel = asterisk_ari_request($this->config, 'POST', '/channels', $payload);
             return [
                 'ok' => true,
                 'provider' => 'Asterisk ARI',
@@ -2439,15 +2441,17 @@ final class AsteriskProvider implements TelephonyProvider
         if (empty($this->config['enabled'])) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)($contact['phone_e164'] ?? ''));
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
+        $payload = [
             'channelId' => $externalId,
             'endpoint' => $this->outboundEndpoint($destination),
             'app' => $this->config['stasis_app'],
             'appArgs' => 'ligflow,' . $externalId,
-            'callerId' => $this->outboundCallerId($campaign),
             'timeout' => $this->config['originate_timeout_seconds'],
             'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
-        ]);
+        ];
+        $callerId = $this->outboundCallerId($campaign);
+        if ($callerId !== '') $payload['callerId'] = $callerId;
+        $channel = asterisk_ari_request($this->config, 'POST', '/channels', $payload);
         return [
             'provider' => 'Asterisk ARI',
             'external_call_id' => $externalId,

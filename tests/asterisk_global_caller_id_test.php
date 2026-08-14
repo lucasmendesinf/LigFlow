@@ -10,9 +10,11 @@ $assert = static function (bool $condition, string $message) use (&$tests): void
 $source = file_get_contents(dirname(__DIR__) . '/index.php') ?: '';
 
 $assert(str_contains($source, "\$nvoipTrunkConfig['caller_id']"), 'Nvoip caller ID is stored in the existing global trunk configuration');
-$assert(str_contains($source, "\$this->trunk() === 'NVOIP_TRUNK' && \$this->config['nvoip_caller_id'] !== ''"), 'global caller ID is restricted to the Nvoip trunk');
-$assert(substr_count($source, "'callerId' => \$this->outboundCallerId(\$campaign)") === 2, 'single and parallel Asterisk calls share the same caller ID resolver');
-$assert(str_contains($source, "return nvoip_phone_digits((string)(\$campaign['caller_id'] ?? ''));"), 'DirectCall and unconfigured Nvoip preserve the campaign caller ID fallback');
+$assert(str_contains($source, "\$this->trunk() === 'NVOIP_TRUNK'"), 'global caller ID is restricted to the Nvoip trunk');
+$assert(substr_count($source, "\$callerId = \$this->outboundCallerId(\$campaign);") === 2, 'single and parallel Asterisk calls share the same caller ID resolver');
+$assert(substr_count($source, "if (\$callerId !== '') \$payload['callerId'] = \$callerId;") === 2, 'blank Nvoip caller ID lets the PJSIP endpoint apply its authorized identity');
+$assert(str_contains($source, "return \$this->config['nvoip_caller_id'];"), 'Nvoip never falls back to a campaign or DirectCall caller ID');
+$assert(str_contains($source, "return nvoip_phone_digits((string)(\$campaign['caller_id'] ?? ''));"), 'DirectCall preserves the campaign caller ID');
 $assert(str_contains($source, 'name="nvoip_caller_id"'), 'Asterisk settings expose the global Nvoip caller ID field');
 $assert(str_contains($source, "'nvoip_caller_id_configured' => \$nvoipCallerId !== ''"), 'audit records configuration state without exposing the number');
 
