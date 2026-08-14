@@ -2248,9 +2248,27 @@ function valid_asterisk_webrtc_wss_url(string $url): bool
     if ($scheme === 'wss') return true;
     return $scheme === 'ws' && in_array($host, ['localhost', '127.0.0.1', '::1'], true);
 }
+function asterisk_url_uses_loopback(string $url): bool
+{
+    $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+    return in_array($host, ['localhost', '127.0.0.1', '::1'], true);
+}
+function asterisk_effective_ari_urls(array $row): array
+{
+    $ariUrl = rtrim(trim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL'))), '/');
+    $ariWsUrl = trim((string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')));
+    $environment = strtolower((string)($row['environment'] ?? 'test'));
+    $sipDomain = strtolower(trim((string)($row['sip_domain'] ?? '')));
+    if ($environment === 'production' && $sipDomain === 'telefonia.calutec.com.br') {
+        if (asterisk_url_uses_loopback($ariUrl)) $ariUrl = 'https://telefonia.calutec.com.br/ari';
+        if (asterisk_url_uses_loopback($ariWsUrl)) $ariWsUrl = 'wss://telefonia.calutec.com.br/ari/events';
+    }
+    return [$ariUrl, $ariWsUrl];
+}
 function asterisk_config(): array
 {
     $row = one('SELECT * FROM asterisk_settings WHERE id = 1') ?: [];
+    [$ariUrl, $ariWsUrl] = asterisk_effective_ari_urls($row);
     $route = strtoupper((string)($row['active_route'] ?? 'NVOIP_TRUNK'));
     if (!in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true)) $route = 'NVOIP_TRUNK';
     $nvoipTrunk = trim((string)($row['nvoip_trunk'] ?? 'nvoip'));
@@ -2268,9 +2286,11 @@ function asterisk_config(): array
             (string)($row['enabled'] ?? 0),
             (string)($row['active_mode'] ?? 'NVOIP_DIRECT'),
             $route,
+            $ariUrl,
+            $ariWsUrl,
         ])), 0, 16),
-        'ari_url' => rtrim((string)($row['ari_url'] ?? env_value('ASTERISK_ARI_URL')), '/'),
-        'ari_ws_url' => (string)($row['ari_ws_url'] ?? env_value('ASTERISK_ARI_WS_URL')),
+        'ari_url' => $ariUrl,
+        'ari_ws_url' => $ariWsUrl,
         'ari_username' => (string)($row['ari_username'] ?? env_value('ASTERISK_ARI_USERNAME')),
         'ari_password' => !empty($row['ari_password_encrypted']) ? decrypt_secret((string)$row['ari_password_encrypted']) : env_value('ASTERISK_ARI_PASSWORD'),
         'stasis_app' => trim((string)($row['stasis_app'] ?? 'ligflow')) ?: 'ligflow',
@@ -3776,6 +3796,9 @@ function handle_post(): void
         }
         if (!in_array($mode, ['NVOIP_DIRECT', 'ASTERISK'], true) || !in_array($route, ['NVOIP_TRUNK', 'DIRECTCALL_TRUNK'], true) || !in_array($environment, ['test', 'production'], true)) {
             flash('Modo, rota ou ambiente Asterisk invalido.', 'error'); redirect('?page=settings#asterisk');
+        }
+        if ($environment === 'production' && (asterisk_url_uses_loopback($ariUrl) || asterisk_url_uses_loopback($ariWsUrl))) {
+            flash('Em producao, informe as URLs publicas do ARI e do WebSocket ARI. Enderecos 127.0.0.1/localhost apontam para o servidor do LigFlow.', 'error'); redirect('?page=settings#asterisk');
         }
         if (!valid_asterisk_trunk_identifier($nvoipTrunk) || $directcallTrunk === '' || !valid_asterisk_trunk_identifier($directcallTrunk) || ($webrtcContext !== '' && !valid_asterisk_trunk_identifier($webrtcContext))) {
             flash('Contexto WebRTC ou tronco Asterisk invalido. Use apenas letras, numeros, hifen e underscore.', 'error'); redirect('?page=settings#asterisk');
