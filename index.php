@@ -9874,11 +9874,21 @@ function render_agent(): void
             FROM calls c
             WHERE {$agentStatsClause} AND c.created_at >= ? AND c.created_at < ?",
             array_merge($agentStatsParams, [$todayStartUtc, $todayEndUtc])) ?: [];
+        $remainingLeads = 0;
+        if ($campaign && !empty($campaign['company_id']) && !empty($campaign['list_id'])) {
+            $remainingLeads = (int)(one("SELECT COUNT(*) v
+                FROM contacts
+                WHERE company_id = ?
+                  AND list_id = ?
+                  AND status <> 'excluido'
+                  AND COALESCE(attempts, 0) = 0
+                  AND last_call_at IS NULL", [(int)$campaign['company_id'], (int)$campaign['list_id']])['v'] ?? 0);
+        }
         $agentCards = [
             'Chamadas hoje' => (int)($agentStats['chamadas_hoje'] ?? 0),
             'Minutos hoje' => number_format(((float)($agentStats['segundos_hoje'] ?? 0)) / 60, 0, ',', '.'),
             'Gasto hoje' => money(((int)($agentStats['gasto_hoje_micros'] ?? 0)) / 1000000),
-            'Leads restantes' => (int)(one("SELECT COUNT(*) v FROM contacts c WHERE {$agentStatsClause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $agentStatsParams)['v'] ?? 0),
+            'Leads restantes' => $remainingLeads,
         ];
         // The persisted Asterisk batch is the authoritative source for the aggregate UI.
         // The user status can lag behind the worker while a new wave is being started.
