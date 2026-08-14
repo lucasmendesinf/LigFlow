@@ -2306,7 +2306,10 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
     curl_close($ch);
     $decoded = json_decode((string)$body, true);
     if ($body === false || $status < 200 || $status >= 300) {
-        $message = (string)($decoded['message'] ?? $error ?: 'Falha na requisicao ARI.');
+        $message = trim((string)($decoded['message'] ?? ''));
+        if ($message === '') $message = trim($error);
+        if ($message === '' && $status > 0) $message = 'HTTP ' . $status;
+        if ($message === '') $message = 'Falha na requisicao ARI.';
         throw new RuntimeException('ARI: ' . $message);
     }
     return is_array($decoded) ? $decoded : [];
