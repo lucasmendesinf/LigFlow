@@ -6119,7 +6119,7 @@ function active_dial_batch(int $agentId, int $companyId): ?array
 function agent_parallel_batch_state(int $agentId, int $companyId): ?array
 {
     $batch = active_dial_batch($agentId, $companyId);
-    if (!$batch || (int)($batch['requested_parallelism'] ?? 1) <= 1) return null;
+    if (!$batch || (int)($batch['effective_parallelism'] ?? 1) <= 1) return null;
     $counts = one("SELECT
             COUNT(*) originated_count,
             COALESCE(SUM(CASE WHEN finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected') THEN 1 ELSE 0 END), 0) active_count,

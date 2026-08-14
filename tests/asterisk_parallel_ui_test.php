@@ -10,10 +10,11 @@ $assert = static function (bool $condition, string $message) use (&$tests): void
 $source = file_get_contents(dirname(__DIR__) . '/index.php') ?: '';
 $javascript = file_get_contents(dirname(__DIR__) . '/assets/app.js') ?: '';
 
-$usesParallelUi = static fn(int $simultaneousCalls): bool => $simultaneousCalls > 1;
-$assert(!$usesParallelUi(1), 'serial dialing keeps the previous UI path');
-$assert($usesParallelUi(5), 'five simultaneous calls use the aggregate batch UI');
+$usesParallelUi = static fn(int $effectiveCalls): bool => $effectiveCalls > 1;
+$assert(!$usesParallelUi(1), 'one effective call keeps the individual UI path');
+$assert($usesParallelUi(5), 'five effective calls use the aggregate batch UI');
 $assert(str_contains($source, "campaign_requested_parallelism(\$campaign) > 1"), 'backend keeps the existing parallelism threshold');
+$assert(str_contains($source, "(int)(\$batch['effective_parallelism'] ?? 1) <= 1"), 'aggregate UI follows effective parallelism');
 $assert(str_contains($source, "race_outcome = 'WINNER'"), 'winner is selected explicitly for the active UI');
 $assert(str_contains($source, '$isConnectedBatchWinner'), 'connected winner enters the normal live-call UI');
 $assert(str_contains($source, "NOT IN ('LOSER','LATE_ANSWERED')"), 'loser and late answered calls are excluded from active UI fallback');
