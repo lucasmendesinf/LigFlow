@@ -9815,7 +9815,12 @@ function render_agent(): void
             'Gasto hoje' => money(((int)($agentStats['gasto_hoje_micros'] ?? 0)) / 1000000),
             'Leads restantes' => (int)(one("SELECT COUNT(*) v FROM contacts c WHERE {$agentStatsClause} AND c.status <> 'excluido' AND NOT EXISTS (SELECT 1 FROM calls co WHERE co.company_id = c.company_id AND co.contact_id = c.id)", $agentStatsParams)['v'] ?? 0),
         ];
-        $batchState = $isAutoDialing ? agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']) : null;
+        // The persisted Asterisk batch is the authoritative source for the aggregate UI.
+        // The user status can lag behind the worker while a new wave is being started.
+        $batchState = agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']);
+        if ($batchState) {
+            $isAutoDialing = true;
+        }
         $activeBatch = $batchState['batch'] ?? null;
         if ($batchState && (int)$batchState['active_count'] === 0 && empty($batchState['winner_call_id'])) {
             $continued = asterisk_continue_batch_if_exhausted((int)$batchState['batch_id']);

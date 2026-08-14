@@ -18,6 +18,8 @@ $assert(str_contains($source, "(int)(\$batch['effective_parallelism'] ?? 1) <= 1
 $assert(str_contains($source, "race_outcome = 'WINNER'"), 'winner is selected explicitly for the active UI');
 $assert(str_contains($source, '$isConnectedBatchWinner'), 'connected winner enters the normal live-call UI');
 $assert(str_contains($source, "NOT IN ('LOSER','LATE_ANSWERED')"), 'loser and late answered calls are excluded from active UI fallback');
+$assert(str_contains($source, '$batchState = agent_parallel_batch_state((int)$user[\'id\'], (int)$user[\'company_id\']);'), 'active Asterisk batch is detected independently from the cached user status');
+$assert(!str_contains($source, '$batchState = $isAutoDialing ? agent_parallel_batch_state'), 'aggregate UI is not gated by the user status text');
 $assert(str_contains($source, 'data-parallel-batch-state'), 'aggregate batch state is rendered');
 $assert(!str_contains($source, 'data-parallel-batch-phone'), 'aggregate state exposes no participant phone');
 $assert(str_contains($javascript, "fetch('?page=agent_batch_state'"), 'batch UI reuses one lightweight state endpoint');
