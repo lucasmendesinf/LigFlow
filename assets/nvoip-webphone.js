@@ -1372,6 +1372,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         currentSipCallId = managedCallId;
         panel?.classList.remove('is-hidden');
         root.querySelector('[data-phone-tab="monitorar"]')?.click();
+        ensureRegistered();
         pollManagedCallState();
     } else if (autoCallPhone && !autoCallStarted) {
         autoCallStarted = true;
