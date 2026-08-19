@@ -3300,6 +3300,9 @@ function flash(?string $message = null, string $type = 'ok'): ?array
 
 function handle_post(): void
 {
+    if (($_GET['page'] ?? '') === 'asterisk_manual_hangup') {
+        return;
+    }
     $action = post('action');
     $pdo = db();
 
