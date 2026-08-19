@@ -970,6 +970,9 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         remoteAudio,
         onState: (state) => {
             if (state.call || !usesManagedAsterisk()) setText(statusEl, state.call || state.status);
+            if (state.status === 'INCOMING' && usesManagedAsterisk() && currentSipCallId) {
+                service.answer();
+            }
             if (state.register) setText(registerEl, state.register);
             if (state.call) setText(callState, state.call);
             if (state.direction) currentSipDirection = state.direction;
