@@ -7852,7 +7852,7 @@ $billingUser = current_user();
 if ($billingUser && !is_platform_admin($billingUser)) {
     $billingState = tenant_billing_state((int)$billingUser['company_id']);
     if (!billing_operational_route_allowed((bool)$billingState['blocked'], $requestedPage) && !isset($_GET['logout'])) {
-        if (in_array($requestedPage, ['sip_config','sip_call_event','phone_history','list_contacts_batch','answered_calls_batch','agent_batch_state','quick_block_call'], true)) {
+        if (in_array($requestedPage, ['sip_config','sip_call_event','phone_history','list_contacts_batch','answered_calls_batch','agent_batch_state','quick_block_call','asterisk_call_state','asterisk_manual_hangup'], true)) {
             header('Content-Type: application/json; charset=utf-8'); http_response_code(402); echo json_encode(['ok'=>false,'error'=>'Plano bloqueado.']); exit;
         }
         flash((string)$billingState['message'], 'error');
