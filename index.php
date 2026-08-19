@@ -6937,6 +6937,10 @@ function quick_hangup(int $callId, int $companyId): void
     db()->prepare("UPDATE users SET status = 'Pos-atendimento' WHERE id = ?")->execute([$call['agent_id']]);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.quick_hangup', ?, 'completed', ?)")
         ->execute([$companyId, $callId, $call['status'], json_encode(['duration_seconds' => $duration, 'billable_seconds' => $billable, 'estimated_cost' => $billing['cost_decimal']])]);
+    if (!empty($call['dial_batch_id'])) {
+        db()->prepare("UPDATE dial_batches SET status='FINISHED', updated_at=datetime('now') WHERE id=? AND winner_call_id=?")
+            ->execute([(int)$call['dial_batch_id'], $callId]);
+    }
     audit('encerrou_ligacao_webfone', 'calls:' . $callId);
     flash('Chamada encerrada pelo webfone.');
 }
@@ -8124,7 +8128,14 @@ function asterisk_handle_event(array $event): void
                 }
             }
         }
-        if ($isFinal && !empty($call['dial_batch_id'])) asterisk_continue_batch_if_exhausted((int)$call['dial_batch_id']);
+        if ($isFinal && !empty($call['dial_batch_id'])) {
+            $finalizedBatch = one('SELECT winner_call_id FROM dial_batches WHERE id=?', [(int)$call['dial_batch_id']]);
+            if ($finalizedBatch && (int)($finalizedBatch['winner_call_id'] ?? 0) === (int)$call['id']) {
+                db()->prepare("UPDATE dial_batches SET status='FINISHED', updated_at=datetime('now') WHERE id=?")
+                    ->execute([(int)$call['dial_batch_id']]);
+            }
+            asterisk_continue_batch_if_exhausted((int)$call['dial_batch_id']);
+        }
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
         throw $e;
