@@ -1095,6 +1095,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         if (!state.active) {
             stopManagedCallPolling();
             currentSipCallId = null;
+            root.setAttribute('data-managed-call-id', '0');
             callButton?.classList.remove('hangup');
             callButton?.setAttribute('aria-label', 'Ligar manualmente');
             monitor?.classList.remove('online');
