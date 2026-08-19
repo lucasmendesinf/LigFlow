@@ -1332,6 +1332,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
 
     form?.addEventListener('submit', async (event) => {
         event.preventDefault();
+        if (!currentSipCallId && usesManagedAsterisk()) {
+            const domManagedCallId = Number(root.getAttribute('data-managed-call-id') || 0);
+            if (domManagedCallId) currentSipCallId = domManagedCallId;
+        }
         if (service.session || currentSipCallId) {
             if (isAutoDialing()) {
                 await window.ligflowSkipCurrentCampaignCall();
@@ -1352,6 +1356,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
 
     callButton?.addEventListener('click', async (event) => {
         event.preventDefault();
+        if (!currentSipCallId && usesManagedAsterisk()) {
+            const domManagedCallId = Number(root.getAttribute('data-managed-call-id') || 0);
+            if (domManagedCallId) currentSipCallId = domManagedCallId;
+        }
         if (service.session || currentSipCallId) {
             if (isAutoDialing()) {
                 await window.ligflowSkipCurrentCampaignCall({ playSound: true });
