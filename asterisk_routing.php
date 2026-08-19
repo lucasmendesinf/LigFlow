@@ -26,9 +26,39 @@ function asterisk_outbound_endpoint(array $config, string $destination): string
     }
 
     $trunk = asterisk_route_trunk($config);
-    return strtoupper((string)($config['active_route'] ?? '')) === 'NVOIP_TRUNK'
-        ? 'PJSIP/' . $destination . '@' . $trunk
-        : 'PJSIP/' . $trunk . '/' . $destination;
+    return 'PJSIP/' . $destination . '@' . $trunk;
+}
+
+function asterisk_event_identifiers(array $event): array
+{
+    $identifiers = [];
+    foreach (['channel', 'caller', 'peer'] as $field) {
+        $channel = $event[$field] ?? null;
+        if (!is_array($channel)) continue;
+        foreach (['id', 'linkedid'] as $key) {
+            $value = trim((string)($channel[$key] ?? ''));
+            if ($value !== '') $identifiers[] = $value;
+        }
+    }
+    return array_values(array_unique($identifiers));
+}
+
+function asterisk_event_references_channel(array $event, string $channelId): bool
+{
+    return $channelId !== '' && in_array($channelId, asterisk_event_identifiers($event), true);
+}
+
+function asterisk_terminal_event_cause(array $event): string
+{
+    $type = trim((string)($event['type'] ?? 'ARI'));
+    $parts = [];
+    foreach (['cause', 'cause_txt'] as $field) {
+        $value = $event[$field] ?? $event['channel'][$field] ?? null;
+        if ($value !== null && $value !== '') $parts[] = $field . '=' . $value;
+    }
+    $dialStatus = trim((string)($event['dialstatus'] ?? ''));
+    if ($dialStatus !== '') $parts[] = 'dialstatus=' . $dialStatus;
+    return $type . ($parts ? ': ' . implode('; ', $parts) : '');
 }
 
 function asterisk_ari_success_diagnostics(
@@ -89,7 +119,18 @@ function asterisk_origin_has_timed_out(array $call, int $now, int $timeoutSecond
     if (!empty($call['answered_at']) || !empty($call['finalized_at']) || $status === 'ringing') {
         return false;
     }
-    $anchor = strtotime((string)($call['last_event_at'] ?? $call['created_at'] ?? $call['started_at'] ?? ''));
+    $rawAnchor = trim((string)($call['last_event_at'] ?? $call['created_at'] ?? $call['started_at'] ?? ''));
+    $anchor = false;
+    if ($rawAnchor !== '') {
+        $candidates = array_filter([
+            strtotime($rawAnchor),
+            strtotime($rawAnchor . ' UTC'),
+        ], static fn(mixed $value): bool => $value !== false && $value <= $now);
+        if ($candidates) {
+            usort($candidates, static fn(int $left, int $right): int => abs($now - $left) <=> abs($now - $right));
+            $anchor = $candidates[0];
+        }
+    }
     return $anchor !== false && ($now - $anchor) >= max(1, $timeoutSeconds);
 }
 
@@ -121,6 +162,8 @@ function asterisk_ari_failure(
 ): AsteriskAriRequestException {
     $response = $body === false ? '' : $body;
     $endpoint = trim((string)($payload['endpoint'] ?? ''));
+    $application = trim((string)($payload['app'] ?? ''));
+    $channelId = trim((string)($payload['channelId'] ?? ''));
     $diagnostics = [
         'method' => strtoupper($method),
         'url' => asterisk_ari_safe_url($url),
@@ -128,6 +171,8 @@ function asterisk_ari_failure(
         'response' => $response,
         'curl_error' => $curlError,
         'telephony_endpoint' => $endpoint,
+        'stasis_app' => $application,
+        'provider_channel_id' => $channelId,
     ];
     $parts = [
         'metodo=' . $diagnostics['method'],
@@ -137,6 +182,8 @@ function asterisk_ari_failure(
         'cURL=' . ($curlError !== '' ? $curlError : '<sem erro>'),
     ];
     if ($endpoint !== '') $parts[] = 'endpoint=' . $endpoint;
+    if ($application !== '') $parts[] = 'app=' . $application;
+    if ($channelId !== '') $parts[] = 'channelId=' . $channelId;
 
     return new AsteriskAriRequestException('ARI: ' . implode('; ', $parts), $diagnostics);
 }

@@ -26,6 +26,7 @@ session_save_path(DATA_DIR . '/sessions');
 session_start();
 load_env_file(__DIR__ . '/.env');
 require_once __DIR__ . '/billing_domain.php';
+require_once __DIR__ . '/asterisk_routing.php';
 $asteriskRecordingFile = __DIR__ . '/asterisk_recording.php';
 if (is_file($asteriskRecordingFile)) {
     require_once $asteriskRecordingFile;
@@ -2306,8 +2307,7 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
     curl_close($ch);
     $decoded = json_decode((string)$body, true);
     if ($body === false || $status < 200 || $status >= 300) {
-        $message = (string)($decoded['message'] ?? $error ?: 'Falha na requisicao ARI.');
-        throw new RuntimeException('ARI: ' . $message);
+        throw asterisk_ari_failure($method, $url, $status, $body, $error, $payload);
     }
     return is_array($decoded) ? $decoded : [];
 }
@@ -2336,14 +2336,39 @@ final class AsteriskProvider implements TelephonyProvider
     }
     public function mode(): string { return 'ASTERISK'; }
     public function trunk(): string { return $this->config['active_route']; }
-    private function routeTrunk(): string
+    private function outboundEndpoint(string $destination): string
     {
-        return $this->trunk() === 'DIRECTCALL_TRUNK' ? $this->config['directcall_trunk'] : $this->config['nvoip_trunk'];
+        return asterisk_outbound_endpoint($this->config, $destination);
     }
     private function safeEndpoint(string $endpoint): string
     {
         if (!preg_match('/^[A-Za-z0-9_.-]+$/', $endpoint)) throw new RuntimeException('Endpoint Asterisk invalido.');
         return $endpoint;
+    }
+    private function confirmOriginatedChannel(array $channel, string $externalId, string $dialString): string
+    {
+        $channelId = asterisk_origin_returned_channel_id($channel);
+        if ($channelId === '') {
+            throw new RuntimeException('ARI_ORIGIN_REJECTED: o POST /channels nao retornou um channelId valido.');
+        }
+        try {
+            $confirmed = asterisk_ari_request($this->config, 'GET', '/channels/' . rawurlencode($channelId));
+        } catch (AsteriskAriRequestException $e) {
+            if ((int)($e->diagnostics()['http_status'] ?? 0) === 404) {
+                throw new RuntimeException('ARI_CHANNEL_DESTROYED: o canal retornado pelo Asterisk encerrou antes da confirmacao.');
+            }
+            throw $e;
+        }
+        if (asterisk_origin_confirmation_state($channelId, 200, $confirmed) !== 'active') {
+            throw new RuntimeException('ARI_CHANNEL_CONFIRMATION_FAILED: o canal confirmado difere do channelId retornado pelo Asterisk.');
+        }
+        log_call_status(0, null, 'Asterisk ARI', 'origin_confirmed', 'Canal ARI confirmado.', [
+            'requested_channel_id' => $externalId,
+            'returned_channel_id' => $channelId,
+            'endpoint' => $dialString,
+            'state' => (string)($confirmed['state'] ?? ''),
+        ]);
+        return $channelId;
     }
     public function createBridge(string $bridgeId): array
     {
@@ -2376,32 +2401,33 @@ final class AsteriskProvider implements TelephonyProvider
         if (!$this->config['enabled']) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)$contact['phone_e164']);
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $trunk = $this->safeEndpoint($this->routeTrunk());
+        $dialString = $this->outboundEndpoint($destination);
         $externalId = 'ARI-' . bin2hex(random_bytes(12));
         $bridgeId = 'ligflow-' . strtolower(bin2hex(random_bytes(8)));
         try {
             $this->createBridge($bridgeId);
             $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
                 'channelId' => $externalId,
-                'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+                'endpoint' => $dialString,
                 'app' => $this->config['stasis_app'],
                 'appArgs' => 'ligflow,' . $externalId,
                 'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
                 'timeout' => $this->config['originate_timeout_seconds'],
                 'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
             ]);
+            $channelId = $this->confirmOriginatedChannel($channel, $externalId, $dialString);
             return [
                 'ok' => true,
                 'provider' => 'Asterisk ARI',
                 'external_call_id' => $externalId,
-                'provider_channel_id' => (string)($channel['id'] ?? $externalId),
+                'provider_channel_id' => $channelId,
                 'provider_linked_id' => (string)($channel['connected']['id'] ?? ''),
                 'provider_bridge_id' => $bridgeId,
                 'telephony_mode' => $this->mode(),
                 'telephony_trunk' => $this->trunk(),
-                'status' => 'in_progress',
+                'status' => 'calling_origin',
                 'message' => 'Chamada enviada ao Asterisk pela rota ' . $this->trunk() . '.',
-                'payload' => ['route' => $this->trunk(), 'channel_id' => $channel['id'] ?? $externalId, 'bridge_id' => $bridgeId],
+                'payload' => ['route' => $this->trunk(), 'endpoint' => $dialString, 'channel_id' => $channelId, 'bridge_id' => $bridgeId],
             ];
         } catch (Throwable $e) {
             try { $this->destroyBridge($bridgeId); } catch (Throwable) { }
@@ -2413,23 +2439,25 @@ final class AsteriskProvider implements TelephonyProvider
         if (empty($this->config['enabled'])) throw new RuntimeException('Asterisk esta desabilitado.');
         $destination = nvoip_phone_digits((string)($contact['phone_e164'] ?? ''));
         if ($destination === '') throw new RuntimeException('Numero de destino invalido.');
-        $trunk = $this->safeEndpoint($this->routeTrunk());
+        $dialString = $this->outboundEndpoint($destination);
         $channel = asterisk_ari_request($this->config, 'POST', '/channels', [
             'channelId' => $externalId,
-            'endpoint' => 'PJSIP/' . $trunk . '/' . $destination,
+            'endpoint' => $dialString,
             'app' => $this->config['stasis_app'],
             'appArgs' => 'ligflow,' . $externalId,
             'callerId' => nvoip_phone_digits((string)($campaign['caller_id'] ?? '')),
             'timeout' => $this->config['originate_timeout_seconds'],
             'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
         ]);
+        $channelId = $this->confirmOriginatedChannel($channel, $externalId, $dialString);
         return [
             'provider' => 'Asterisk ARI',
             'external_call_id' => $externalId,
-            'provider_channel_id' => (string)($channel['id'] ?? $externalId),
+            'provider_channel_id' => $channelId,
             'provider_linked_id' => (string)($channel['connected']['id'] ?? ''),
             'telephony_mode' => $this->mode(),
             'telephony_trunk' => $this->trunk(),
+            'endpoint' => $dialString,
         ];
     }
 
@@ -2441,8 +2469,7 @@ final class AsteriskProvider implements TelephonyProvider
         try {
             $this->createBridge($bridgeId);
             $this->addChannelToBridge($bridgeId, $channelId);
-            $consultantEndpoint = preg_replace('/^PJSIP\//i', '', (string)($this->config['consultant_endpoint'] ?? ''));
-            $consultant = $this->connectConsultant($bridgeId, (string)$consultantEndpoint);
+            $consultant = $this->connectConsultant($bridgeId, asterisk_consultant_endpoint_for_agent($this->config, $agent));
             return ['bridge_id' => $bridgeId, 'consultant_channel_id' => (string)($consultant['id'] ?? '')];
         } catch (Throwable $e) {
             try { $this->destroyBridge($bridgeId); } catch (Throwable) { }
@@ -2452,9 +2479,43 @@ final class AsteriskProvider implements TelephonyProvider
 
     public function hangup(array $call): void
     {
-        $channelId = (string)($call['provider_channel_id'] ?? $call['provider_call_id'] ?? '');
-        if ($channelId !== '') asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($channelId));
-        if (!empty($call['provider_bridge_id'])) $this->destroyBridge((string)$call['provider_bridge_id']);
+        $channelIds = array_values(array_unique(array_filter([
+            trim((string)($call['provider_channel_id'] ?? $call['provider_call_id'] ?? '')),
+            trim((string)($call['provider_linked_id'] ?? '')),
+        ])));
+        $channelError = null;
+        foreach ($channelIds as $channelId) {
+            try {
+                asterisk_ari_request($this->config, 'DELETE', '/channels/' . rawurlencode($channelId));
+            } catch (AsteriskAriRequestException $e) {
+                if ((int)($e->diagnostics()['http_status'] ?? 0) !== 404) $channelError = $e;
+            }
+        }
+        if (!empty($call['provider_bridge_id'])) {
+            try {
+                $this->destroyBridge((string)$call['provider_bridge_id']);
+            } catch (AsteriskAriRequestException $e) {
+                if ((int)($e->diagnostics()['http_status'] ?? 0) !== 404 && !$channelError) $channelError = $e;
+            }
+        }
+        if ($channelError) throw $channelError;
+    }
+
+    public function connectManualCall(array $call, array $agent): array
+    {
+        $channelId = trim((string)($call['provider_channel_id'] ?? ''));
+        $bridgeId = trim((string)($call['provider_bridge_id'] ?? ''));
+        if ($channelId === '' || $bridgeId === '') {
+            throw new RuntimeException('Canal ou bridge Asterisk indisponivel para conectar o consultor.');
+        }
+        $this->addChannelToBridge($bridgeId, $channelId);
+        $consultantEndpoint = asterisk_consultant_endpoint_for_agent($this->config, $agent);
+        $consultant = $this->connectConsultant($bridgeId, $consultantEndpoint);
+        $consultantChannelId = asterisk_origin_returned_channel_id($consultant);
+        if ($consultantChannelId === '') {
+            throw new RuntimeException('ARI_MANUAL_CONSULTANT_FAILED: o Asterisk nao retornou o canal do consultor.');
+        }
+        return ['bridge_id' => $bridgeId, 'consultant_channel_id' => $consultantChannelId];
     }
     public function health(): array
     {
@@ -5466,6 +5527,16 @@ function get_active_call(int $agentId, int $companyId): ?array
     return one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND status IN (" . active_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [$agentId, $companyId]) ?: null;
 }
 
+function get_active_manual_call(int $agentId, int $companyId): ?array
+{
+    return one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.agent_id=? AND c.company_id=? AND ca.dialer_type='manual' AND c.status IN (" . active_call_statuses_sql() . ") ORDER BY c.id DESC LIMIT 1", [$agentId, $companyId]) ?: null;
+}
+
+function get_active_campaign_call(int $agentId, int $companyId): ?array
+{
+    return one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.agent_id=? AND c.company_id=? AND COALESCE(ca.dialer_type,'')<>'manual' AND c.status IN (" . active_call_statuses_sql() . ") ORDER BY c.id DESC LIMIT 1", [$agentId, $companyId]) ?: null;
+}
+
 function get_live_call(int $agentId, int $companyId): ?array
 {
     return one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND status IN (" . live_call_statuses_sql() . ") ORDER BY id DESC LIMIT 1", [$agentId, $companyId]) ?: null;
@@ -6241,6 +6312,26 @@ function asterisk_user_extension_ready(?array $extension): bool
         && !empty($extension['sip_password_encrypted']);
 }
 
+function asterisk_consultant_endpoint_for_agent(array $config, array $agent): string
+{
+    $endpoint = '';
+    $companyId = (int)($agent['company_id'] ?? 0);
+    $userId = (int)($agent['id'] ?? 0);
+    if ($companyId > 0 && $userId > 0) {
+        $extension = asterisk_user_extension_record($companyId, $userId);
+        if ($extension && strtoupper((string)($extension['lifecycle_status'] ?? 'ACTIVE')) === 'ACTIVE') {
+            $endpoint = trim((string)($extension['extension'] ?? ''));
+        }
+    }
+    if ($endpoint === '') {
+        $endpoint = preg_replace('/^PJSIP\//i', '', trim((string)($config['consultant_endpoint'] ?? '')));
+    }
+    if ($endpoint === '' || !valid_asterisk_webrtc_endpoint($endpoint)) {
+        throw new RuntimeException('Ramal Asterisk do consultor nao configurado.');
+    }
+    return $endpoint;
+}
+
 function asterisk_uses_local_ari(array $config): bool
 {
     foreach (['ari_url', 'ari_ws_url'] as $key) {
@@ -6322,8 +6413,12 @@ function asterisk_batch_answered(int $callId): void
         if ($provider instanceof AsteriskProvider) {
             $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
             $bridge = $provider->connectParallelWinner($call, $agent);
-            db()->prepare("UPDATE calls SET provider_bridge_id=?, internal_status='conectada', status='connected', connected_at=COALESCE(connected_at,datetime('now')) WHERE id=?")->execute([(string)$bridge['bridge_id'], $callId]);
-            db()->prepare("UPDATE dial_batches SET status='CONNECTED', updated_at=datetime('now') WHERE id=?")->execute([(int)$batch['id']]);
+            $consultantChannelId = trim((string)($bridge['consultant_channel_id'] ?? ''));
+            if ($consultantChannelId === '') throw new RuntimeException('Canal do consultor nao retornado pelo Asterisk.');
+            db()->prepare("UPDATE calls SET provider_bridge_id=?, provider_linked_id=?, provider_status_raw='ASTERISK_CONSULTANT_ORIGINATED', status='answered', internal_status='atendida', updated_at=datetime('now') WHERE id=?")
+                ->execute([(string)$bridge['bridge_id'], $consultantChannelId, $callId]);
+            db()->prepare("UPDATE dial_batches SET status='WINNER', updated_at=datetime('now') WHERE id=?")->execute([(int)$batch['id']]);
+            asterisk_replay_orphan_events_for_call($callId, $consultantChannelId);
             if (filter_var(env_value('ASTERISK_BRIDGE_RECORDING_HOMOLOGATION'), FILTER_VALIDATE_BOOLEAN)) {
                 $recording = asterisk_try_winner_bridge_recording(
                     static fn(string $bridgeId, string $recordingName, string $format): array => $provider->recordBridge($bridgeId, $recordingName, $format),
@@ -6404,6 +6499,10 @@ function start_next_progressive_call(int $campaignId, int $agentId, int $company
     db()->prepare("UPDATE contacts SET reserved_by = ?, reserved_at = datetime('now'), reservation_expires_at = datetime('now', '+10 minutes'), status = 'reservado' WHERE id = ?")
         ->execute([$agentId, $contact['id']]);
     audit('discador_reservou_contato', 'contacts:' . $contact['id']);
+    $asterisk = asterisk_config();
+    if (!empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK') {
+        return start_call((int)$campaign['id'], (int)$contact['id'], $agentId, $companyId);
+    }
     flash('Lead reservado. O webfone vai iniciar a ligacao SIP.');
     return true;
 }
@@ -6450,6 +6549,108 @@ function reserve_next_contact(int $campaignId, int $agentId, int $companyId): vo
     flash('Lead reservado para ligacao.');
 }
 
+function asterisk_bridge_is_empty_or_missing(array $config, string $bridgeId): bool
+{
+    if ($bridgeId === '') return true;
+    try {
+        $bridge = asterisk_ari_request($config, 'GET', '/bridges/' . rawurlencode($bridgeId));
+        return empty($bridge['channels']);
+    } catch (AsteriskAriRequestException $e) {
+        if ((int)($e->diagnostics()['http_status'] ?? 0) === 404) return true;
+        throw $e;
+    }
+}
+
+function asterisk_terminal_event_for_channel(int $callId, string $channelId): ?array
+{
+    if ($callId < 1 || $channelId === '') return null;
+    $events = rows("SELECT payload_json FROM asterisk_ari_events WHERE (call_id=? OR call_id IS NULL) AND event_type IN ('ChannelDestroyed','StasisEnd') ORDER BY id DESC LIMIT 100", [$callId]);
+    foreach ($events as $row) {
+        $event = json_decode((string)($row['payload_json'] ?? ''), true);
+        if (is_array($event) && (string)($event['channel']['id'] ?? '') === $channelId) return $event;
+    }
+    return null;
+}
+
+function asterisk_remove_empty_bridge(array $config, string $bridgeId): void
+{
+    if ($bridgeId === '' || !asterisk_bridge_is_empty_or_missing($config, $bridgeId)) return;
+    try {
+        asterisk_ari_request($config, 'DELETE', '/bridges/' . rawurlencode($bridgeId));
+    } catch (AsteriskAriRequestException $e) {
+        if ((int)($e->diagnostics()['http_status'] ?? 0) !== 404) throw $e;
+    }
+}
+
+function asterisk_finalize_missing_active_call(array $call, array $config): bool
+{
+    $channelId = trim((string)($call['provider_channel_id'] ?? ''));
+    $bridgeId = trim((string)($call['provider_bridge_id'] ?? ''));
+    if (!asterisk_bridge_is_empty_or_missing($config, $bridgeId)) return false;
+
+    asterisk_replay_orphan_events_for_call((int)$call['id'], $channelId);
+    $terminalEvent = asterisk_terminal_event_for_channel((int)$call['id'], $channelId);
+    if ($terminalEvent) {
+        asterisk_handle_event($terminalEvent);
+        $updated = one('SELECT finalized_at FROM calls WHERE id=?', [(int)$call['id']]);
+        if (!empty($updated['finalized_at'])) {
+            asterisk_remove_empty_bridge($config, $bridgeId);
+            return true;
+        }
+    }
+
+    $cause = 'ARI_TERMINAL_CAUSE_UNAVAILABLE: canal ativo no banco nao existe mais no ARI.';
+    log_call_status((int)$call['company_id'], (int)$call['id'], 'Asterisk ARI', 'ARI_EVENT_CONSUMER_REPLACED', $cause);
+    $pdo = db();
+    $pdo->beginTransaction();
+    try {
+        $finish = $pdo->prepare("UPDATE calls SET status='failed', provider_status_raw='ARI_CHANNEL_RESIDUAL_NOT_FOUND', internal_status='falha', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND company_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered')");
+        $finish->execute([$cause, (int)$call['id'], (int)$call['company_id']]);
+        if ($finish->rowCount() !== 1) {
+            $pdo->commit();
+            return true;
+        }
+        $campaign = one('SELECT dialer_type FROM campaigns WHERE id=? AND company_id=?', [(int)$call['campaign_id'], (int)$call['company_id']]);
+        $contactStatus = strtolower((string)($campaign['dialer_type'] ?? '')) === 'manual' ? 'novo' : 'concluido';
+        $pdo->prepare('UPDATE contacts SET status=?, reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?')
+            ->execute([$contactStatus, (int)$call['contact_id'], (int)$call['company_id']]);
+        $pdo->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status IN ('Em ligacao','Discando automatico')")
+            ->execute([(int)$call['agent_id'], (int)$call['company_id']]);
+        $pdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'asterisk.residual_channel_missing', ?, 'failed', ?)")
+            ->execute([(int)$call['company_id'], (int)$call['id'], (string)$call['status'], json_encode_safe(['cause' => $cause, 'channel_id' => $channelId])]);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+    asterisk_remove_empty_bridge($config, $bridgeId);
+    return true;
+}
+
+function asterisk_count_confirmed_active_calls(int $companyId, array $config): int
+{
+    $activeCalls = rows("SELECT * FROM calls WHERE company_id=? AND telephony_mode='ASTERISK' AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered') ORDER BY id", [$companyId]);
+    $activeCount = 0;
+    foreach ($activeCalls as $call) {
+        if (!empty($call['dial_batch_id'])) {
+            $activeCount++;
+            continue;
+        }
+        $channelId = trim((string)($call['provider_channel_id'] ?? ''));
+        $channelExists = false;
+        if ($channelId !== '') {
+            try {
+                asterisk_ari_request($config, 'GET', '/channels/' . rawurlencode($channelId));
+                $channelExists = true;
+            } catch (AsteriskAriRequestException $e) {
+                if ((int)($e->diagnostics()['http_status'] ?? 0) !== 404) throw $e;
+            }
+        }
+        if ($channelExists || !asterisk_finalize_missing_active_call($call, $config)) $activeCount++;
+    }
+    return $activeCount;
+}
+
 function start_call(int $campaignId, int $contactId, int $agentId, int $companyId): bool
 {
     $contact = one('SELECT * FROM contacts WHERE id = ? AND company_id = ? AND reserved_by = ?', [$contactId, $companyId, $agentId]);
@@ -6476,12 +6677,18 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
 
     $asterisk = asterisk_config();
     if (!empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK') {
-        $active = (int)scalar("SELECT COUNT(*) FROM calls WHERE company_id = ? AND telephony_mode = 'ASTERISK' AND status IN ('in_progress','calling_origin','ringing','answered')", [$companyId]);
+        try {
+            $active = asterisk_count_confirmed_active_calls($companyId, $asterisk);
+        } catch (Throwable $e) {
+            flash('Nao foi possivel validar as chamadas Asterisk ativas: ' . $e->getMessage(), 'error');
+            return false;
+        }
         if ($active >= 1) {
             flash('O modo Asterisk permite somente uma chamada simultanea nesta etapa.', 'error');
             return false;
         }
-    }    $providerCall = make_provider_call($campaign, $contact, $agent ?: []);
+    }
+    $providerCall = make_provider_call($campaign, $contact, $agent ?: []);
     if (!$providerCall['ok']) {
         db()->prepare("INSERT INTO call_events (company_id, event_name, old_status, new_status, payload) VALUES (?, 'call.provider_failed', 'reserved', 'failed', ?)")
             ->execute([$companyId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
@@ -6497,16 +6704,27 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
     $attemptNumber = max(1, (int)($contact['attempts'] ?? 0) + 1);
     $internalStatus = normalize_call_attempt_status((string)$providerCall['status'], ['event' => 'start']);
     $billingRateMicros = call_plan_rate_micros($companyId);
+    $isManualAsterisk = (string)($providerCall['telephony_mode'] ?? '') === 'ASTERISK'
+        && (string)($campaign['dialer_type'] ?? '') === 'manual';
+    $initialStatus = $isManualAsterisk ? 'calling_origin' : (string)$providerCall['status'];
+    $initialInternalStatus = $isManualAsterisk ? 'iniciada' : $internalStatus;
     db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, telephony_mode, telephony_trunk, provider_channel_id, provider_linked_id, provider_bridge_id, started_at, ringing_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)")
-        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $providerCall['status'], (string)$providerCall['status'], $internalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], (string)($providerCall['telephony_mode'] ?? 'NVOIP_DIRECT'), (string)($providerCall['telephony_trunk'] ?? 'NVOIP_DIRECT'), (string)($providerCall['provider_channel_id'] ?? ''), (string)($providerCall['provider_linked_id'] ?? ''), (string)($providerCall['provider_bridge_id'] ?? ''), $answeredAt]);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL, ?)")
+        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $initialStatus, $initialStatus, $initialInternalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], (string)($providerCall['telephony_mode'] ?? 'NVOIP_DIRECT'), (string)($providerCall['telephony_trunk'] ?? 'NVOIP_DIRECT'), (string)($providerCall['provider_channel_id'] ?? ''), (string)($providerCall['provider_linked_id'] ?? ''), (string)($providerCall['provider_bridge_id'] ?? ''), $answeredAt]);
     $callId = (int)db()->lastInsertId();
+    if ((string)($providerCall['telephony_mode'] ?? '') === 'ASTERISK') {
+        try {
+            asterisk_replay_orphan_events_for_call($callId, (string)($providerCall['provider_channel_id'] ?? ''));
+        } catch (Throwable $e) {
+            log_call_status($companyId, $callId, 'Asterisk ARI', 'orphan_event_replay_failed', $e->getMessage());
+        }
+    }
     db()->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contactId]);
     $nextAgentStatus = (($agent['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
     db()->prepare("UPDATE users SET status = ? WHERE id = ?")->execute([$nextAgentStatus, $agentId]);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.started', 'reserved', 'in_progress', ?)")
         ->execute([$companyId, $callId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
-    log_call_status($companyId, $callId, (string)($providerCall['provider'] ?? 'Nvoip'), (string)$providerCall['status'], 'call_started', (array)$providerCall['payload']);
+    log_call_status($companyId, $callId, (string)($providerCall['provider'] ?? 'Nvoip'), $initialStatus, 'call_started', (array)$providerCall['payload']);
     audit('iniciou_ligacao', 'calls:' . $callId);
     flash($providerCall['message']);
     return true;
@@ -6558,11 +6776,8 @@ function start_manual_call(int $campaignId, string $phoneRaw, int $agentId, int 
         return $campaignId;
     }
 
-    $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ? AND company_id = ?', [$campaignId, $companyId]) : null;
-    if (!$campaign) {
-        $campaign = get_or_create_manual_campaign($companyId, $agentId);
-        $campaignId = (int)($campaign['id'] ?? 0);
-    }
+    $campaign = get_or_create_manual_campaign($companyId, $agentId);
+    $campaignId = (int)($campaign['id'] ?? 0);
 
     if (!$campaignId || !$campaign) {
         flash('Nao foi possivel preparar a ligacao manual.', 'error');
@@ -6572,13 +6787,15 @@ function start_manual_call(int $campaignId, string $phoneRaw, int $agentId, int 
     $listId = (int)$campaign['list_id'];
     $contact = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND phone_e164 = ? AND status <> 'excluido'", [$companyId, $listId, $phone]);
     if (!$contact) {
-        db()->prepare("INSERT INTO contacts (company_id, list_id, name, phone_raw, phone_e164, origin, status, reserved_by, reserved_at, reservation_expires_at)
-            VALUES (?, ?, 'Ligacao manual', ?, ?, 'Manual', 'reservado', ?, datetime('now'), datetime('now', '+10 minutes'))")
-            ->execute([$companyId, $listId, $phoneRaw, $phone, $agentId]);
+        db()->prepare("INSERT INTO contacts (company_id, list_id, name, phone_raw, phone_e164, origin, status)
+            VALUES (?, ?, 'Ligacao manual', ?, ?, 'Manual', 'novo')")
+            ->execute([$companyId, $listId, $phoneRaw, $phone]);
         $contactId = (int)db()->lastInsertId();
+        db()->prepare("UPDATE contacts SET reserved_by=?, reserved_at=datetime('now'), reservation_expires_at=datetime('now', '+10 minutes') WHERE id=?")
+            ->execute([$agentId, $contactId]);
     } else {
         $contactId = (int)$contact['id'];
-        db()->prepare("UPDATE contacts SET reserved_by = ?, reserved_at = datetime('now'), reservation_expires_at = datetime('now', '+10 minutes'), status = 'reservado' WHERE id = ?")
+        db()->prepare("UPDATE contacts SET reserved_by = ?, reserved_at = datetime('now'), reservation_expires_at = datetime('now', '+10 minutes'), status = 'novo' WHERE id = ?")
             ->execute([$agentId, $contactId]);
     }
 
@@ -6696,7 +6913,7 @@ function quick_hangup(int $callId, int $companyId): void
     $providerBillable = (int)($call['billable_seconds'] ?? 0) > 0 ? (int)$call['billable_seconds'] : null;
     $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
     $billing = call_billing_values($call, $billable);
-    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = CASE WHEN answered_at IS NOT NULL THEN 'atendida' ELSE 'cancelada' END, ended_at = datetime('now'), finalized_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
         ->execute([$duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
     telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
     db()->prepare("UPDATE contacts SET status = 'concluido', reserved_by = NULL, reserved_at = NULL, reservation_expires_at = NULL WHERE id = ?")
@@ -7366,6 +7583,12 @@ function handle_sip_call_event(): never
         $campaignId = (int)($payload['campaign_id'] ?? 0);
         $autoDialing = !empty($payload['auto_dialing'])
             || (string)($user['status'] ?? '') === 'Discando automatico';
+        $asterisk = asterisk_config();
+        if (!empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK') {
+            http_response_code(409);
+            echo json_encode_safe(['ok' => false, 'error' => 'Telefonia Asterisk ativa. Use o fluxo gerenciado do discador.']);
+            exit;
+        }
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ? AND company_id = ?', [$campaignId, $companyId]) : null;
         $contact = null;
         if ($campaign) {
@@ -7666,8 +7889,7 @@ if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_template'])) {
 
 function asterisk_event_key(array $event): string
 {
-    $channelId = (string)($event['channel']['id'] ?? $event['channel']['name'] ?? '');
-    return hash('sha256', implode('|', [(string)($event['timestamp'] ?? ''), (string)($event['type'] ?? ''), $channelId, json_encode_safe($event)]));
+    return hash('sha256', implode('|', [(string)($event['timestamp'] ?? ''), (string)($event['type'] ?? ''), implode(',', asterisk_event_identifiers($event)), json_encode_safe($event)]));
 }
 
 function asterisk_extension_from_identifier(mixed $identifier): string
@@ -7718,8 +7940,8 @@ function asterisk_normalized_event_status(array $event): array
 {
     $type = (string)($event['type'] ?? '');
     $state = strtolower((string)($event['channel']['state'] ?? ''));
-    if ($type === 'StasisStart') return ['in_progress', 'iniciada'];
-    if ($type === 'ChannelAnswered' || $state === 'up') return ['answered', 'atendida'];
+    if ($type === 'ChannelStateChange' && $state === 'up') return ['answered', 'atendida'];
+    if ($type === 'StasisStart') return $state === 'up' ? ['answered', 'atendida'] : ['in_progress', 'iniciada'];
     if ($type === 'ChannelStateChange' && in_array($state, ['ring', 'ringing'], true)) return ['ringing', 'chamando'];
     if (in_array($type, ['ChannelDestroyed', 'StasisEnd'], true)) {
         $cause = (int)($event['cause'] ?? $event['channel']['cause'] ?? 0);
@@ -7734,10 +7956,23 @@ function asterisk_event_transition(array $event, array $call): array
     $state = strtolower((string)($event['channel']['state'] ?? ''));
     $cause = (int)($event['cause'] ?? $event['channel']['cause'] ?? -1);
     $answered = !empty($call['answered_at']) || in_array((string)$call['internal_status'], ['atendida', 'conectada'], true);
-    if ($type === 'channelcreated' || $type === 'stasisstart') return ['in_progress', 'iniciada', false];
+    $dialStatus = strtoupper(trim((string)($event['dialstatus'] ?? '')));
+    if ($type === 'dial' && $dialStatus !== '') {
+        if ($dialStatus === 'ANSWER') return ['answered', 'atendida', false];
+        if (in_array($dialStatus, ['RINGING', 'PROGRESS', 'PROCEEDING'], true)) return ['ringing', 'chamando', false];
+        if ($dialStatus === 'BUSY') return ['busy', 'ocupado', true];
+        if ($dialStatus === 'NOANSWER') return ['no_answer', 'nao_atendida', true];
+        if (in_array($dialStatus, ['CHANUNAVAIL', 'CONGESTION', 'DONTCALL'], true)) return ['failed', 'falha', true];
+        if ($dialStatus === 'CANCEL') return ['cancelled', 'cancelada', true];
+    }
+    if ($type === 'channelcreated' || $type === 'stasisstart') {
+        if ($state === 'up') return ['answered', 'atendida', false];
+        if ($answered) return ['', '', false];
+        return ['in_progress', 'iniciada', false];
+    }
     if ($type === 'channelstatechange' && in_array($state, ['ring', 'ringing'], true)) return ['ringing', 'chamando', false];
-    if ($type === 'channelanswered' || ($type === 'channelstatechange' && $state === 'up')) return ['answered', 'atendida', false];
-    if ($type === 'bridgeenter' && !empty($event['bridge']['id'])) return ['connected', 'conectada', false];
+    if ($type === 'channelstatechange' && $state === 'up') return ['answered', 'atendida', false];
+    if ($type === 'channelenteredbridge' && !empty($event['bridge']['id'])) return ['', '', false];
     if (!in_array($type, ['channeldestroyed', 'stasisend'], true)) return ['', '', false];
     if (in_array($cause, [17], true)) return ['busy', 'ocupado', true];
     if (in_array($cause, [18, 19], true)) return ['no_answer', 'nao_atendida', true];
@@ -7747,10 +7982,40 @@ function asterisk_event_transition(array $event, array $call): array
     return ['failed', 'falha', true];
 }
 
+function connectManualCall(array $call, array $agent): void
+{
+    $callId = (int)($call['id'] ?? 0);
+    if ($callId < 1 || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK' || !empty($call['dial_batch_id'])) return;
+    if (trim((string)($call['provider_linked_id'] ?? '')) !== '') return;
+
+    $claim = db()->prepare("UPDATE calls SET provider_status_raw='ASTERISK_MANUAL_CONSULTANT_ORIGINATING', updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL AND COALESCE(provider_linked_id,'')='' AND provider_status_raw<>'ASTERISK_MANUAL_CONSULTANT_ORIGINATING'");
+    $claim->execute([$callId]);
+    if ($claim->rowCount() !== 1) return;
+
+    try {
+        $provider = new AsteriskProvider(asterisk_config());
+        $connected = $provider->connectManualCall($call, $agent);
+        $consultantChannelId = trim((string)($connected['consultant_channel_id'] ?? ''));
+        if ($consultantChannelId === '') throw new RuntimeException('Canal do consultor nao retornado pelo Asterisk.');
+        db()->prepare("UPDATE calls SET provider_linked_id=?, provider_bridge_id=?, provider_status_raw='ASTERISK_MANUAL_CONSULTANT_ORIGINATED', updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
+            ->execute([$consultantChannelId, (string)($connected['bridge_id'] ?? ''), $callId]);
+        log_call_status((int)$call['company_id'], $callId, 'Asterisk ARI', 'ASTERISK_MANUAL_CONSULTANT_ORIGINATED', 'Canal do consultor originado apos ANSWER.', [
+            'consultant_channel_id' => $consultantChannelId,
+            'bridge_id' => (string)($connected['bridge_id'] ?? ''),
+        ]);
+        asterisk_replay_orphan_events_for_call($callId, $consultantChannelId);
+    } catch (Throwable $e) {
+        db()->prepare("UPDATE calls SET provider_status_raw='ASTERISK_MANUAL_CONSULTANT_FAILED', error_message=?, updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
+            ->execute([$e->getMessage(), $callId]);
+        log_call_status((int)$call['company_id'], $callId, 'Asterisk ARI', 'ASTERISK_MANUAL_CONSULTANT_FAILED', $e->getMessage());
+    }
+}
+
 function asterisk_handle_event(array $event): void
 {
     $eventKey = asterisk_event_key($event);
-    $channelId = (string)($event['channel']['id'] ?? '');
+    $identifiers = asterisk_event_identifiers($event);
+    $channelId = (string)($event['channel']['id'] ?? $event['peer']['id'] ?? $event['caller']['id'] ?? '');
     $linkedId = (string)($event['channel']['linkedid'] ?? '');
     $detectedExtension = asterisk_event_extension($event);
     $eventType = (string)($event['type'] ?? 'unknown');
@@ -7759,10 +8024,19 @@ function asterisk_handle_event(array $event): void
     try {
         $saved = $pdo->prepare("INSERT OR IGNORE INTO asterisk_ari_events (event_key, event_type, payload_json) VALUES (?, ?, ?)");
         $saved->execute([$eventKey, $eventType, json_encode_safe($event)]);
-        if ($saved->rowCount() === 0) { $pdo->commit(); return; }
-        $call = $channelId !== '' ? one('SELECT * FROM calls WHERE provider_channel_id = ? ORDER BY id DESC LIMIT 1', [$channelId]) : null;
-        if (!$call && $linkedId !== '') $call = one('SELECT * FROM calls WHERE provider_linked_id = ? ORDER BY id DESC LIMIT 1', [$linkedId]);
+        if ($saved->rowCount() === 0) {
+            $existingEvent = one('SELECT call_id FROM asterisk_ari_events WHERE event_key = ?', [$eventKey]);
+            if (!empty($existingEvent['call_id'])) { $pdo->commit(); return; }
+        }
+        $call = null;
+        foreach ($identifiers as $identifier) {
+            $call = one('SELECT * FROM calls WHERE provider_channel_id = ? OR provider_linked_id = ? ORDER BY id DESC LIMIT 1', [$identifier, $identifier]);
+            if ($call) { $channelId = $identifier; break; }
+        }
         if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') { $pdo->commit(); return; }
+        $isConsultantChannel = $channelId !== ''
+            && $channelId === (string)($call['provider_linked_id'] ?? '')
+            && $channelId !== (string)($call['provider_channel_id'] ?? '');
         $resolvedUserId = asterisk_associate_call_user($pdo, $call, $detectedExtension);
         if ($detectedExtension !== '' || $resolvedUserId !== null) {
             $event['_ligflow'] = ['detected_extension' => $detectedExtension, 'resolved_user_id' => $resolvedUserId];
@@ -7771,10 +8045,38 @@ function asterisk_handle_event(array $event): void
         $pdo->prepare('UPDATE asterisk_ari_events SET call_id = ? WHERE event_key = ?')->execute([(int)$call['id'], $eventKey]);
         $terminal = !empty($call['finalized_at']);
         [$status, $internal, $isFinal] = asterisk_event_transition($event, $call);
-        if ($status === '' || $terminal) { $pdo->commit(); return; }
-        $rawCause = trim((string)($event['cause_txt'] ?? $event['cause'] ?? ''));
+        $connectConsultantToBridge = false;
+        if ($isConsultantChannel && !$isFinal) {
+            $consultantState = strtolower((string)($event['channel']['state'] ?? ''));
+            $connectConsultantToBridge = empty($call['connected_at']) && (string)($call['status'] ?? '') !== 'connected' && ($consultantState === 'up'
+                || (strtolower($eventType) === 'channelenteredbridge'
+                    && (string)($event['bridge']['id'] ?? '') === (string)($call['provider_bridge_id'] ?? '')));
+            [$status, $internal, $isFinal] = ['', '', false];
+        }
+        if (($status === '' && !$connectConsultantToBridge) || $terminal) { $pdo->commit(); return; }
+        if ($connectConsultantToBridge) {
+            $pdo->commit();
+            try {
+                $provider = new AsteriskProvider(asterisk_config());
+                $provider->addChannelToBridge((string)$call['provider_bridge_id'], $channelId);
+                db()->prepare("UPDATE calls SET status='connected', internal_status='conectada', provider_status_raw='ChannelEnteredBridge', answered_at=COALESCE(answered_at,datetime('now')), connected_at=COALESCE(connected_at,datetime('now')), last_event_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
+                    ->execute([(int)$call['id']]);
+                if (!empty($call['dial_batch_id'])) {
+                    db()->prepare("UPDATE dial_batches SET status='CONNECTED', updated_at=datetime('now') WHERE id=?")
+                        ->execute([(int)$call['dial_batch_id']]);
+                }
+            } catch (Throwable $e) {
+                db()->prepare("UPDATE calls SET provider_status_raw='ASTERISK_CONSULTANT_BRIDGE_FAILED', error_message=?, updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
+                    ->execute([$e->getMessage(), (int)$call['id']]);
+                log_call_status((int)$call['company_id'], (int)$call['id'], 'Asterisk ARI', 'ASTERISK_CONSULTANT_BRIDGE_FAILED', $e->getMessage());
+            }
+            return;
+        }
+        $rawCause = trim((string)($event['cause_txt'] ?? $event['channel']['cause_txt'] ?? $event['dialstatus'] ?? $event['cause'] ?? $event['channel']['cause'] ?? ''));
         $sets = ['status = ?', 'provider_status_raw = ?', 'internal_status = ?', "provider_channel_id = COALESCE(NULLIF(?, ''), provider_channel_id)", "provider_linked_id = COALESCE(NULLIF(?, ''), provider_linked_id)", "last_event_at = datetime('now')", "event_origin = 'ASTERISK_ARI'"];
-        $params = [$status, $eventType . ($rawCause !== '' ? ' - ' . $rawCause : ''), $internal, $channelId, $linkedId];
+        $eventProviderChannelId = $isConsultantChannel ? '' : $channelId;
+        $eventLinkedId = $isConsultantChannel ? $channelId : '';
+        $params = [$status, $eventType . ($rawCause !== '' ? ' - ' . $rawCause : ''), $internal, $eventProviderChannelId, $eventLinkedId];
         if ($internal === 'atendida') $sets[] = "answered_at = COALESCE(answered_at, datetime('now'))";
         if ($internal === 'conectada') { $sets[] = "answered_at = COALESCE(answered_at, datetime('now'))"; $sets[] = "connected_at = COALESCE(connected_at, datetime('now'))"; }
         if ($isFinal) { $sets[] = "ended_at = COALESCE(ended_at, datetime('now'))"; $sets[] = "finalized_at = COALESCE(finalized_at, datetime('now'))"; $sets[] = 'hangup_cause = ?'; $sets[] = "error_message = COALESCE(NULLIF(?, ''), error_message)"; $params[] = $rawCause; $params[] = $rawCause; }
@@ -7783,7 +8085,13 @@ function asterisk_handle_event(array $event): void
         $pdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, ?, ?, ?)")
             ->execute([(int)$call['company_id'], (int)$call['id'], 'asterisk.' . strtolower($eventType), (string)$call['status'], $status, json_encode_safe($event)]);
         $pdo->commit();
-        if ($internal === 'atendida' && !empty($call['dial_batch_id'])) asterisk_batch_answered((int)$call['id']);
+        if ($internal === 'atendida' && !empty($call['dial_batch_id'])) {
+            asterisk_batch_answered((int)$call['id']);
+        } elseif ($internal === 'atendida' && !$isConsultantChannel) {
+            $call = one('SELECT * FROM calls WHERE id=?', [(int)$call['id']]) ?: $call;
+            $agent = one('SELECT * FROM users WHERE id=? AND company_id=?', [(int)$call['agent_id'], (int)$call['company_id']]) ?: [];
+            connectManualCall($call, $agent);
+        }
         if ($isFinal) {
             $updated = one('SELECT * FROM calls WHERE id = ? AND company_id = ?', [(int)$call['id'], (int)$call['company_id']]);
             if ($updated) {
@@ -7795,6 +8103,9 @@ function asterisk_handle_event(array $event): void
                 db()->prepare("UPDATE calls SET duration_seconds = ?, billable_seconds = ?, estimated_cost_micros = ?, confirmed_cost = ? WHERE id = ? AND finalized_at IS NOT NULL")
                     ->execute([$duration, $billable, (int)$billing['cost_micros'], (int)$billing['cost_micros'] / 1000000, (int)$updated['id']]);
                 telephony_record_call_debit($updated, $billing, (int)$updated['agent_id']);
+                try { (new AsteriskProvider(asterisk_config()))->hangup($updated); } catch (Throwable $cleanupError) {
+                    log_call_status((int)$updated['company_id'], (int)$updated['id'], 'Asterisk ARI', 'ASTERISK_CLEANUP_FAILED', $cleanupError->getMessage());
+                }
             }
         }
         if ($isFinal && !empty($call['dial_batch_id'])) asterisk_continue_batch_if_exhausted((int)$call['dial_batch_id']);
@@ -7803,6 +8114,22 @@ function asterisk_handle_event(array $event): void
         throw $e;
     }
 }
+
+function asterisk_replay_orphan_events_for_call(int $callId, string $channelId): void
+{
+    if ($callId < 1 || $channelId === '') return;
+    $events = rows("SELECT payload_json FROM asterisk_ari_events WHERE call_id IS NULL ORDER BY id ASC LIMIT 200");
+    foreach ($events as $row) {
+        $event = json_decode((string)($row['payload_json'] ?? ''), true);
+        if (!is_array($event) || !asterisk_event_references_channel($event, $channelId)) continue;
+        try {
+            asterisk_handle_event($event);
+        } catch (Throwable $e) {
+            log_call_status(0, $callId, 'Asterisk ARI', 'orphan_event_replay_failed', $e->getMessage());
+        }
+    }
+}
+
 final class AsteriskAriWebSocket
 {
     private $socket = null;
@@ -7851,6 +8178,11 @@ final class AsteriskAriWebSocket
         if ($opcode !== 1 || $payload === '') return null;
         $event = json_decode($payload, true);
         return is_array($event) ? $event : null;
+    }
+    public function timedOut(): bool
+    {
+        if (!is_resource($this->socket)) return false;
+        return !empty(stream_get_meta_data($this->socket)['timed_out']);
     }
     public function close(): void { if (is_resource($this->socket)) fclose($this->socket); $this->socket = null; }
 }
@@ -7981,7 +8313,7 @@ if ($page !== 'login') {
     require_login();
     $mergedCallsAccess = ($page === 'supervisor' && can('recordings'))
         || ($page === 'recordings' && can('supervisor'));
-    $agentEndpointAccess = in_array($page, ['answered_calls_batch', 'agent_batch_state'], true) && can('agent');
+    $agentEndpointAccess = in_array($page, ['answered_calls_batch', 'agent_batch_state', 'asterisk_call_state', 'asterisk_manual_hangup'], true) && can('agent');
     if (!can($page) && !$mergedCallsAccess && !$agentEndpointAccess) {
         flash('Voce nao tem permissao para acessar esta area.', 'error');
         redirect('?page=dashboard');
@@ -8196,8 +8528,10 @@ function render_floating_webphone_panel(): void
     if (!$user || !can('agent')) {
         return;
     }
+    $asterisk = asterisk_config();
+    $managedAsterisk = !empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK';
     $campaignId = selected_campaign_id();
-    $activeCall = get_active_call((int)$user['id'], (int)$user['company_id']);
+    $activeCall = get_active_manual_call((int)$user['id'], (int)$user['company_id']);
     $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
     $recentHistory = recent_phone_history((int)$user['company_id'], (int)$user['id']);
     $recentCalls = $recentHistory['todas'];
@@ -8206,14 +8540,15 @@ function render_floating_webphone_panel(): void
     $recentMissed = $recentHistory['perdidas'];
     $phoneContacts = rows("SELECT name, phone_e164, product, status FROM contacts WHERE company_id = ? AND status <> 'excluido' ORDER BY last_call_at DESC, id DESC LIMIT 8", [(int)$user['company_id']]);
     ?>
-    <section class="webphone-panel" data-sip-floating>
+    <section class="webphone-panel" data-sip-floating data-managed-asterisk="<?= $managedAsterisk ? '1' : '0' ?>" data-managed-call-id="<?= $managedAsterisk && $activeCall ? (int)$activeCall['id'] : 0 ?>">
         <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
         <article class="webphone is-hidden" data-webphone>
             <header>
                 <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong>Webfone manual</strong></div>
                 <button type="button" class="icon-button" data-webphone-close aria-label="Fechar webfone">x</button>
             </header>
-            <form class="webphone-form" data-floating-webphone-form>
+            <form method="post" class="webphone-form" data-floating-webphone-form>
+                <input type="hidden" name="action" value="manual_call">
                 <button type="button" class="phone-backspace" data-clear-phone aria-label="Limpar numero">&#9003;</button>
                 <input type="hidden" name="campaign_id" value="<?= (int)$campaignId ?>">
                 <input name="manual_phone" class="dial-display" placeholder="Pesquisar ou digitar numero" inputmode="tel" autocomplete="off" data-phone-search-input>
@@ -9736,10 +10071,98 @@ if (($_GET['page'] ?? '') === 'agent_batch_state') {
     handle_agent_batch_state();
 }
 
+function finalize_stalled_asterisk_manual_call(array $call, string $cause): array
+{
+    $callId = (int)$call['id'];
+    $companyId = (int)$call['company_id'];
+    $cause = trim($cause) !== '' ? trim($cause) : 'ARI_ORIGIN_TIMEOUT';
+    try {
+        (new AsteriskProvider(asterisk_config()))->hangup($call);
+    } catch (Throwable $e) {
+        log_call_status($companyId, $callId, 'Asterisk ARI', 'terminal_cleanup_failed', $e->getMessage());
+        if (!empty($call['provider_bridge_id'])) {
+            try {
+                (new AsteriskProvider(asterisk_config()))->destroyBridge((string)$call['provider_bridge_id']);
+            } catch (Throwable $bridgeError) {
+                log_call_status($companyId, $callId, 'Asterisk ARI', 'bridge_cleanup_failed', $bridgeError->getMessage());
+            }
+        }
+    }
+    db()->prepare("UPDATE calls SET status='failed', provider_status_raw=?, internal_status='falha', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
+        ->execute([$cause, $cause, $callId]);
+    db()->prepare("UPDATE contacts SET status='novo', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
+        ->execute([(int)$call['contact_id'], $companyId]);
+    db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Em ligacao'")
+        ->execute([(int)$call['agent_id'], $companyId]);
+    db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'asterisk.manual.terminal_fallback', ?, 'failed', ?)")
+        ->execute([$companyId, $callId, (string)$call['status'], json_encode_safe(['cause' => $cause])]);
+    log_call_status($companyId, $callId, 'Asterisk ARI', 'failed', $cause);
+    return one('SELECT * FROM calls WHERE id=? AND company_id=?', [$callId, $companyId]) ?: $call;
+}
+
+function handle_asterisk_call_state(): never
+{
+    require_login();
+    $user = current_user();
+    header('Content-Type: application/json; charset=utf-8');
+    $callId = max(0, (int)($_GET['call_id'] ?? 0));
+    $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
+    if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') {
+        http_response_code(404);
+        echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
+        exit;
+    }
+
+    $view = asterisk_manual_call_view_state($call);
+    if ($view['active'] && asterisk_origin_has_timed_out($call, time(), 15)) {
+        $call = finalize_stalled_asterisk_manual_call($call, 'ARI_ORIGIN_TIMEOUT: canal permaneceu sem progresso por 15 segundos.');
+        $view = asterisk_manual_call_view_state($call);
+    }
+    echo json_encode_safe([
+        'ok' => true,
+        'active' => $view['active'],
+        'phase' => $view['phase'],
+        'label' => $view['label'],
+        'status' => (string)$call['status'],
+        'error' => (string)($call['error_message'] ?? ''),
+        'destination' => (string)($call['destination_number'] ?? ''),
+    ]);
+    exit;
+}
+
+function handle_asterisk_manual_hangup(): never
+{
+    require_login();
+    $user = current_user();
+    header('Content-Type: application/json; charset=utf-8');
+    $payload = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
+    $callId = max(0, (int)($payload['call_id'] ?? 0));
+    $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND c.telephony_mode='ASTERISK' AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
+    if (!$call) {
+        http_response_code(404);
+        echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
+        exit;
+    }
+    if (asterisk_manual_call_view_state($call)['active']) {
+        quick_hangup($callId, (int)$user['company_id']);
+    }
+    echo json_encode_safe(['ok' => true, 'active' => false, 'phase' => 'ended', 'label' => 'Encerrada']);
+    exit;
+}
+
+if (($_GET['page'] ?? '') === 'asterisk_call_state') {
+    handle_asterisk_call_state();
+}
+if (($_GET['page'] ?? '') === 'asterisk_manual_hangup') {
+    handle_asterisk_manual_hangup();
+}
+
 function render_agent(): void
 {
     layout('agent', function () {
         $user = current_user();
+        $asterisk = asterisk_config();
+        $managedAsterisk = !empty($asterisk['enabled']) && ($asterisk['active_mode'] ?? '') === 'ASTERISK';
         [$clause, $params] = tenant_clause();
         $campaigns = rows("SELECT id, name, status FROM campaigns WHERE {$clause} AND status <> 'Manual' ORDER BY status, name", $params);
         $campaignId = selected_campaign_id();
@@ -9773,7 +10196,7 @@ function render_agent(): void
         } else {
             $activeCall = $isAutoDialing && $campaignId
                 ? one("SELECT * FROM calls WHERE agent_id = ? AND company_id = ? AND campaign_id = ? AND status IN (" . active_call_statuses_sql() . ") AND COALESCE(race_outcome, '') NOT IN ('LOSER','LATE_ANSWERED') ORDER BY id DESC LIMIT 1", [(int)$user['id'], (int)$user['company_id'], $campaignId])
-                : get_active_call((int)$user['id'], (int)$user['company_id']);
+                : get_active_campaign_call((int)$user['id'], (int)$user['company_id']);
         }
         $isBatchWaitingForWinner = (bool)($batchState['awaiting_winner'] ?? false);
         if ($isBatchWaitingForWinner) $activeCall = null;
@@ -10090,14 +10513,15 @@ function render_agent(): void
                 </div>
             <?php endif; ?>
         </section>
-        <section class="webphone-panel" data-sip-floating data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>"<?= $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
+        <section class="webphone-panel" data-sip-floating data-managed-asterisk="<?= $managedAsterisk ? '1' : '0' ?>" data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>" data-managed-call-id="<?= $managedAsterisk && !$isAutoDialing && $activeCall ? (int)$activeCall['id'] : 0 ?>"<?= $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
             <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
             <article class="webphone is-hidden" data-webphone>
                 <header>
                     <div class="webphone-title"><span class="status-dot" data-floating-sip-dot></span><strong><?= $isAutoDialing ? 'Discador automatico' : 'Webfone manual' ?></strong></div>
                     <button type="button" class="icon-button" data-webphone-close aria-label="Fechar webfone">x</button>
                 </header>
-                <form class="webphone-form" data-floating-webphone-form>
+                <form method="post" class="webphone-form" data-floating-webphone-form>
+                    <input type="hidden" name="action" value="manual_call">
                     <button type="button" class="phone-backspace" data-clear-phone aria-label="Limpar numero">&#9003;</button>
                     <input type="hidden" name="campaign_id" value="<?= $campaignId ?>">
                     <input name="manual_phone" class="dial-display" value="<?= h($isAutoDialing && $activeCall ? nvoip_phone_digits((string)$activeCall['destination_number']) : '') ?>" placeholder="Pesquisar ou digitar numero" inputmode="tel" autocomplete="off" data-phone-search-input>

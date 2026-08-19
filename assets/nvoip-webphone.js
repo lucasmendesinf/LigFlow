@@ -462,6 +462,8 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     let connecting = false;
     let autoCallStarted = false;
     let currentSipCallId = null;
+    let managedCallPhase = '';
+    let managedCallPollTimer = null;
     let currentSipStartedAt = null;
     let currentSipAnswered = false;
     let currentSipRingingConfirmed = false;
@@ -497,6 +499,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const isAutoDialing = () => root.getAttribute('data-auto-dialing') === '1';
+    const usesManagedAsterisk = () => root.getAttribute('data-managed-asterisk') === '1';
 
     const blockManualCallDuringAutoDialing = () => {
         if (!isAutoDialing()) return false;
@@ -966,7 +969,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     const service = new NvoipWebphoneService({
         remoteAudio,
         onState: (state) => {
-            setText(statusEl, state.call || state.status);
+            if (state.call || !usesManagedAsterisk()) setText(statusEl, state.call || state.status);
             if (state.register) setText(registerEl, state.register);
             if (state.call) setText(callState, state.call);
             if (state.direction) currentSipDirection = state.direction;
@@ -1075,6 +1078,68 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         refreshCallButtonReady();
     };
 
+    const stopManagedCallPolling = () => {
+        if (!managedCallPollTimer) return;
+        clearTimeout(managedCallPollTimer);
+        managedCallPollTimer = null;
+    };
+
+    const applyManagedCallState = (state) => {
+        managedCallPhase = String(state.phase || '');
+        setText(callState, state.label || 'Iniciando chamada');
+        setText(statusEl, state.status || managedCallPhase || 'iniciando');
+        if (state.destination) setText(destinationEl, state.destination);
+        if (!state.active) {
+            stopManagedCallPolling();
+            currentSipCallId = null;
+            callButton?.classList.remove('hangup');
+            callButton?.setAttribute('aria-label', 'Ligar manualmente');
+            monitor?.classList.remove('online');
+            toggleStopCallButtons(false);
+            document.querySelectorAll('[data-live-call-timer]').forEach((timer) => timer.remove());
+            setText(callDetail, state.error || state.label || 'Chamada encerrada');
+            root.querySelector('[data-webphone]')?.classList.remove('is-hidden');
+            refreshCallButtonReady();
+            return;
+        }
+        monitor?.classList.add('online');
+        callButton?.classList.add('hangup');
+        callButton?.setAttribute('aria-label', 'Encerrar chamada');
+        toggleStopCallButtons(true);
+        if (managedCallPhase === 'answered' || managedCallPhase === 'connected') {
+            currentSipStartedAt ||= Date.now();
+        }
+    };
+
+    const pollManagedCallState = async () => {
+        if (!usesManagedAsterisk() || !currentSipCallId || isAutoDialing()) return;
+        try {
+            const response = await fetch(`?page=asterisk_call_state&call_id=${encodeURIComponent(currentSipCallId)}`, { credentials: 'same-origin' });
+            const state = await response.json();
+            if (!response.ok || !state.ok) throw new Error(state.error || 'Falha ao consultar chamada Asterisk.');
+            applyManagedCallState(state);
+            if (state.active) managedCallPollTimer = setTimeout(pollManagedCallState, 1000);
+        } catch (error) {
+            setText(callDetail, error.message);
+            managedCallPollTimer = setTimeout(pollManagedCallState, 1500);
+        }
+    };
+
+    const hangupManagedCall = async () => {
+        if (!currentSipCallId) return;
+        const callId = currentSipCallId;
+        stopManagedCallPolling();
+        const response = await fetch('?page=asterisk_manual_hangup', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ call_id: callId }),
+        });
+        const state = await response.json();
+        if (!response.ok || !state.ok) throw new Error(state.error || 'Falha ao encerrar chamada Asterisk.');
+        applyManagedCallState(state);
+    };
+
     window.ligflowStopWebphoneCall = async (options = {}) => {
         stopRequestedByUser = true;
         forcedTerminalFailure = null;
@@ -1086,6 +1151,14 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         if (options.playSound && window.ligflowPlayHangupSound) {
             window.ligflowPlayHangupSound();
+        }
+        if (usesManagedAsterisk() && currentSipCallId && !isAutoDialing()) {
+            try {
+                await hangupManagedCall();
+            } catch (error) {
+                setText(callDetail, error.message);
+            }
+            return;
         }
         if (service.session || currentSipCallId) {
             service.hangup();
@@ -1243,6 +1316,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }
         panel?.classList.remove('is-hidden');
         root.querySelector('[data-phone-tab="teclado"]')?.click();
+        if (usesManagedAsterisk() && !isAutoDialing()) {
+            if (form) HTMLFormElement.prototype.submit.call(form);
+            return true;
+        }
         await placeCall(cleanNumber);
         return true;
     };
@@ -1261,6 +1338,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             return;
         }
         if (blockManualCallDuringAutoDialing()) return;
+        if (usesManagedAsterisk() && !isAutoDialing()) {
+            HTMLFormElement.prototype.submit.call(form);
+            return;
+        }
         await placeCall(input?.value || '');
     });
 
@@ -1277,12 +1358,22 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             return;
         }
         if (blockManualCallDuringAutoDialing()) return;
+        if (usesManagedAsterisk() && !isAutoDialing()) {
+            if (form) HTMLFormElement.prototype.submit.call(form);
+            return;
+        }
         await placeCall(input?.value || '');
     });
 
     const autoCallPhone = root.getAttribute('data-auto-call-phone');
     const recoverAutoCallId = Number(root.getAttribute('data-recover-auto-call-id') || 0);
-    if (autoCallPhone && !autoCallStarted) {
+    const managedCallId = Number(root.getAttribute('data-managed-call-id') || 0);
+    if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
+        currentSipCallId = managedCallId;
+        panel?.classList.remove('is-hidden');
+        root.querySelector('[data-phone-tab="monitorar"]')?.click();
+        pollManagedCallState();
+    } else if (autoCallPhone && !autoCallStarted) {
         autoCallStarted = true;
         const cleanAutoCallPhone = service.normalizeSipDialNumber(autoCallPhone);
         if (input) {

@@ -8,6 +8,12 @@ if (PHP_SAPI !== 'cli') {
     exit(1);
 }
 
+$lockHandle = fopen(DATA_DIR . '/asterisk_ari_worker.lock', 'c+');
+if (!$lockHandle || !flock($lockHandle, LOCK_EX | LOCK_NB)) {
+    error_log('LigFlow Asterisk ARI worker: another consumer is already running.');
+    exit(0);
+}
+
 $backoff = 2;
 while (true) {
     $config = asterisk_config();
@@ -24,6 +30,9 @@ while (true) {
         while (true) {
             $event = $socket->readEvent(10);
             if ($event === null) {
+                if ($socket->timedOut()) {
+                    continue;
+                }
                 throw new RuntimeException('Conexao ARI encerrada.');
             }
             asterisk_handle_event($event);
