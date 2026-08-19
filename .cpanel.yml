@@ -3,7 +3,8 @@ deployment:
   tasks:
     - export DEPLOYPATH=/home/calutecc/ligflow.calutec.com.br
     - /bin/mkdir -p $DEPLOYPATH/data $DEPLOYPATH/uploads/avatars $DEPLOYPATH/uploads/imports $DEPLOYPATH/migrations
-    - /bin/cp -f index.php billing_domain.php $DEPLOYPATH/
+    - /bin/cp -f index.php billing_domain.php asterisk_routing.php asterisk_recording.php asterisk_ari_worker.php asterisk_provisioning_worker.php $DEPLOYPATH/
     - /bin/cp -Rf assets $DEPLOYPATH/
     - /bin/cp -Rf migrations/. $DEPLOYPATH/migrations/
     - /bin/chmod 775 $DEPLOYPATH/data $DEPLOYPATH/uploads $DEPLOYPATH/uploads/avatars $DEPLOYPATH/uploads/imports
+    - /bin/sh deploy/restart_ari_worker.sh $DEPLOYPATH
