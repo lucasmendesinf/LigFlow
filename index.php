@@ -10202,6 +10202,9 @@ function render_agent(): void
         if ($isBatchWaitingForWinner) $activeCall = null;
         $isConnectedBatchWinner = $activeBatch && !empty($activeBatch['winner_call_id']) && $activeCall && empty($activeCall['finalized_at']);
         $isCallLive = $isBatchWaitingForWinner || $isConnectedBatchWinner || ($activeCall && in_array((string)$activeCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true));
+        $activeManualCall = $managedAsterisk && !$isAutoDialing ? get_active_manual_call((int)$user['id'], (int)$user['company_id']) : null;
+        $webphoneActiveCall = $isAutoDialing ? $activeCall : $activeManualCall;
+        $webphoneCallLive = $webphoneActiveCall && in_array((string)$webphoneActiveCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
         $reserved = $activeCall ? one('SELECT * FROM contacts WHERE id = ? AND company_id = ?', [$activeCall['contact_id'], $activeCall['company_id']]) : null;
         if (!$reserved && $campaign && !$isBatchWaitingForWinner) {
             $reserved = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$campaign['company_id'], $campaign['list_id'], $user['id']]);
@@ -10513,7 +10516,7 @@ function render_agent(): void
                 </div>
             <?php endif; ?>
         </section>
-        <section class="webphone-panel" data-sip-floating data-managed-asterisk="<?= $managedAsterisk ? '1' : '0' ?>" data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>" data-managed-call-id="<?= $managedAsterisk && !$isAutoDialing && $activeCall ? (int)$activeCall['id'] : 0 ?>"<?= $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
+        <section class="webphone-panel" data-sip-floating data-managed-asterisk="<?= $managedAsterisk ? '1' : '0' ?>" data-auto-dialing="<?= $isAutoDialing ? '1' : '0' ?>" data-managed-call-id="<?= $managedAsterisk && $webphoneActiveCall ? (int)$webphoneActiveCall['id'] : 0 ?>"<?= $isAutoDialing && !$isBatchWaitingForWinner && !$activeCall && ($autoNextPhone !== '' || $reserved) ? ' data-auto-call-phone="' . h($autoNextPhone !== '' ? $autoNextPhone : (string)($reserved['phone_e164'] ?? '')) . '"' : '' ?><?= $isAutoDialing && $activeCall && $isCallLive && empty($activeCall['answered_at']) ? ' data-recover-auto-call-id="' . (int)$activeCall['id'] . '"' : '' ?>>
             <button class="webphone-launcher" type="button" data-webphone-toggle aria-label="Abrir webfone">&#10303;</button>
             <article class="webphone is-hidden" data-webphone>
                 <header>
@@ -10556,18 +10559,18 @@ function render_agent(): void
                             <button type="button" data-digit="<?= h($key[0]) ?>"><strong><?= h($key[0]) ?></strong><small><?= h($key[1]) ?></small></button>
                         <?php endforeach; ?>
                     </div>
-                    <button class="call-fab <?= $isCallLive ? 'hangup' : '' ?>" type="submit" data-floating-call-button aria-label="<?= $isCallLive ? 'Encerrar chamada' : 'Ligar manualmente' ?>">&#9742;</button>
+                    <button class="call-fab <?= $webphoneCallLive ? 'hangup' : '' ?>" type="submit" data-floating-call-button aria-label="<?= $webphoneCallLive ? 'Encerrar chamada' : 'Ligar manualmente' ?>">&#9742;</button>
                     </div>
                     <div class="webphone-tab-panel" data-tab-panel="monitorar">
-                        <div class="phone-monitor <?= $isCallLive ? 'online' : '' ?>">
+                        <div class="phone-monitor <?= $webphoneCallLive ? 'online' : '' ?>">
                             <span></span>
-                            <strong><?= $isBatchWaitingForWinner ? 'Discagem simultânea' : ($isCallLive ? 'Chamada ativa' : 'Sem chamada ativa') ?></strong>
-                            <small><?= $isBatchWaitingForWinner ? 'Aguardando vencedora' : h($activeCall['external_call_id'] ?? ($lastCall['external_call_id'] ?? 'Aguardando discagem')) ?></small>
+                            <strong><?= $isBatchWaitingForWinner ? 'Discagem simultânea' : ($webphoneCallLive ? 'Chamada ativa' : 'Sem chamada ativa') ?></strong>
+                            <small><?= $isBatchWaitingForWinner ? 'Aguardando vencedora' : h($webphoneActiveCall['external_call_id'] ?? ($lastCall['external_call_id'] ?? 'Aguardando discagem')) ?></small>
                         </div>
                         <dl class="phone-monitor-details">
                             <dt>Registro</dt><dd data-floating-register>Desconectado</dd>
-                            <dt>Status</dt><dd data-floating-status><?= $isBatchWaitingForWinner ? 'aguardando_vencedora' : h($activeCall['status'] ?? ($lastCall['status'] ?? 'pronto')) ?></dd>
-                            <dt>Destino</dt><dd data-floating-destination><?= $isBatchWaitingForWinner ? '-' : h($activeCall['destination_number'] ?? ($lastCall['destination_number'] ?? '-')) ?></dd>
+                            <dt>Status</dt><dd data-floating-status><?= $isBatchWaitingForWinner ? 'aguardando_vencedora' : h($webphoneActiveCall['status'] ?? ($lastCall['status'] ?? 'pronto')) ?></dd>
+                            <dt>Destino</dt><dd data-floating-destination><?= $isBatchWaitingForWinner ? '-' : h($webphoneActiveCall['destination_number'] ?? ($lastCall['destination_number'] ?? '-')) ?></dd>
                         </dl>
                         <audio data-floating-remote-audio autoplay></audio>
                     </div>
