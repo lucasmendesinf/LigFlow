@@ -10118,28 +10118,33 @@ function handle_asterisk_call_state(): never
     require_login();
     $user = current_user();
     header('Content-Type: application/json; charset=utf-8');
-    $callId = max(0, (int)($_GET['call_id'] ?? 0));
-    $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
-    if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') {
-        http_response_code(404);
-        echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
-        exit;
-    }
+    try {
+        $callId = max(0, (int)($_GET['call_id'] ?? 0));
+        $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
+        if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') {
+            http_response_code(404);
+            echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
+            exit;
+        }
 
-    $view = asterisk_manual_call_view_state($call);
-    if ($view['active'] && asterisk_origin_has_timed_out($call, time(), 15)) {
-        $call = finalize_stalled_asterisk_manual_call($call, 'ARI_ORIGIN_TIMEOUT: canal permaneceu sem progresso por 15 segundos.');
         $view = asterisk_manual_call_view_state($call);
+        if ($view['active'] && asterisk_origin_has_timed_out($call, time(), 15)) {
+            $call = finalize_stalled_asterisk_manual_call($call, 'ARI_ORIGIN_TIMEOUT: canal permaneceu sem progresso por 15 segundos.');
+            $view = asterisk_manual_call_view_state($call);
+        }
+        echo json_encode_safe([
+            'ok' => true,
+            'active' => $view['active'],
+            'phase' => $view['phase'],
+            'label' => $view['label'],
+            'status' => (string)$call['status'],
+            'error' => (string)($call['error_message'] ?? ''),
+            'destination' => (string)($call['destination_number'] ?? ''),
+        ]);
+    } catch (Throwable $e) {
+        http_response_code(500);
+        echo json_encode_safe(['ok' => false, 'error' => $e->getMessage()]);
     }
-    echo json_encode_safe([
-        'ok' => true,
-        'active' => $view['active'],
-        'phase' => $view['phase'],
-        'label' => $view['label'],
-        'status' => (string)$call['status'],
-        'error' => (string)($call['error_message'] ?? ''),
-        'destination' => (string)($call['destination_number'] ?? ''),
-    ]);
     exit;
 }
 
@@ -10148,18 +10153,23 @@ function handle_asterisk_manual_hangup(): never
     require_login();
     $user = current_user();
     header('Content-Type: application/json; charset=utf-8');
-    $payload = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
-    $callId = max(0, (int)($payload['call_id'] ?? 0));
-    $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND c.telephony_mode='ASTERISK' AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
-    if (!$call) {
-        http_response_code(404);
-        echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
-        exit;
+    try {
+        $payload = json_decode(file_get_contents('php://input') ?: '{}', true) ?: [];
+        $callId = max(0, (int)($payload['call_id'] ?? 0));
+        $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND c.telephony_mode='ASTERISK' AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
+        if (!$call) {
+            http_response_code(404);
+            echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
+            exit;
+        }
+        if (asterisk_manual_call_view_state($call)['active']) {
+            quick_hangup($callId, (int)$user['company_id']);
+        }
+        echo json_encode_safe(['ok' => true, 'active' => false, 'phase' => 'ended', 'label' => 'Encerrada']);
+    } catch (Throwable $e) {
+        http_response_code(500);
+        echo json_encode_safe(['ok' => false, 'error' => $e->getMessage()]);
     }
-    if (asterisk_manual_call_view_state($call)['active']) {
-        quick_hangup($callId, (int)$user['company_id']);
-    }
-    echo json_encode_safe(['ok' => true, 'active' => false, 'phase' => 'ended', 'label' => 'Encerrada']);
     exit;
 }
 
