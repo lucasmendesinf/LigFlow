@@ -18,9 +18,18 @@ function asterisk_route_trunk(array $config): string
     return $trunk;
 }
 
-function asterisk_outbound_endpoint(array $config, string $destination): string
+function asterisk_national_dial_digits(string $destination): string
 {
     $destination = preg_replace('/\D+/', '', $destination) ?? '';
+    if (preg_match('/^55\d{10,11}$/', $destination) === 1) {
+        $destination = substr($destination, 2);
+    }
+    return $destination;
+}
+
+function asterisk_outbound_endpoint(array $config, string $destination): string
+{
+    $destination = asterisk_national_dial_digits($destination);
     if ($destination === '') {
         throw new RuntimeException('Numero de destino Asterisk invalido.');
     }

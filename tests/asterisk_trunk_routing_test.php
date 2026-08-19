@@ -13,8 +13,11 @@ $nvoip = ['active_route' => 'NVOIP_TRUNK', 'nvoip_trunk' => 'nvoip', 'directcall
 $directcall = ['active_route' => 'DIRECTCALL_TRUNK', 'nvoip_trunk' => 'nvoip', 'directcall_trunk' => 'directcall'];
 
 $assert(asterisk_route_trunk($nvoip) === 'nvoip', 'NVOIP_TRUNK resolves to the nvoip PJSIP endpoint');
-$assert(asterisk_outbound_endpoint($nvoip, '+55 (41) 99999-9999') === 'PJSIP/5541999999999@nvoip', 'NVOIP_TRUNK resolves to the nvoip PJSIP endpoint and digits only');
-$assert(asterisk_outbound_endpoint($directcall, '+55 (41) 99999-9999') === 'PJSIP/5541999999999@directcall', 'DIRECTCALL_TRUNK resolves to the directcall PJSIP endpoint');
+$assert(asterisk_outbound_endpoint($nvoip, '+55 (41) 99999-9999') === 'PJSIP/41999999999@nvoip', 'NVOIP_TRUNK strips the 55 country code and dials the national number');
+$assert(asterisk_outbound_endpoint($directcall, '+55 (41) 99999-9999') === 'PJSIP/41999999999@directcall', 'DIRECTCALL_TRUNK strips the 55 country code and dials the national number');
+$assert(asterisk_outbound_endpoint($nvoip, '41999999999') === 'PJSIP/41999999999@nvoip', 'a number already in national format is left untouched');
+$assert(asterisk_outbound_endpoint($nvoip, '5541988887777') === 'PJSIP/41988887777@nvoip', '55 + 11-digit mobile numbers are stripped down to the national number');
+$assert(asterisk_outbound_endpoint($nvoip, '551133334444') === 'PJSIP/1133334444@nvoip', '55 + 10-digit landline numbers are stripped down to the national number');
 
 $snapshot = $nvoip;
 $current = $directcall;
@@ -50,7 +53,7 @@ foreach ($flows as $flow => $channelId) {
         $assert($result['telephony_mode'] === 'ASTERISK', "{$flow} {$route} uses Asterisk mode");
         $assert($result['telephony_trunk'] === $route, "{$flow} {$route} keeps the selected route snapshot");
         $assert($result['provider_channel_id'] === $channelId, "{$flow} {$route} keeps the ARI channel id");
-        $expected = $route === 'NVOIP_TRUNK' ? 'PJSIP/5541999999999@nvoip' : 'PJSIP/5541999999999@directcall';
+        $expected = $route === 'NVOIP_TRUNK' ? 'PJSIP/41999999999@nvoip' : 'PJSIP/41999999999@directcall';
         $assert($result['endpoint'] === $expected, "{$flow} {$route} sends the expected ARI endpoint");
     }
 }
