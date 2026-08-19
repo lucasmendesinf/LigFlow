@@ -1380,6 +1380,9 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     const autoCallPhone = root.getAttribute('data-auto-call-phone');
     const recoverAutoCallId = Number(root.getAttribute('data-recover-auto-call-id') || 0);
     const managedCallId = Number(root.getAttribute('data-managed-call-id') || 0);
+    if (usesManagedAsterisk()) {
+        ensureRegistered();
+    }
     if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
         currentSipCallId = managedCallId;
         panel?.classList.remove('is-hidden');
