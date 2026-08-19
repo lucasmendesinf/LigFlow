@@ -2355,7 +2355,16 @@ final class AsteriskProvider implements TelephonyProvider
             $confirmed = asterisk_ari_request($this->config, 'GET', '/channels/' . rawurlencode($channelId));
         } catch (AsteriskAriRequestException $e) {
             if ((int)($e->diagnostics()['http_status'] ?? 0) === 404) {
-                throw new RuntimeException('ARI_CHANNEL_DESTROYED: o canal retornado pelo Asterisk encerrou antes da confirmacao.');
+                // The channel already terminated (e.g. an immediate busy/reject) before we could
+                // confirm it. Asterisk did accept the origination, so trust the channelId from the
+                // POST response and let the caller insert the call row: its terminal ARI event is
+                // already sitting as an orphan and will be replayed with the real cause.
+                log_call_status(0, null, 'Asterisk ARI', 'origin_confirmed_after_teardown', 'Canal ARI encerrou antes da confirmacao; causa real sera aplicada via replay.', [
+                    'requested_channel_id' => $externalId,
+                    'returned_channel_id' => $channelId,
+                    'endpoint' => $dialString,
+                ]);
+                return $channelId;
             }
             throw $e;
         }
