@@ -6355,7 +6355,7 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     $allowed = telephony_call_allowed($companyId);
     if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
     $limit = campaign_effective_parallelism($campaign, $companyId);
-    if ($limit < 1) { flash('Sem capacidade ou leads elegiveis para iniciar o lote Asterisk.', 'error'); return false; }
+    if ($limit < 1) { flash('Lista finalizada, crie nova remessa para os contatos nao atendidos e ocupados.', 'error'); return false; }
     $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit, (int)$allowed['state']['period_id']);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
     if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
