@@ -6355,10 +6355,20 @@ function start_asterisk_parallel_batch(array $campaign, int $agentId, int $compa
     $allowed = telephony_call_allowed($companyId);
     if (!$allowed['ok']) { flash((string)$allowed['message'], 'error'); return false; }
     $limit = campaign_effective_parallelism($campaign, $companyId);
-    if ($limit < 1) { flash('Lista finalizada, crie nova remessa para os contatos nao atendidos e ocupados.', 'error'); return false; }
+    if ($limit < 1) {
+        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+            ->execute([$agentId, $companyId]);
+        flash('Lista finalizada, crie nova remessa para os contatos nao atendidos e ocupados.', 'error');
+        return false;
+    }
     $batch = reserve_parallel_contacts($campaign, $agentId, $companyId, $limit, (int)$allowed['state']['period_id']);
     if (!$batch) { flash('Ja existe um lote Asterisk ativo para este consultor.', 'error'); return false; }
-    if (empty($batch['contacts'])) { flash('Nao ha numeros novos para ligar nesta lista.', 'error'); return false; }
+    if (empty($batch['contacts'])) {
+        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+            ->execute([$agentId, $companyId]);
+        flash('Lista finalizada, crie nova remessa para os contatos nao atendidos e ocupados.', 'error');
+        return false;
+    }
     $agent = one('SELECT * FROM users WHERE id = ? AND company_id = ?', [$agentId, $companyId]) ?: [];
     $provider = telephony_provider_for_company($companyId);
     if (!$provider instanceof AsteriskProvider) throw new RuntimeException('Provedor Asterisk indisponivel para este lote.');
@@ -6491,7 +6501,9 @@ function start_next_progressive_call(int $campaignId, int $agentId, int $company
     }
     $contact = next_eligible_contact($campaign, $companyId);
     if (!$contact) {
-        flash('Nao ha numeros novos para ligar nesta lista.', 'error');
+        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
+            ->execute([$agentId, $companyId]);
+        flash('Lista finalizada, crie nova remessa para os contatos nao atendidos e ocupados.', 'error');
         return false;
     }
     db()->prepare("UPDATE contacts SET reserved_by = ?, reserved_at = datetime('now'), reservation_expires_at = datetime('now', '+10 minutes'), status = 'reservado' WHERE id = ?")
