@@ -2363,6 +2363,21 @@ body.light-theme .dialpad button {
     min-height: 60px;
 }
 
+.call-modal-lead-form {
+    display: grid;
+    gap: 10px;
+    align-content: start;
+}
+
+.call-modal-lead-form input {
+    padding: 8px 10px;
+    font-size: 13px;
+}
+
+.call-modal-lead-form button {
+    justify-self: start;
+}
+
 .call-modal [data-modal-countdown-text] {
     margin: 10px 0 0;
     text-align: center;

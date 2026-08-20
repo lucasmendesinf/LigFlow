@@ -3968,6 +3968,20 @@ function handle_post(): void
         redirect('?page=agent&campaign_id=' . $redirectCampaignId);
     }
 
+    if ($action === 'update_manual_call_contact' && can('agent')) {
+        $callId = (int)post('call_id');
+        $call = one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND ca.dialer_type='manual'", [$callId, $companyId, (int)$user['id']]);
+        if (!$call || !$call['contact_id']) {
+            flash('Chamada manual nao encontrada.', 'error');
+            redirect('?page=agent&campaign_id=' . (int)post('campaign_id'));
+        }
+        db()->prepare('UPDATE contacts SET name = ?, origin = ?, city = ?, product = ? WHERE id = ? AND company_id = ?')
+            ->execute([trim((string)post('name')), trim((string)post('origin')), trim((string)post('city')), trim((string)post('product')), (int)$call['contact_id'], $companyId]);
+        audit('atualizou_contato_chamada_manual', 'contacts:' . (int)$call['contact_id']);
+        flash('Dados do contato atualizados.');
+        redirect('?page=agent&campaign_id=' . (int)post('campaign_id'));
+    }
+
     if ($action === 'finish_call' && can('agent')) {
         $shouldContinueAuto = post('continue_auto') && (($user['status'] ?? '') === 'Discando automatico');
         finish_call((int)post('call_id'), (int)post('result_id'), (string)post('notes'), $companyId);
@@ -10620,6 +10634,7 @@ function render_agent(): void
         </section>
         <?php
         $modalCall = $activeCall ? call_modal_payload((int)$activeCall['id'], (int)$user['company_id'], (int)$user['id']) : null;
+        $isManualLeadModal = ($modalCall['dialer_type'] ?? '') === 'manual';
         $liveWhatsappMessage = 'Oi, aqui é ' . (string)$user['name'] . ', da Ademicon, conforme combinado, vamos seguir nossa conversa por aqui ';
         $livePhoneDigits = nvoip_phone_digits((string)($modalCall['phone'] ?? $modalCall['destination_number'] ?? ''));
         if (strlen($livePhoneDigits) === 10 || strlen($livePhoneDigits) === 11) {
@@ -10645,6 +10660,19 @@ function render_agent(): void
                         </div>
                     </header>
                     <div class="call-modal-grid">
+                        <?php if ($isManualLeadModal): ?>
+                        <form method="post" class="call-modal-lead-form">
+                            <input type="hidden" name="action" value="update_manual_call_contact">
+                            <input type="hidden" name="campaign_id" value="<?= $campaignId ?>">
+                            <input type="hidden" name="call_id" value="<?= (int)($activeCall['id'] ?? 0) ?>">
+                            <label>Telefone<span class="modal-phone-actions"><a class="whatsapp-phone-link" data-live-whatsapp-link href="<?= h($liveWhatsappLink ?: '#') ?>" target="_blank" rel="noopener" title="Conversar pelo WhatsApp"<?= $liveWhatsappLink ? '' : ' hidden' ?>><?= h((string)($modalCall['phone'] ?? '-')) ?></a><button class="mini-link danger-link" type="button" data-quick-block-call="<?= (int)($activeCall['id'] ?? 0) ?>" data-live-block-button<?= $activeCall ? '' : ' hidden' ?>>Bloquear</button></span></label>
+                            <label>Nome<input name="name" value="<?= h((string)($modalCall['name'] ?? '')) ?>" placeholder="Nome do cliente" data-live-lead-name-input></label>
+                            <label>Origem<input name="origin" value="<?= h((string)($modalCall['origin'] ?? '')) ?>" placeholder="Ex: Indicação, site"></label>
+                            <label>Cidade<input name="city" value="<?= h((string)($modalCall['city_state'] ?? '')) ?>" placeholder="Cidade / UF"></label>
+                            <label>Produto<input name="product" value="<?= h((string)($modalCall['product'] ?? '')) ?>" placeholder="Produto de interesse"></label>
+                            <button class="button secondary small" type="submit">Salvar contato</button>
+                        </form>
+                        <?php else: ?>
                         <dl>
                             <dt>Telefone</dt><dd><span class="modal-phone-actions"><a class="whatsapp-phone-link" data-live-whatsapp-link href="<?= h($liveWhatsappLink ?: '#') ?>" target="_blank" rel="noopener" title="Conversar pelo WhatsApp"<?= $liveWhatsappLink ? '' : ' hidden' ?>><?= h((string)($modalCall['phone'] ?? '-')) ?></a><button class="mini-link danger-link" type="button" data-quick-block-call="<?= (int)($activeCall['id'] ?? 0) ?>" data-live-block-button<?= $activeCall ? '' : ' hidden' ?>>Bloquear</button></span></dd>
                             <dt>Origem</dt><dd data-live-lead-origin><?= h((string)($modalCall['origin'] ?? '-')) ?></dd>
@@ -10652,6 +10680,7 @@ function render_agent(): void
                             <dt>Produto</dt><dd data-live-lead-product><?= h((string)($modalCall['product'] ?? '-')) ?></dd>
                             <dt>Tentativas</dt><dd data-live-lead-attempts><?= h((string)($modalCall['attempts'] ?? 0)) ?></dd>
                         </dl>
+                        <?php endif; ?>
                         <div class="live-call-card is-live">
                             <div class="live-indicator"><span></span> Em atendimento</div>
                             <strong data-live-call-external><?= h((string)($modalCall['external_call_id'] ?? 'Chamada ativa')) ?></strong>
