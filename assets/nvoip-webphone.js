@@ -464,6 +464,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     let currentSipCallId = null;
     let managedCallPhase = '';
     let managedCallPollTimer = null;
+    let managedModalShownForCallId = null;
     let currentSipStartedAt = null;
     let currentSipAnswered = false;
     let currentSipRingingConfirmed = false;
@@ -1103,6 +1104,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             document.querySelectorAll('[data-live-call-timer]').forEach((timer) => timer.remove());
             setText(callDetail, state.error || state.label || 'Chamada encerrada');
             root.querySelector('[data-webphone]')?.classList.remove('is-hidden');
+            if (managedModalShownForCallId !== null) {
+                document.querySelector('[data-call-modal]')?.classList.add('is-hidden');
+                managedModalShownForCallId = null;
+            }
             refreshCallButtonReady();
             return;
         }
@@ -1112,6 +1117,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         toggleStopCallButtons(true);
         if (managedCallPhase === 'answered' || managedCallPhase === 'connected') {
             currentSipStartedAt ||= Date.now();
+            if (state.call && managedModalShownForCallId !== currentSipCallId) {
+                managedModalShownForCallId = currentSipCallId;
+                showLeadModal(state.call);
+            }
         }
     };
 

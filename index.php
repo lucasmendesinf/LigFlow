@@ -10154,6 +10154,9 @@ function handle_asterisk_call_state(): never
             'status' => (string)$call['status'],
             'error' => (string)($call['error_message'] ?? ''),
             'destination' => (string)($call['destination_number'] ?? ''),
+            'call' => in_array($view['phase'], ['answered', 'connected'], true)
+                ? call_modal_payload((int)$call['id'], (int)$user['company_id'], (int)$user['id'])
+                : null,
         ]);
     } catch (Throwable $e) {
         http_response_code(500);
