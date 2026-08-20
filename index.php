@@ -8428,7 +8428,7 @@ function layout(string $page, callable $content): void
             </div>
         <?php endif; ?>
         <?php if ($activeOperation): ?>
-            <div class="active-call-banner">
+            <div class="active-call-banner" data-active-call-banner>
                 <strong>Ligacoes ativas</strong>
                 <span>O discador esta realizando chamadas neste momento.</span>
             </div>

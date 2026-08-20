@@ -1116,6 +1116,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             setText(callDetail, state.error || state.label || 'Chamada encerrada');
             root.querySelector('[data-webphone]')?.classList.remove('is-hidden');
             setDialpadCallStatus(false);
+            document.querySelector('[data-active-call-banner]')?.remove();
             if (managedModalShownForCallId !== null) {
                 document.querySelector('[data-call-modal]')?.classList.add('is-hidden');
                 managedModalShownForCallId = null;
