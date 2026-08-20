@@ -52,6 +52,20 @@ $assert($directCallCost(48)['cost_micros'] === 320000 && $directCallCost(48)['bi
 $assert($directCallCost(60)['cost_micros'] === 320000 && $directCallCost(60)['billed_minutes'] === 1, 'DirectCall 60 segundos cobra 1 minuto cheio');
 $assert($directCallCost(61)['cost_micros'] === 640000 && $directCallCost(61)['billed_minutes'] === 2, 'DirectCall 61 segundos cobra 2 minutos cheios');
 
+$assert(billing_cadence_30_6_seconds(0) === 0, 'cadencia 30/6: 0s sem custo');
+$assert(billing_cadence_30_6_seconds(1) === 30, 'cadencia 30/6: 1s cobra a franquia minima de 30s');
+$assert(billing_cadence_30_6_seconds(30) === 30, 'cadencia 30/6: 30s cobra exatamente 30s');
+$assert(billing_cadence_30_6_seconds(31) === 36, 'cadencia 30/6: 31s ja entra no proximo bloco de 6s');
+$assert(billing_cadence_30_6_seconds(36) === 36, 'cadencia 30/6: 36s cobra 36s');
+$assert(billing_cadence_30_6_seconds(37) === 42, 'cadencia 30/6: 37s cobra 42s');
+$assert(billing_cadence_30_6_seconds(42) === 42, 'cadencia 30/6: 42s cobra 42s');
+$assert(billing_cadence_30_6_seconds(43) === 48, 'cadencia 30/6: 43s cobra 48s');
+$cadenceCost = static fn(int $seconds, int $rate = 350000): array => billing_cadence_call_cost($seconds, $rate);
+$assert($cadenceCost(0)['cost_micros'] === 0, 'cadencia 30/6: chamada nao atendida sem custo');
+$assert($cadenceCost(1)['billable_seconds'] === 30 && $cadenceCost(1)['cost_micros'] === $cadenceCost(30)['cost_micros'], 'cadencia 30/6: 1s cobra o mesmo que 30s');
+$assert($cadenceCost(37)['billable_seconds'] === 42, 'cadencia 30/6: usa os segundos cobraveis, nao os reais, no custo');
+$assert($cadenceCost(60, billing_decimal_to_micros('0.50'))['billable_seconds'] === 60 && $cadenceCost(60, billing_decimal_to_micros('0.50'))['cost_micros'] === 500000, 'cadencia 30/6: 60s cobra tarifa cheia do minuto conforme o plano');
+
 $pdo->exec('CREATE TABLE call_charges (call_id INTEGER PRIMARY KEY, cost_micros INTEGER NOT NULL)');
 $charge = $pdo->prepare('INSERT INTO call_charges(call_id,cost_micros) VALUES (?,?) ON CONFLICT(call_id) DO UPDATE SET cost_micros=excluded.cost_micros');
 $charge->execute([77, $cost(30)['cost_micros']]);

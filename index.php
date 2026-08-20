@@ -1605,25 +1605,7 @@ function call_billing_values(array $call, int $billableSeconds): array
     $storedRate = array_key_exists('billing_rate_micros', $call) && $call['billing_rate_micros'] !== null
         ? (int)$call['billing_rate_micros']
         : call_plan_rate_micros((int)$call['company_id']);
-    return call_uses_directcall_tariff($call)
-        ? billing_full_minute_call_cost($billableSeconds, $storedRate)
-        : billing_proportional_call_cost($billableSeconds, $storedRate);
-}
-
-function call_uses_directcall_tariff(array $call): bool
-{
-    $mode = strtoupper(trim((string)($call['telephony_mode'] ?? '')));
-    $trunk = strtolower(trim((string)($call['telephony_trunk'] ?? '')));
-    if ($mode === 'ASTERISK' && ($trunk === 'directcall' || str_contains($trunk, 'directcall'))) {
-        return true;
-    }
-    if ($mode !== '' || $trunk !== '') {
-        return false;
-    }
-    $config = asterisk_config();
-    return !empty($config['enabled'])
-        && strtoupper((string)($config['active_mode'] ?? '')) === 'ASTERISK'
-        && strtoupper((string)($config['active_route'] ?? '')) === 'DIRECTCALL_TRUNK';
+    return billing_cadence_call_cost($billableSeconds, $storedRate);
 }
 
 function call_billable_seconds(array $call, int $fallbackDuration, bool $answered, mixed $providerBillable = null): int

@@ -73,6 +73,30 @@ function billing_full_minute_call_cost(int $billableSeconds, int $rateMicros): a
     ];
 }
 
+function billing_cadence_30_6_seconds(int $actualSeconds): int
+{
+    $actualSeconds = max(0, $actualSeconds);
+    if ($actualSeconds <= 0) return 0;
+    if ($actualSeconds <= 30) return 30;
+    return 30 + 6 * (int)ceil(($actualSeconds - 30) / 6);
+}
+
+function billing_cadence_call_cost(int $actualSeconds, int $rateMicros): array
+{
+    $billableSeconds = billing_cadence_30_6_seconds($actualSeconds);
+    $rateMicros = max(0, $rateMicros);
+    $costMicros = $billableSeconds > 0 && $rateMicros > 0
+        ? intdiv(($billableSeconds * $rateMicros) + 30, 60)
+        : 0;
+    return [
+        'actual_seconds' => max(0, $actualSeconds),
+        'billable_seconds' => $billableSeconds,
+        'rate_micros' => $rateMicros,
+        'cost_micros' => $costMicros,
+        'cost_decimal' => billing_micros_to_decimal($costMicros),
+    ];
+}
+
 function billing_telephony_balance_after(int $balanceMicros, int $debitMicros): int
 {
     return $balanceMicros - max(0, $debitMicros);
