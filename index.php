@@ -10665,7 +10665,7 @@ function render_agent(): void
                         <input type="hidden" name="call_id" value="<?= (int)($activeCall['id'] ?? 0) ?>" data-live-call-id>
                         <?php if ($isAutoDialing): ?><input type="hidden" name="continue_auto" value="1"><?php endif; ?>
                         <label>Resultado<select name="result_id"><?php foreach ($results as $r): ?><option value="<?= $r['id'] ?>"><?= h($r['name']) ?></option><?php endforeach; ?></select></label>
-                        <label>Anotação da ligação<textarea name="notes" rows="5" placeholder="Registre o interesse, objeções e próximo passo"></textarea></label>
+                        <label>Anotação da ligação<textarea name="notes" rows="3" placeholder="Registre o interesse, objeções e próximo passo"></textarea></label>
                         <label>Agendar retorno<input name="callback_at" type="datetime-local"></label>
                         <label>Prioridade<select name="callback_priority"><option>normal</option><option>alta</option><option>urgente</option></select></label>
                         <button class="button danger" type="submit" data-delayed-finish-button>Finalizar ligação</button>

@@ -2321,22 +2321,51 @@ body.light-theme .dialpad button {
 }
 
 .call-modal {
-    width: min(860px, 100%);
+    width: min(900px, 100%);
     max-height: calc(100vh - 44px);
     overflow: auto;
     background: var(--panel);
     border-radius: 12px;
     box-shadow: 0 24px 70px rgba(0, 0, 0, .42);
-    padding: 22px;
+    padding: 20px 22px;
+}
+
+.call-modal header {
+    margin-bottom: 14px;
+}
+
+.call-modal-grid {
+    margin-bottom: 14px;
+}
+
+.call-modal-grid .live-call-card {
+    margin-bottom: 0;
+    align-content: start;
+}
+
+.call-modal-grid .timer {
+    font-size: 30px;
+    margin: 6px 0 0;
 }
 
 .call-modal-form {
     grid-template-columns: 1fr 1fr;
+    gap: 12px;
 }
 
 .call-modal-form label:nth-of-type(2),
 .call-modal-form button {
     grid-column: 1 / -1;
+}
+
+.call-modal-form textarea {
+    resize: vertical;
+    min-height: 60px;
+}
+
+.call-modal [data-modal-countdown-text] {
+    margin: 10px 0 0;
+    text-align: center;
 }
 
 @media (max-width: 760px) {
