@@ -1406,10 +1406,11 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     if (usesManagedAsterisk()) {
         ensureRegistered();
     }
-    if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
+    if (managedCallId && usesManagedAsterisk()) {
         currentSipCallId = managedCallId;
+    }
+    if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
         panel?.classList.remove('is-hidden');
-        ensureRegistered();
         pollManagedCallState();
     } else if (autoCallPhone && !autoCallStarted) {
         autoCallStarted = true;
