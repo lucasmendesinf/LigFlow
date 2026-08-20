@@ -10659,7 +10659,7 @@ function render_agent(): void
                             <div class="timer" data-start="<?= h((string)($activeCall['answered_at'] ?? $activeCall['started_at'] ?? '')) ?>" data-live-call-timer>00:00</div>
                         </div>
                     </div>
-                    <form method="post" class="stack" data-delayed-finish>
+                    <form method="post" class="stack call-modal-form" data-delayed-finish>
                         <input type="hidden" name="action" value="finish_call">
                         <input type="hidden" name="campaign_id" value="<?= $campaignId ?>">
                         <input type="hidden" name="call_id" value="<?= (int)($activeCall['id'] ?? 0) ?>" data-live-call-id>
