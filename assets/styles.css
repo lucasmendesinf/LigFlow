@@ -1921,6 +1921,38 @@ body.light-theme .dial-display {
     background: #f1f2f4;
 }
 
+.dialpad-call-status {
+    justify-self: center;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    margin-bottom: 10px;
+    border-radius: 999px;
+    background: rgba(238, 49, 36, .10);
+    color: var(--primary);
+    font-weight: 600;
+    font-size: .9rem;
+}
+
+.dialpad-call-status.is-hidden {
+    display: none;
+}
+
+.dialpad-call-status::before {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--primary);
+    animation: dialpad-call-status-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes dialpad-call-status-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: .35; }
+}
+
 .dialpad {
     width: min(220px, 100%);
     display: grid;

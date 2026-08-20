@@ -1088,6 +1088,17 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         managedCallPollTimer = null;
     };
 
+    const dialpadCallStatus = root.querySelector('[data-dialpad-call-status]');
+    const otherPhoneTabs = Array.from(root.querySelectorAll('[data-phone-tab="recentes"], [data-phone-tab="contatos"]'));
+
+    const setDialpadCallStatus = (active, label) => {
+        if (dialpadCallStatus) {
+            dialpadCallStatus.textContent = label || 'Chamando';
+            dialpadCallStatus.classList.toggle('is-hidden', !active);
+        }
+        otherPhoneTabs.forEach((button) => { button.hidden = active; });
+    };
+
     const applyManagedCallState = (state) => {
         managedCallPhase = String(state.phase || '');
         setText(callState, state.label || 'Iniciando chamada');
@@ -1104,6 +1115,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             document.querySelectorAll('[data-live-call-timer]').forEach((timer) => timer.remove());
             setText(callDetail, state.error || state.label || 'Chamada encerrada');
             root.querySelector('[data-webphone]')?.classList.remove('is-hidden');
+            setDialpadCallStatus(false);
             if (managedModalShownForCallId !== null) {
                 document.querySelector('[data-call-modal]')?.classList.add('is-hidden');
                 managedModalShownForCallId = null;
@@ -1115,6 +1127,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         callButton?.classList.add('hangup');
         callButton?.setAttribute('aria-label', 'Encerrar chamada');
         toggleStopCallButtons(true);
+        setDialpadCallStatus(true, state.label);
         if (managedCallPhase === 'answered' || managedCallPhase === 'connected') {
             currentSipStartedAt ||= Date.now();
             if (state.call && managedModalShownForCallId !== currentSipCallId) {
@@ -1395,7 +1408,6 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
         currentSipCallId = managedCallId;
         panel?.classList.remove('is-hidden');
-        root.querySelector('[data-phone-tab="monitorar"]')?.click();
         ensureRegistered();
         pollManagedCallState();
     } else if (autoCallPhone && !autoCallStarted) {

@@ -10594,6 +10594,7 @@ function render_agent(): void
                         <?php endif; ?>
                     </div>
                     <div class="webphone-tab-panel phone-keypad-panel active" data-tab-panel="teclado">
+                    <div class="dialpad-call-status<?= $webphoneCallLive ? '' : ' is-hidden' ?>" data-dialpad-call-status>Chamando</div>
                     <div class="dialpad" data-dialpad>
                         <?php foreach ([['1',''], ['2','ABC'], ['3','DEF'], ['4','GHI'], ['5','JKL'], ['6','MNO'], ['7','PQRS'], ['8','TUV'], ['9','WXYZ'], ['*',''], ['0','+'], ['#','']] as $key): ?>
                             <button type="button" data-digit="<?= h($key[0]) ?>"><strong><?= h($key[0]) ?></strong><small><?= h($key[1]) ?></small></button>
