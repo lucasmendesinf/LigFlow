@@ -1532,6 +1532,28 @@ th {
     min-width: 150px;
 }
 
+.list-download-link {
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 30px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--primary);
+    font-size: 20px;
+    font-weight: 800;
+    line-height: 1;
+    text-decoration: none;
+}
+
+.list-download-link:hover {
+    border-color: var(--primary);
+    background: var(--primary-soft);
+}
+
 .flash {
     border-radius: 8px;
     padding: 12px 14px;

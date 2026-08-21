@@ -4179,6 +4179,70 @@ function download_csv_template(): never
     exit;
 }
 
+function download_contact_list_csv(): never
+{
+    require_login();
+    if (!can('lists')) {
+        http_response_code(403);
+        exit('Sem permissao.');
+    }
+
+    $user = current_user();
+    $listId = max(0, (int)($_GET['download_list'] ?? 0));
+    $companyId = (int)($user['company_id'] ?? 0);
+    $list = is_platform_admin($user)
+        ? one('SELECT id, company_id, name FROM contact_lists WHERE id = ?', [$listId])
+        : one('SELECT id, company_id, name FROM contact_lists WHERE id = ? AND company_id = ?', [$listId, $companyId]);
+    if (!$list) {
+        http_response_code(404);
+        exit('Lista nao encontrada.');
+    }
+
+    $safeName = strtolower(trim((string)preg_replace('/[^a-zA-Z0-9]+/', '-', (string)$list['name']), '-'));
+    if ($safeName === '') {
+        $safeName = 'lista-' . $listId;
+    }
+
+    $stmt = db()->prepare("SELECT name, phone_e164, email, organization, document, city, state, product, origin, notes, external_code, status, attempts, last_call_at, custom_json
+        FROM contacts WHERE list_id = ? AND company_id = ? AND status <> 'excluido' ORDER BY id");
+    $stmt->execute([$listId, (int)$list['company_id']]);
+
+    audit('baixou_lista_contatos', 'contact_lists:' . $listId, null, ['company_id' => (int)$list['company_id']]);
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment; filename="' . $safeName . '.csv"');
+    header('X-Content-Type-Options: nosniff');
+    $out = fopen('php://output', 'wb');
+    fwrite($out, "\xEF\xBB\xBF");
+    fputcsv($out, ['nome', 'telefone', 'email', 'empresa', 'documento', 'cidade', 'estado', 'produto', 'origem', 'observacao', 'codigo_externo', 'status', 'tentativas', 'ultima_ligacao', 'campos_adicionais'], ';');
+    $safeCell = static function (mixed $value): string {
+        $text = (string)$value;
+        return preg_match('/^[=+\-@]/', $text) === 1 ? "'" . $text : $text;
+    };
+    while ($contact = $stmt->fetch()) {
+        $phone = preg_replace('/\D+/', '', (string)($contact['phone_e164'] ?? '')) ?? '';
+        $lastCallAt = trim((string)($contact['last_call_at'] ?? ''));
+        fputcsv($out, [
+            $safeCell($contact['name'] ?? ''),
+            $phone,
+            $safeCell($contact['email'] ?? ''),
+            $safeCell($contact['organization'] ?? ''),
+            $safeCell($contact['document'] ?? ''),
+            $safeCell($contact['city'] ?? ''),
+            $safeCell($contact['state'] ?? ''),
+            $safeCell($contact['product'] ?? ''),
+            $safeCell($contact['origin'] ?? ''),
+            $safeCell($contact['notes'] ?? ''),
+            $safeCell($contact['external_code'] ?? ''),
+            $safeCell($contact['status'] ?? ''),
+            (int)($contact['attempts'] ?? 0),
+            $lastCallAt !== '' ? datetime_utc_display($lastCallAt) : '',
+            $safeCell($contact['custom_json'] ?? '{}'),
+        ], ';');
+    }
+    fclose($out);
+    exit;
+}
+
 function csv_header_key(string $value): string
 {
     $value = preg_replace('/^\xEF\xBB\xBF/', '', $value) ?? $value;
@@ -7938,6 +8002,10 @@ if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_template'])) {
     download_csv_template();
 }
 
+if (($_GET['page'] ?? '') === 'lists' && isset($_GET['download_list'])) {
+    download_contact_list_csv();
+}
+
 function asterisk_event_key(array $event): string
 {
     return hash('sha256', implode('|', [(string)($event['timestamp'] ?? ''), (string)($event['type'] ?? ''), implode(',', asterisk_event_identifiers($event)), json_encode_safe($event)]));
@@ -9643,6 +9711,7 @@ function render_lists(): void
                             <td><?= h(datetime_utc_display((string)$list['created_at'])) ?></td>
                             <td class="actions">
                                 <a class="mini-link" href="?page=lists&list_id=<?= (int)$list['id'] ?>">Ver numeros</a>
+                                <a class="list-download-link" href="?page=lists&amp;download_list=<?= (int)$list['id'] ?>" aria-label="Baixar lista <?= h((string)$list['name']) ?> em CSV" title="Baixar lista em CSV"><span aria-hidden="true">&#8595;</span></a>
                                 <?php if (is_account_admin()): ?>
                                     <form method="post" class="inline" data-reset-list-form>
                                         <input type="hidden" name="action" value="reset_list">
