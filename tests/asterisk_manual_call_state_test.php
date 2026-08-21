@@ -56,7 +56,8 @@ $assert(str_contains($index, '$campaign = get_or_create_manual_campaign($company
 $assert(str_contains($index, "VALUES (?, ?, 'Ligacao manual', ?, ?, 'Manual', 'novo')"), 'manual call technical contact is not reserved as a campaign lead');
 $assert(str_contains($index, 'connectManualCall($call, $agent)'), 'answered manual calls connect the registered consultant endpoint to the ARI bridge');
 $assert(str_contains($index, "ASTERISK_MANUAL_CONSULTANT_ORIGINATED")
-    && str_contains($index, "['connected', 'conectada', false]"), 'manual UI becomes connected only after the consultant channel reaches Up');
+    && str_contains($index, "\$consultantState === 'up'")
+    && str_contains($index, "UPDATE calls SET status='connected', internal_status='conectada'"), 'manual UI becomes connected only after the consultant channel reaches Up');
 $assert(str_contains($javascript, "?page=asterisk_manual_hangup"), 'the floating manual UI controls the real Asterisk call');
 $assert(str_contains($javascript, "data-managed-call-id")
     && str_contains($javascript, "managedCallPhase === 'answered' || managedCallPhase === 'connected'"), 'manual timer starts only after a confirmed answer');

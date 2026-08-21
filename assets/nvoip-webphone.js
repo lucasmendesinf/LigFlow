@@ -465,6 +465,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     let managedCallPhase = '';
     let managedCallPollTimer = null;
     let managedModalShownForCallId = null;
+    let managedAutoAdvancePending = false;
     let currentSipStartedAt = null;
     let currentSipAnswered = false;
     let currentSipRingingConfirmed = false;
@@ -917,6 +918,24 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         }, remainingOriginationTimeoutMs());
     };
 
+    const triggerManagedAutoAdvance = () => {
+        const agentStatusForm = document.querySelector('[data-agent-status-form]');
+        if (!agentStatusForm) {
+            window.location.reload();
+            return;
+        }
+        let statusInput = agentStatusForm.querySelector('[data-auto-advance-status]');
+        if (!statusInput) {
+            statusInput = document.createElement('input');
+            statusInput.type = 'hidden';
+            statusInput.name = 'status';
+            statusInput.setAttribute('data-auto-advance-status', '1');
+            agentStatusForm.appendChild(statusInput);
+        }
+        statusInput.value = 'Disponivel';
+        HTMLFormElement.prototype.submit.call(agentStatusForm);
+    };
+
     const finishSipCallRecord = async (eventName, extra = {}) => {
         if (!currentSipCallId) return;
         clearAnswerConfirmationTimer();
@@ -954,7 +973,11 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
                 nextAutoCallTimer = setTimeout(() => {
                     nextAutoCallTimer = null;
                     if (!stopRequestedByUser) {
-                        placeCall(result.next_phone);
+                        if (usesManagedAsterisk() && isAutoDialing()) {
+                            triggerManagedAutoAdvance();
+                        } else {
+                            placeCall(result.next_phone);
+                        }
                     }
                 }, urgentAdvance ? 150 : (immediateAdvance ? 1200 : 1800));
             }
@@ -1139,13 +1162,20 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     };
 
     const pollManagedCallState = async () => {
-        if (!usesManagedAsterisk() || !currentSipCallId || isAutoDialing()) return;
+        if (!usesManagedAsterisk() || !currentSipCallId) return;
         try {
             const response = await fetch(`?page=asterisk_call_state&call_id=${encodeURIComponent(currentSipCallId)}`, { credentials: 'same-origin' });
             const state = await response.json();
             if (!response.ok || !state.ok) throw new Error(state.error || 'Falha ao consultar chamada Asterisk.');
+            const shouldAdvanceAuto = isAutoDialing() && Boolean(state.continue_auto);
             applyManagedCallState(state);
-            if (state.active) managedCallPollTimer = setTimeout(pollManagedCallState, 1000);
+            if (state.active) {
+                managedCallPollTimer = setTimeout(pollManagedCallState, 1000);
+            } else if (shouldAdvanceAuto && !managedAutoAdvancePending) {
+                managedAutoAdvancePending = true;
+                setText(callDetail, `${state.error || 'Tentativa encerrada.'} Avancando para o proximo lead.`);
+                setTimeout(triggerManagedAutoAdvance, 700);
+            }
         } catch (error) {
             setText(callDetail, error.message);
             managedCallPollTimer = setTimeout(pollManagedCallState, 1500);
@@ -1409,7 +1439,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     if (managedCallId && usesManagedAsterisk()) {
         currentSipCallId = managedCallId;
     }
-    if (managedCallId && usesManagedAsterisk() && !isAutoDialing()) {
+    if (managedCallId && usesManagedAsterisk()) {
         panel?.classList.remove('is-hidden');
         pollManagedCallState();
     } else if (autoCallPhone && !autoCallStarted) {
@@ -1424,19 +1454,37 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         setTimeout(() => placeCall(cleanAutoCallPhone), 500);
     } else if (recoverAutoCallId && isAutoDialing() && !autoCallStarted) {
         autoCallStarted = true;
+        const autoCallSeenKey = 'ligflowAutoCallSeen';
+        let alreadySeen = false;
+        try {
+            alreadySeen = sessionStorage.getItem(autoCallSeenKey) === String(recoverAutoCallId);
+        } catch (error) { /* sessionStorage indisponivel, trata como primeira vez */ }
         currentSipCallId = recoverAutoCallId;
         currentSipStartedAt = Date.now();
         currentSipAnswered = false;
         currentSipRingingConfirmed = false;
-        setText(callDetail, 'Recuperando a fila automatica apos perda da sessao da chamada.');
-        setTimeout(async () => {
-            await finishSipCallRecord('failed', {
-                cause: 'browser_session_lost',
-                terminal_failure: true,
-                immediate_advance: true,
-                urgent_advance: true,
-            });
-            resetFloatingCallState('Fila recuperada. Avancando para a proxima lead.');
-        }, 300);
+        currentSipDirection = 'outgoing';
+        if (alreadySeen) {
+            setText(callDetail, 'Recuperando a fila automatica apos perda da sessao da chamada.');
+            setTimeout(async () => {
+                await finishSipCallRecord('failed', {
+                    cause: 'browser_session_lost',
+                    terminal_failure: true,
+                    immediate_advance: true,
+                    urgent_advance: true,
+                });
+                resetFloatingCallState('Fila recuperada. Avancando para a proxima lead.');
+            }, 300);
+        } else {
+            try { sessionStorage.setItem(autoCallSeenKey, String(recoverAutoCallId)); } catch (error) { /* ignora */ }
+            callButton?.classList.add('hangup');
+            callButton?.classList.remove('ready');
+            callButton?.setAttribute('aria-label', 'Encerrar chamada');
+            monitor?.classList.add('online');
+            toggleStopCallButtons(true);
+            setText(callState, 'Chamada automatica em andamento');
+            setText(callDetail, 'Aguardando confirmacao da chamada automatica.');
+            startRingConfirmationTimer();
+        }
     }
 });

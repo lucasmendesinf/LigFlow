@@ -2425,8 +2425,6 @@ final class AsteriskProvider implements TelephonyProvider
                 'timeout' => $this->config['originate_timeout_seconds'],
                 'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
             ];
-            $callerId = nvoip_phone_digits((string)($campaign['caller_id'] ?? ''));
-            if ($callerId !== '') $originatePayload['callerId'] = $callerId;
             $channel = asterisk_ari_request($this->config, 'POST', '/channels', $originatePayload);
             $channelId = $this->confirmOriginatedChannel($channel, $externalId, $dialString);
             return [
@@ -2461,8 +2459,6 @@ final class AsteriskProvider implements TelephonyProvider
             'timeout' => $this->config['originate_timeout_seconds'],
             'variables' => ['LIGFLOW_EXTERNAL_ID' => $externalId, 'LIGFLOW_TRUNK' => $this->trunk()],
         ];
-        $callerId = nvoip_phone_digits((string)($campaign['caller_id'] ?? ''));
-        if ($callerId !== '') $originateParallelPayload['callerId'] = $callerId;
         $channel = asterisk_ari_request($this->config, 'POST', '/channels', $originateParallelPayload);
         $channelId = $this->confirmOriginatedChannel($channel, $externalId, $dialString);
         return [
@@ -6762,6 +6758,26 @@ function asterisk_count_confirmed_active_calls(int $companyId, array $config): i
     return $activeCount;
 }
 
+function asterisk_release_terminal_sequential_contact(array $call): bool
+{
+    if ((string)($call['telephony_mode'] ?? '') !== 'ASTERISK'
+        || !empty($call['dial_batch_id'])
+        || empty($call['finalized_at'])
+        || !empty($call['answered_at'])
+        || in_array((string)($call['internal_status'] ?? ''), ['atendida', 'conectada'], true)) {
+        return false;
+    }
+    $companyId = (int)($call['company_id'] ?? 0);
+    $contactId = (int)($call['contact_id'] ?? 0);
+    $campaignId = (int)($call['campaign_id'] ?? 0);
+    if ($companyId < 1 || $contactId < 1 || $campaignId < 1) return false;
+    $dialerType = (string)(scalar('SELECT dialer_type FROM campaigns WHERE id=? AND company_id=?', [$campaignId, $companyId]) ?? '');
+    if ($dialerType === 'manual') return false;
+    $stmt = db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=? AND status IN ('reservado','em_ligacao')");
+    $stmt->execute([$contactId, $companyId]);
+    return $stmt->rowCount() > 0;
+}
+
 function start_call(int $campaignId, int $contactId, int $agentId, int $companyId): bool
 {
     $contact = one('SELECT * FROM contacts WHERE id = ? AND company_id = ? AND reserved_by = ?', [$contactId, $companyId, $agentId]);
@@ -6819,22 +6835,32 @@ function start_call(int $campaignId, int $contactId, int $agentId, int $companyI
         && (string)($campaign['dialer_type'] ?? '') === 'manual';
     $initialStatus = $isManualAsterisk ? 'calling_origin' : (string)$providerCall['status'];
     $initialInternalStatus = $isManualAsterisk ? 'iniciada' : $internalStatus;
-    db()->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, telephony_mode, telephony_trunk, provider_channel_id, provider_linked_id, provider_bridge_id, started_at, ringing_at, answered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL, ?)")
-        ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $initialStatus, $initialStatus, $initialInternalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], (string)($providerCall['telephony_mode'] ?? 'NVOIP_DIRECT'), (string)($providerCall['telephony_trunk'] ?? 'NVOIP_DIRECT'), (string)($providerCall['provider_channel_id'] ?? ''), (string)($providerCall['provider_linked_id'] ?? ''), (string)($providerCall['provider_bridge_id'] ?? ''), $answeredAt]);
-    $callId = (int)db()->lastInsertId();
+    $callPdo = db();
+    $callPdo->beginTransaction();
+    try {
+        $callPdo->prepare("INSERT INTO calls (company_id, campaign_id, contact_id, agent_id, provider, external_call_id, provider_call_id, origin_number, destination_number, status, provider_status_raw, internal_status, attempt_number, billing_rate_micros, telephony_period_id, telephony_mode, telephony_trunk, provider_channel_id, provider_linked_id, provider_bridge_id, started_at, ringing_at, answered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), NULL, ?)")
+            ->execute([$companyId, $campaignId, $contactId, $agentId, $providerCall['provider'], $providerCall['external_call_id'], $providerCall['external_call_id'], $originNumber, $contact['phone_e164'], $initialStatus, $initialStatus, $initialInternalStatus, $attemptNumber, $billingRateMicros, (int)$telephony['state']['period_id'], (string)($providerCall['telephony_mode'] ?? 'NVOIP_DIRECT'), (string)($providerCall['telephony_trunk'] ?? 'NVOIP_DIRECT'), (string)($providerCall['provider_channel_id'] ?? ''), (string)($providerCall['provider_linked_id'] ?? ''), (string)($providerCall['provider_bridge_id'] ?? ''), $answeredAt]);
+        $callId = (int)$callPdo->lastInsertId();
+        $callPdo->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contactId]);
+        $nextAgentStatus = (($agent['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
+        $callPdo->prepare("UPDATE users SET status = ? WHERE id = ?")->execute([$nextAgentStatus, $agentId]);
+        $callPdo->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.started', 'reserved', 'in_progress', ?)")
+            ->execute([$companyId, $callId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
+        $callPdo->commit();
+    } catch (Throwable $e) {
+        if ($callPdo->inTransaction()) $callPdo->rollBack();
+        throw $e;
+    }
     if ((string)($providerCall['telephony_mode'] ?? '') === 'ASTERISK') {
         try {
             asterisk_replay_orphan_events_for_call($callId, (string)($providerCall['provider_channel_id'] ?? ''));
+            $persistedCall = one('SELECT * FROM calls WHERE id=? AND company_id=?', [$callId, $companyId]);
+            if ($persistedCall) asterisk_release_terminal_sequential_contact($persistedCall);
         } catch (Throwable $e) {
             log_call_status($companyId, $callId, 'Asterisk ARI', 'orphan_event_replay_failed', $e->getMessage());
         }
     }
-    db()->prepare("UPDATE contacts SET status = 'em_ligacao', attempts = attempts + 1, last_call_at = datetime('now') WHERE id = ?")->execute([$contactId]);
-    $nextAgentStatus = (($agent['status'] ?? '') === 'Discando automatico') ? 'Discando automatico' : 'Em ligacao';
-    db()->prepare("UPDATE users SET status = ? WHERE id = ?")->execute([$nextAgentStatus, $agentId]);
-    db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.started', 'reserved', 'in_progress', ?)")
-        ->execute([$companyId, $callId, json_encode($providerCall['payload'], JSON_UNESCAPED_UNICODE)]);
     log_call_status($companyId, $callId, (string)($providerCall['provider'] ?? 'Nvoip'), $initialStatus, 'call_started', (array)$providerCall['payload']);
     audit('iniciou_ligacao', 'calls:' . $callId);
     flash($providerCall['message']);
@@ -8163,6 +8189,15 @@ function asterisk_handle_event(array $event): void
         }
         $pdo->prepare('UPDATE asterisk_ari_events SET call_id = ? WHERE event_key = ?')->execute([(int)$call['id'], $eventKey]);
         $terminal = !empty($call['finalized_at']);
+        if ($terminal) {
+            if (strtolower($eventType) === 'channeldestroyed') {
+                $lateCause = asterisk_terminal_event_cause($event);
+                $pdo->prepare("UPDATE calls SET provider_status_raw=?, hangup_cause=?, error_message=?, last_event_at=datetime('now') WHERE id=?")
+                    ->execute([$lateCause, $lateCause, $lateCause, (int)$call['id']]);
+            }
+            $pdo->commit();
+            return;
+        }
         [$status, $internal, $isFinal] = asterisk_event_transition($event, $call);
         $connectConsultantToBridge = false;
         if ($isConsultantChannel && !$isFinal) {
@@ -8172,7 +8207,7 @@ function asterisk_handle_event(array $event): void
                     && (string)($event['bridge']['id'] ?? '') === (string)($call['provider_bridge_id'] ?? '')));
             [$status, $internal, $isFinal] = ['', '', false];
         }
-        if (($status === '' && !$connectConsultantToBridge) || $terminal) { $pdo->commit(); return; }
+        if ($status === '' && !$connectConsultantToBridge) { $pdo->commit(); return; }
         if ($connectConsultantToBridge) {
             $pdo->commit();
             try {
@@ -8222,6 +8257,7 @@ function asterisk_handle_event(array $event): void
                 db()->prepare("UPDATE calls SET duration_seconds = ?, billable_seconds = ?, estimated_cost_micros = ?, confirmed_cost = ? WHERE id = ? AND finalized_at IS NOT NULL")
                     ->execute([$duration, $billable, (int)$billing['cost_micros'], (int)$billing['cost_micros'] / 1000000, (int)$updated['id']]);
                 telephony_record_call_debit($updated, $billing, (int)$updated['agent_id']);
+                if (!$answered) asterisk_release_terminal_sequential_contact($updated);
                 try { (new AsteriskProvider(asterisk_config()))->hangup($updated); } catch (Throwable $cleanupError) {
                     log_call_status((int)$updated['company_id'], (int)$updated['id'], 'Asterisk ARI', 'ASTERISK_CLEANUP_FAILED', $cleanupError->getMessage());
                 }
@@ -10276,6 +10312,8 @@ function finalize_stalled_asterisk_manual_call(array $call, string $cause): arra
     $callId = (int)$call['id'];
     $companyId = (int)$call['company_id'];
     $cause = trim($cause) !== '' ? trim($cause) : 'ARI_ORIGIN_TIMEOUT';
+    $dialerType = (string)(scalar('SELECT dialer_type FROM campaigns WHERE id=? AND company_id=?', [(int)$call['campaign_id'], $companyId]) ?? '');
+    $isManual = $dialerType === 'manual';
     try {
         (new AsteriskProvider(asterisk_config()))->hangup($call);
     } catch (Throwable $e) {
@@ -10290,12 +10328,16 @@ function finalize_stalled_asterisk_manual_call(array $call, string $cause): arra
     }
     db()->prepare("UPDATE calls SET status='failed', provider_status_raw=?, internal_status='falha', error_message=?, ended_at=datetime('now'), finalized_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
         ->execute([$cause, $cause, $callId]);
-    db()->prepare("UPDATE contacts SET status='novo', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
-        ->execute([(int)$call['contact_id'], $companyId]);
-    db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Em ligacao'")
-        ->execute([(int)$call['agent_id'], $companyId]);
-    db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'asterisk.manual.terminal_fallback', ?, 'failed', ?)")
-        ->execute([$companyId, $callId, (string)$call['status'], json_encode_safe(['cause' => $cause])]);
+    $contactStatus = $isManual ? 'novo' : 'concluido';
+    db()->prepare("UPDATE contacts SET status=?, reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id=? AND company_id=?")
+        ->execute([$contactStatus, (int)$call['contact_id'], $companyId]);
+    if ($isManual) {
+        db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Em ligacao'")
+            ->execute([(int)$call['agent_id'], $companyId]);
+    }
+    $fallbackEvent = $isManual ? 'asterisk.manual.terminal_fallback' : 'asterisk.campaign.terminal_fallback';
+    db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, ?, 'failed', ?)")
+        ->execute([$companyId, $callId, $fallbackEvent, (string)$call['status'], json_encode_safe(['cause' => $cause])]);
     log_call_status($companyId, $callId, 'Asterisk ARI', 'failed', $cause);
     return one('SELECT * FROM calls WHERE id=? AND company_id=?', [$callId, $companyId]) ?: $call;
 }
@@ -10307,26 +10349,35 @@ function handle_asterisk_call_state(): never
     header('Content-Type: application/json; charset=utf-8');
     try {
         $callId = max(0, (int)($_GET['call_id'] ?? 0));
-        $call = $callId > 0 ? one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=? AND ca.dialer_type='manual'", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
+        $call = $callId > 0 ? one("SELECT c.*, ca.dialer_type FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.id=? AND c.company_id=? AND c.agent_id=?", [$callId, (int)$user['company_id'], (int)$user['id']]) : null;
         if (!$call || (string)($call['telephony_mode'] ?? '') !== 'ASTERISK') {
             http_response_code(404);
             echo json_encode_safe(['ok' => false, 'error' => 'Chamada Asterisk nao encontrada.']);
             exit;
         }
 
+        $isManual = (string)($call['dialer_type'] ?? '') === 'manual';
         $view = asterisk_manual_call_view_state($call);
-        if ($view['active'] && asterisk_origin_has_timed_out($call, time(), 15)) {
-            $call = finalize_stalled_asterisk_manual_call($call, 'ARI_ORIGIN_TIMEOUT: canal permaneceu sem progresso por 15 segundos.');
+        $originTimeout = $isManual ? 15 : max(20, (int)(asterisk_config()['originate_timeout_seconds'] ?? 30) + 5);
+        if ($view['active'] && asterisk_origin_has_timed_out($call, time(), $originTimeout)) {
+            $call = finalize_stalled_asterisk_manual_call($call, 'ARI_ORIGIN_TIMEOUT: canal permaneceu sem progresso por ' . $originTimeout . ' segundos.');
             $view = asterisk_manual_call_view_state($call);
         }
+        $agentStatus = (string)(one('SELECT status FROM users WHERE id=? AND company_id=?', [(int)$user['id'], (int)$user['company_id']])['status'] ?? '');
+        $continueAuto = !$isManual && !$view['active'] && empty($call['answered_at']) && $agentStatus === 'Discando automatico';
+        $error = trim((string)($call['hangup_cause'] ?? ''));
+        if ($error === '') $error = trim((string)($call['error_message'] ?? ''));
+        if ($error === '') $error = trim((string)($call['provider_status_raw'] ?? ''));
         echo json_encode_safe([
             'ok' => true,
             'active' => $view['active'],
             'phase' => $view['phase'],
             'label' => $view['label'],
             'status' => (string)$call['status'],
-            'error' => (string)($call['error_message'] ?? ''),
+            'error' => $error,
             'destination' => (string)($call['destination_number'] ?? ''),
+            'auto_dialing' => !$isManual,
+            'continue_auto' => $continueAuto,
             'call' => in_array($view['phase'], ['answered', 'connected'], true)
                 ? call_modal_payload((int)$call['id'], (int)$user['company_id'], (int)$user['id'])
                 : null,
@@ -10381,6 +10432,12 @@ function render_agent(): void
         $campaignId = selected_campaign_id();
         $campaign = $campaignId ? one('SELECT * FROM campaigns WHERE id = ?', [$campaignId]) : null;
         $isAutoDialing = ($user['status'] ?? '') === 'Discando automatico';
+        if ($managedAsterisk) {
+            $staleSequentialCalls = rows("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id JOIN contacts ct ON ct.id=c.contact_id AND ct.company_id=c.company_id WHERE c.company_id=? AND c.agent_id=? AND c.telephony_mode='ASTERISK' AND c.dial_batch_id IS NULL AND c.finalized_at IS NOT NULL AND c.answered_at IS NULL AND COALESCE(ca.dialer_type,'')<>'manual' AND ct.reserved_by=? AND ct.status IN ('reservado','em_ligacao') ORDER BY c.id DESC LIMIT 50", [(int)$user['company_id'], (int)$user['id'], (int)$user['id']]);
+            foreach ($staleSequentialCalls as $staleSequentialCall) {
+                asterisk_release_terminal_sequential_contact($staleSequentialCall);
+            }
+        }
         [$agentStatsClause, $agentStatsParams] = tenant_clause('c');
         [$todayStartUtc, $todayEndUtc] = sao_paulo_utc_period_bounds('day');
         $agentCostMicros = call_cost_sql('c');
@@ -10417,7 +10474,6 @@ function render_agent(): void
         $isCallLive = $isBatchWaitingForWinner || $isConnectedBatchWinner || ($activeCall && in_array((string)$activeCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true));
         $activeManualCall = $managedAsterisk && !$isAutoDialing ? get_active_manual_call((int)$user['id'], (int)$user['company_id']) : null;
         $webphoneActiveCall = $isAutoDialing ? $activeCall : $activeManualCall;
-        $webphoneCallLive = $webphoneActiveCall && in_array((string)$webphoneActiveCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
         $reserved = $activeCall ? one('SELECT * FROM contacts WHERE id = ? AND company_id = ?', [$activeCall['contact_id'], $activeCall['company_id']]) : null;
         if (!$reserved && $campaign && !$isBatchWaitingForWinner) {
             $reserved = one("SELECT * FROM contacts WHERE company_id = ? AND list_id = ? AND reserved_by = ? AND status IN ('reservado','em_ligacao') ORDER BY reserved_at DESC LIMIT 1", [$campaign['company_id'], $campaign['list_id'], $user['id']]);
@@ -10426,7 +10482,12 @@ function render_agent(): void
         if ($autoNextPhone !== '') {
             unset($_SESSION['auto_next_phone']);
         }
-        if ($isAutoDialing && !$activeBatch && !$activeCall && !$reserved && $autoNextPhone === '') {
+        $recentManagedAutoTerminalCall = null;
+        if ($managedAsterisk && $isAutoDialing && !$activeBatch && !$activeCall && !$reserved && $autoNextPhone === '' && $campaignId) {
+            $recentManagedAutoTerminalCall = one("SELECT c.* FROM calls c JOIN campaigns ca ON ca.id=c.campaign_id WHERE c.agent_id=? AND c.company_id=? AND c.campaign_id=? AND c.telephony_mode='ASTERISK' AND c.dial_batch_id IS NULL AND COALESCE(ca.dialer_type,'')<>'manual' AND c.finalized_at IS NOT NULL AND c.finalized_at>=datetime('now','-2 minutes') ORDER BY c.id DESC LIMIT 1", [(int)$user['id'], (int)$user['company_id'], $campaignId]);
+            if ($recentManagedAutoTerminalCall) $webphoneActiveCall = $recentManagedAutoTerminalCall;
+        }
+        if ($isAutoDialing && !$activeBatch && !$activeCall && !$reserved && $autoNextPhone === '' && !$recentManagedAutoTerminalCall) {
             db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
                 ->execute([(int)$user['id'], (int)$user['company_id']]);
             $user['status'] = 'Disponivel';
@@ -10434,6 +10495,7 @@ function render_agent(): void
             $isBatchWaitingForWinner = false;
             $isCallLive = false;
         }
+        $webphoneCallLive = $webphoneActiveCall && in_array((string)$webphoneActiveCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
         $showAnsweredModal = call_was_answered($activeCall);
         $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
         $recentHistory = recent_phone_history((int)$user['company_id'], (int)$user['id']);
@@ -10484,7 +10546,7 @@ function render_agent(): void
                     <input type="hidden" name="page" value="agent">
                     <select name="campaign_id" onchange="this.form.submit()"><?php foreach ($campaigns as $c): ?><option value="<?= $c['id'] ?>" <?= $campaignId === (int)$c['id'] ? 'selected' : '' ?>><?= h($c['name'] . ' - ' . $c['status']) ?></option><?php endforeach; ?></select>
                 </form>
-                <form method="post" class="button-row">
+                <form method="post" class="button-row" data-agent-status-form>
                     <input type="hidden" name="action" value="agent_status">
                     <input type="hidden" name="campaign_id" value="<?= $campaignId ?>">
                     <button
