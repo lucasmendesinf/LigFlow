@@ -960,7 +960,12 @@ label {
 }
 
 .password-reset-panel {
-    grid-column: auto;
+    align-self: start;
+    min-height: 46px;
+    padding: 13px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--input-bg);
 }
 
 .password-reset-panel summary {

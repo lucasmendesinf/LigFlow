@@ -1339,24 +1339,44 @@ function modules_from_json(?string $json): array
     return sanitize_modules(is_array($decoded) ? $decoded : []);
 }
 
+function access_profile_modules(int $profileId, int $companyId): array
+{
+    if ($profileId <= 0) {
+        return [];
+    }
+    $profile = one('SELECT modules_json FROM access_profiles WHERE id = ? AND (company_id = ? OR company_id IS NULL)', [$profileId, $companyId]);
+    return $profile ? modules_from_json((string)$profile['modules_json']) : [];
+}
+
+function additional_user_modules(array $user): array
+{
+    $custom = modules_from_json($user['allowed_modules_json'] ?? null);
+    $profile = access_profile_modules((int)($user['access_profile_id'] ?? 0), (int)($user['company_id'] ?? 0));
+    return array_values(array_diff($custom, $profile));
+}
+
+function additional_modules_json(int $profileId, int $companyId, mixed $modules): string
+{
+    $selected = sanitize_modules($modules);
+    $profile = access_profile_modules($profileId, $companyId);
+    return selected_modules_json(array_values(array_diff($selected, $profile)));
+}
+
 function modules_for_user(array $user): array
 {
     if (is_platform_admin($user)) {
         return default_role_modules((string)$user['role']);
     }
+    $profileId = (int)($user['access_profile_id'] ?? 0);
     $custom = modules_from_json($user['allowed_modules_json'] ?? null);
+    if ($profileId > 0) {
+        $profileModules = access_profile_modules($profileId, (int)($user['company_id'] ?? 0));
+        if ($profileModules) {
+            return sanitize_modules(array_merge($profileModules, $custom));
+        }
+    }
     if ($custom) {
         return $custom;
-    }
-    $profileId = (int)($user['access_profile_id'] ?? 0);
-    if ($profileId > 0) {
-        $profile = one('SELECT modules_json FROM access_profiles WHERE id = ? AND (company_id = ? OR company_id IS NULL)', [$profileId, $user['company_id'] ?? 0]);
-        if ($profile) {
-            $modules = modules_from_json((string)$profile['modules_json']);
-            if ($modules) {
-                return $modules;
-            }
-        }
     }
     return default_role_modules((string)$user['role']);
 }
@@ -3536,7 +3556,7 @@ function handle_post(): void
             redirect('?page=users');
         }
         $profileId = save_access_profile((int)post('profile_id'), $companyId, (int)$user['id']);
-        redirect('?page=users' . ($profileId > 0 ? '&profile_id=' . $profileId : ''));
+        redirect('?page=users&company_id=' . $companyId . ($profileId > 0 ? '&profile_id=' . $profileId : ''));
     }
 
     if ($action === 'delete_access_profile' && can('users')) {
@@ -3545,7 +3565,7 @@ function handle_post(): void
             redirect('?page=users');
         }
         delete_access_profile((int)post('profile_id'), $companyId);
-        redirect('?page=users');
+        redirect('?page=users&company_id=' . $companyId);
     }
 
     if ($action === 'save_user' && can('users')) {
@@ -3569,9 +3589,10 @@ function handle_post(): void
                 $profileRole = (string)(one('SELECT role_key FROM access_profiles WHERE id = ? AND company_id = ?', [$accessProfileId, $companyId])['role_key'] ?? '');
             }
             $role = $profileRole ?: 'usuario_operacional';
+            $additionalModulesJson = additional_modules_json($accessProfileId, $companyId, post('modules', []));
             $pdo->prepare("INSERT INTO users (company_id, team_id, access_profile_id, name, email, password_hash, role, allowed_modules_json, phone, extension, status, work_hours, created_by)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                ->execute([$companyId, post('team_id') ?: null, $accessProfileId ?: null, post('name'), $email, password_hash((string)post('password', 'admin123'), PASSWORD_DEFAULT), $role, selected_modules_json(post('modules', [])), post('phone'), post('extension'), post('status'), post('work_hours'), $user['id']]);
+                ->execute([$companyId, post('team_id') ?: null, $accessProfileId ?: null, post('name'), $email, password_hash((string)post('password', 'admin123'), PASSWORD_DEFAULT), $role, $additionalModulesJson, post('phone'), post('extension'), post('status'), post('work_hours'), $user['id']]);
             $newUserId = (int)$pdo->lastInsertId();
             if (asterisk_new_users_use_provisioning()) {
                 asterisk_reserve_user_extension($pdo, $companyId, $newUserId, (string)post('asterisk_extension'), (string)post('status'));
@@ -5174,7 +5195,9 @@ function update_user_access(int $userId, int $companyId): void
     if (!is_platform_admin($current)) {
         $role = 'usuario_operacional';
     }
-    $allowedModulesJson = is_platform_admin($current) ? selected_modules_json(post('modules', [])) : (string)($target['allowed_modules_json'] ?? '');
+    $allowedModulesJson = is_platform_admin($current)
+        ? additional_modules_json($accessProfileId, $newCompanyId, post('modules', []))
+        : (string)($target['allowed_modules_json'] ?? '');
     $password = trim((string)post('password'));
     if ($password !== '') {
         db()->prepare("UPDATE users SET company_id = ?, team_id = ?, access_profile_id = ?, name = ?, email = ?, password_hash = ?, role = ?, allowed_modules_json = ?, phone = ?, extension = ?, status = ?, work_hours = ? WHERE id = ?")
@@ -8504,18 +8527,24 @@ function role_label(string $role): string
     ][$role] ?? $role;
 }
 
-function module_checkboxes(array $selected, string $name = 'modules'): string
+function module_checkboxes(array $selected, string $name = 'modules', array $inherited = [], bool $profileEditor = false): string
 {
     $selected = sanitize_modules($selected);
+    $inherited = sanitize_modules($inherited);
     $html = '<div class="module-grid wide">';
     foreach (access_modules() as $key => $label) {
         if ($key === 'account') {
             continue;
         }
-        $checked = in_array($key, $selected, true) ? ' checked' : '';
-        $html .= '<label class="module-option"><input type="checkbox" name="' . h($name) . '[]" value="' . h($key) . '"' . $checked . '> <span>' . h($label) . '</span></label>';
+        $isInherited = in_array($key, $inherited, true);
+        $isAdditional = in_array($key, $selected, true) && !$isInherited;
+        $checked = ($isInherited || $isAdditional) ? ' checked' : '';
+        $disabled = $isInherited ? ' disabled' : '';
+        $html .= '<label class="module-option" data-module-option><input type="checkbox" name="' . h($name) . '[]" value="' . h($key) . '" data-module-key="' . h($key) . '" data-additional="' . ($isAdditional ? '1' : '0') . '"' . $checked . $disabled . '> <span>' . h($label) . '<small data-profile-badge' . ($isInherited ? '' : ' hidden') . '> (perfil)</small></span></label>';
     }
-    $html .= '<p class="hint wide">Minha conta fica sempre liberado para o usuario editar seus proprios dados.</p>';
+    $html .= $profileEditor
+        ? '<p class="hint wide">Minha conta fica sempre liberado para o usuario editar seus proprios dados.</p>'
+        : '<p class="hint wide">Permissoes marcadas como perfil sao herdadas e nao podem ser removidas aqui. As demais sao adicionais deste usuario. Minha conta fica sempre liberado.</p>';
     $html .= '</div>';
     return $html;
 }
@@ -9142,6 +9171,7 @@ function render_users(): void
             $profileCompanyId = (int)(current_user()['company_id'] ?? 0);
         }
         $accessProfiles = rows('SELECT ap.*, (SELECT COUNT(*) FROM users u WHERE u.access_profile_id = ap.id) linked_users FROM access_profiles ap WHERE ap.company_id = ? ORDER BY ap.role_key, ap.name', [$profileCompanyId]);
+        $profileCompany = one('SELECT id, trade_name FROM companies WHERE id = ?', [$profileCompanyId]);
         $editProfileId = (int)($_GET['profile_id'] ?? 0);
         $editProfile = $editProfileId ? one('SELECT * FROM access_profiles WHERE id = ? AND company_id = ?', [$editProfileId, $profileCompanyId]) : null;
         $showProfileModal = $isPlatformAdmin && (isset($_GET['new_profile']) || $editProfile);
@@ -9149,7 +9179,19 @@ function render_users(): void
         $editUser = $editUserId ? one("SELECT u.*, cp.display_name consultant_display_name, cp.internal_code consultant_code, cp.status consultant_status, cp.goal consultant_goal, axe.extension asterisk_extension, axe.status asterisk_extension_status, axe.lifecycle_status asterisk_lifecycle_status, axe.provisioning_status asterisk_provisioning_status FROM users u LEFT JOIN consultant_profiles cp ON cp.user_id = u.id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE u.id = ? AND u.deleted_at IS NULL AND " . ($isPlatformAdmin ? '1=1' : 'u.company_id = ?'), $isPlatformAdmin ? [$editUserId] : [$editUserId, current_user()['company_id']]) : null;
         $userProfileCompanyId = $editUser ? (int)$editUser['company_id'] : $profileCompanyId;
         $userProfiles = rows('SELECT * FROM access_profiles WHERE company_id = ? ORDER BY role_key, name', [$userProfileCompanyId]);
+        $allAccessProfiles = $isPlatformAdmin ? rows('SELECT * FROM access_profiles ORDER BY company_id, role_key, name') : $userProfiles;
         $showCreateModal = $isPlatformAdmin && isset($_GET['new_user']);
+        $editProfileModules = $editUser ? access_profile_modules((int)($editUser['access_profile_id'] ?? 0), (int)$editUser['company_id']) : [];
+        $editAdditionalModules = $editUser ? additional_user_modules($editUser) : [];
+        $createProfile = null;
+        foreach ($allAccessProfiles as $candidateProfile) {
+            if ((int)$candidateProfile['company_id'] === $profileCompanyId) {
+                $createProfile = $candidateProfile;
+                break;
+            }
+        }
+        $createProfileModules = $createProfile ? modules_from_json((string)$createProfile['modules_json']) : [];
+        $createAdditionalModules = $createProfile ? [] : default_role_modules('usuario_operacional');
         $accessRows = rows("SELECT u.id, u.company_id, u.name nome, u.email, u.role perfil, COALESCE(ap.name, '') perfil_acesso, COALESCE(t.name, '-') equipe, u.status, u.extension identificacao, COALESCE(axe.extension, '-') asterisk_extension, COALESCE(axe.lifecycle_status, axe.status, 'Sem ramal') asterisk_extension_status FROM users u LEFT JOIN teams t ON t.id = u.team_id LEFT JOIN access_profiles ap ON ap.id = u.access_profile_id LEFT JOIN asterisk_user_extensions axe ON axe.user_id = u.id AND axe.company_id = u.company_id AND axe.asterisk_server_id = 1 AND axe.status = 'Ativo' WHERE {$userClause} AND u.deleted_at IS NULL ORDER BY u.id DESC", $userParams);
         foreach ($accessRows as &$accessRow) {
             $accessRow['can_remove'] = user_access_can_be_removed((int)$accessRow['id'], (int)current_user()['company_id']);
@@ -9167,13 +9209,14 @@ function render_users(): void
                         <div>
                             <span class="modal-kicker"><?= $editProfile ? 'Editar perfil' : 'Novo perfil' ?></span>
                             <h2><?= h($editProfile['name'] ?? 'Perfil de usuario') ?></h2>
-                            <p>Defina quais modulos este perfil libera.</p>
+                            <p>Cliente: <?= h((string)($profileCompany['trade_name'] ?? 'Nao identificado')) ?>. Defina quais modulos este perfil libera.</p>
                         </div>
-                        <a class="icon-button" href="?page=users" aria-label="Fechar modal">x</a>
+                        <a class="icon-button" href="?page=users&amp;company_id=<?= $profileCompanyId ?>" aria-label="Fechar modal">x</a>
                     </header>
                     <form class="form-grid" method="post">
                         <input type="hidden" name="action" value="save_access_profile">
                         <input type="hidden" name="profile_id" value="<?= (int)($editProfile['id'] ?? 0) ?>">
+                        <input type="hidden" name="company_id" value="<?= $profileCompanyId ?>">
                         <label>Nome do perfil<input name="name" value="<?= h((string)($editProfile['name'] ?? '')) ?>" required placeholder="Ex: Consultor padrao"></label>
                         <label>Base do perfil<select name="role_key">
                             <?php foreach (['cliente_admin', 'usuario_operacional', 'supervisor', 'atendente'] as $roleOption): ?>
@@ -9181,7 +9224,7 @@ function render_users(): void
                             <?php endforeach; ?>
                         </select></label>
                         <h3 class="wide">Modulos liberados</h3>
-                        <?= module_checkboxes($profileModules) ?>
+                        <?= module_checkboxes($profileModules, 'modules', [], true) ?>
                         <button class="button"><?= $editProfile ? 'Salvar perfil' : 'Criar perfil' ?></button>
                     </form>
                 </article>
@@ -9212,12 +9255,15 @@ function render_users(): void
                     <label>E-mail<input type="email" name="email" value="<?= h($editUser['email']) ?>" required></label>
                     <label>Nova senha<input name="password" placeholder="Deixe em branco para manter"></label>
                     <?php if ($isPlatformAdmin): ?>
-                        <label>Perfil<select name="access_profile_id">
-                            <option value="">Manter perfil atual: <?= h(role_label((string)$editUser['role'])) ?></option>
+                        <label>Perfil<select name="access_profile_id" data-access-profile-select>
+                            <option value="" data-modules="<?= h(json_encode($editProfileModules)) ?>">Manter perfil atual: <?= h(role_label((string)$editUser['role'])) ?></option>
                             <?php foreach ($userProfiles as $profile): ?>
-                                <option value="<?= (int)$profile['id'] ?>" <?= (int)($editUser['access_profile_id'] ?? 0) === (int)$profile['id'] ? 'selected' : '' ?>><?= h($profile['name']) ?></option>
+                                <option value="<?= (int)$profile['id'] ?>" data-modules="<?= h(json_encode(modules_from_json((string)$profile['modules_json']))) ?>" <?= (int)($editUser['access_profile_id'] ?? 0) === (int)$profile['id'] ? 'selected' : '' ?>><?= h($profile['name']) ?></option>
                             <?php endforeach; ?>
                         </select></label>
+                        <?php if ((int)($editUser['access_profile_id'] ?? 0) > 0): ?>
+                            <p class="hint wide"><a class="mini-link" href="?page=users&amp;company_id=<?= (int)$editUser['company_id'] ?>&amp;profile_id=<?= (int)$editUser['access_profile_id'] ?>">Editar permissoes deste perfil para <?= h((string)(one('SELECT trade_name FROM companies WHERE id = ?', [(int)$editUser['company_id']])['trade_name'] ?? 'este cliente')) ?></a></p>
+                        <?php endif; ?>
                     <?php endif; ?>
                     <label>Telefone<input name="phone" value="<?= h($editUser['phone']) ?>" data-phone-mask inputmode="tel" placeholder="Ex: (41) 99631-0725"></label>
                     <label>Status<select name="status"><?php foreach (['Ativo','Disponivel','Em pausa','Desconectado','Bloqueado'] as $status): ?><option <?= $editUser['status'] === $status ? 'selected' : '' ?>><?= h($status) ?></option><?php endforeach; ?></select></label>
@@ -9225,8 +9271,8 @@ function render_users(): void
                     <label>Identificacao<input name="extension" value="<?= h($editUser['extension']) ?>" placeholder="Opcional"></label>
                     <label>Ramal Asterisk<input name="asterisk_extension" value="<?= h((string)($editUser['asterisk_extension'] ?? '')) ?>" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"><small><?= h((string)($editUser['asterisk_lifecycle_status'] ?? $editUser['asterisk_extension_status'] ?? 'Sem ramal')) ?><?= !empty($editUser['asterisk_provisioning_status']) ? ' - ' . h((string)$editUser['asterisk_provisioning_status']) : '' ?></small></label>
                     <?php if ($isPlatformAdmin): ?>
-                        <h3 class="wide">Modulos deste usuario</h3>
-                        <?= module_checkboxes(modules_for_user($editUser)) ?>
+                        <h3 class="wide">Permissoes do perfil e adicionais</h3>
+                        <?= module_checkboxes($editAdditionalModules, 'modules', $editProfileModules) ?>
                     <?php endif; ?>
                     <input type="hidden" name="consultant_code" value="<?= h($editUser['consultant_code'] ?: $editUser['extension']) ?>">
                     <button class="button">Salvar acesso</button>
@@ -9296,25 +9342,70 @@ function render_users(): void
                         <input type="hidden" name="extension" value="">
                         <p class="hint wide">Para consultores extras, use perfil Usuario operacional.</p>
                         <?php if ($isPlatformAdmin): ?>
-                            <label>Cliente<select name="company_id"><?php foreach ($companies as $c): ?><option value="<?= $c['id'] ?>"><?= h($c['trade_name']) ?></option><?php endforeach; ?></select></label>
+                            <label>Cliente<select name="company_id" data-user-company-select><?php foreach ($companies as $c): ?><option value="<?= $c['id'] ?>" <?= (int)$c['id'] === $profileCompanyId ? 'selected' : '' ?>><?= h($c['trade_name']) ?></option><?php endforeach; ?></select></label>
                         <?php endif; ?>
                         <label>Nome<input name="name" required></label>
                         <label>E-mail<input type="email" name="email" required></label>
                         <label>Senha inicial<input name="password" value="admin123"></label>
-                        <label>Perfil<select name="access_profile_id">
-                            <?php if (!$accessProfiles): ?><option value="">Usuario operacional</option><?php endif; ?>
-                            <?php foreach ($accessProfiles as $profile): ?>
-                                <option value="<?= (int)$profile['id'] ?>"><?= h($profile['name']) ?></option>
+                        <label>Perfil<select name="access_profile_id" data-access-profile-select>
+                            <?php if (!$allAccessProfiles): ?><option value="">Usuario operacional</option><?php endif; ?>
+                            <?php foreach ($allAccessProfiles as $profile): ?>
+                                <?php $profileMatchesCompany = (int)$profile['company_id'] === $profileCompanyId; ?>
+                                <option value="<?= (int)$profile['id'] ?>" data-company-id="<?= (int)$profile['company_id'] ?>" data-modules="<?= h(json_encode(modules_from_json((string)$profile['modules_json']))) ?>" <?= (int)($createProfile['id'] ?? 0) === (int)$profile['id'] ? 'selected' : '' ?> <?= $profileMatchesCompany ? '' : 'disabled hidden' ?>><?= h($profile['name']) ?></option>
                             <?php endforeach; ?>
                         </select></label>
                         <label>Telefone<input name="phone" data-phone-mask inputmode="tel" placeholder="Ex: (41) 99631-0725"></label>
                         <label>Ramal Asterisk<input name="asterisk_extension" inputmode="numeric" pattern="[0-9]*" placeholder="Ex: 1003"></label>
-                        <h3 class="wide">Modulos deste usuario</h3>
-                        <?= module_checkboxes(default_role_modules('usuario_operacional')) ?>
+                        <h3 class="wide">Permissoes do perfil e adicionais</h3>
+                        <?= module_checkboxes($createAdditionalModules, 'modules', $createProfileModules) ?>
                         <button class="button">Cadastrar</button>
                     </form>
                 </article>
             </section>
+        <?php endif; ?>
+        <?php if ($editUser || $showCreateModal): ?>
+            <script>
+            document.querySelectorAll('[data-access-profile-select]').forEach(function (select) {
+                var form = select.closest('form');
+                if (!form) return;
+                form.querySelectorAll('[data-module-key]').forEach(function (input) {
+                    input.addEventListener('change', function () {
+                        if (!input.disabled) input.dataset.additional = input.checked ? '1' : '0';
+                    });
+                });
+                select.addEventListener('change', function () {
+                    var option = select.options[select.selectedIndex];
+                    var inherited = [];
+                    try { inherited = JSON.parse(option.dataset.modules || '[]'); } catch (error) { inherited = []; }
+                    form.querySelectorAll('[data-module-key]').forEach(function (input) {
+                        var fromProfile = inherited.indexOf(input.dataset.moduleKey) !== -1;
+                        input.disabled = fromProfile;
+                        input.checked = fromProfile || input.dataset.additional === '1';
+                        var badge = input.closest('[data-module-option]').querySelector('[data-profile-badge]');
+                        if (badge) badge.hidden = !fromProfile;
+                    });
+                });
+            });
+            document.querySelectorAll('[data-user-company-select]').forEach(function (companySelect) {
+                var form = companySelect.closest('form');
+                var profileSelect = form ? form.querySelector('[data-access-profile-select]') : null;
+                if (!profileSelect) return;
+                companySelect.addEventListener('change', function () {
+                    var companyId = companySelect.value;
+                    var firstAvailable = null;
+                    Array.prototype.forEach.call(profileSelect.options, function (option) {
+                        var available = !option.dataset.companyId || option.dataset.companyId === companyId;
+                        option.disabled = !available;
+                        option.hidden = !available;
+                        if (available && firstAvailable === null) firstAvailable = option;
+                    });
+                    if (firstAvailable) {
+                        profileSelect.value = firstAvailable.value;
+                        profileSelect.dispatchEvent(new Event('change'));
+                    }
+                });
+            });
+            </script>
         <?php endif; ?>
         <?php if ($isPlatformAdmin): ?>
             <section class="panel">
@@ -9323,8 +9414,12 @@ function render_users(): void
                         <h2>Perfis de usuario</h2>
                         <p>Use perfis para padronizar quais modulos cada tipo de usuario pode acessar.</p>
                     </div>
-                    <a class="button secondary" href="?page=users&new_profile=1">Criar perfil</a>
+                    <a class="button secondary" href="?page=users&amp;company_id=<?= $profileCompanyId ?>&amp;new_profile=1">Criar perfil</a>
                 </div>
+                <form method="get" class="form-grid compact-form">
+                    <input type="hidden" name="page" value="users">
+                    <label>Perfis do cliente<select name="company_id" onchange="this.form.submit()"><?php foreach ($companies as $c): ?><option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $profileCompanyId ? 'selected' : '' ?>><?= h($c['trade_name']) ?></option><?php endforeach; ?></select></label>
+                </form>
                 <?php if (!$accessProfiles): ?>
                     <p class="empty">Nenhum perfil criado ainda.</p>
                 <?php else: ?>
@@ -9340,11 +9435,12 @@ function render_users(): void
                                     <td><?= h((string)($profile['linked_users'] ?? 0)) ?></td>
                                     <td><?= h(implode(', ', array_map(fn($key) => access_modules()[$key] ?? $key, array_filter($profileModules, fn($key) => $key !== 'account')))) ?></td>
                                     <td class="actions">
-                                        <a class="mini-link" href="?page=users&profile_id=<?= (int)$profile['id'] ?>">Editar</a>
+                                        <a class="mini-link" href="?page=users&amp;company_id=<?= $profileCompanyId ?>&amp;profile_id=<?= (int)$profile['id'] ?>">Editar</a>
                                         <?php if ((int)($profile['linked_users'] ?? 0) === 0): ?>
                                             <form method="post" class="inline" onsubmit="return confirm('Excluir este perfil de usuario?');">
                                                 <input type="hidden" name="action" value="delete_access_profile">
                                                 <input type="hidden" name="profile_id" value="<?= (int)$profile['id'] ?>">
+                                                <input type="hidden" name="company_id" value="<?= $profileCompanyId ?>">
                                                 <button class="mini-link danger-link" type="submit">Excluir</button>
                                             </form>
                                         <?php endif; ?>
@@ -11789,6 +11885,7 @@ function render_account(): void
                 </dl>
                 <button class="mini-link terms-review-button" type="button" data-open-terms>Termos de uso e privacidade</button>
             </article>
+            <form id="account-password-reset-form" method="post" hidden></form>
             <form class="panel form-grid" method="post" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="update_my_account">
                 <h2>Editar minha conta</h2>
@@ -11806,6 +11903,16 @@ function render_account(): void
                         <button class="password-visibility-button" type="button" data-password-visibility aria-label="Mostrar senhas" title="Mostrar senhas" aria-pressed="false">&#128065;</button>
                     </span>
                 </label>
+                <details class="password-reset-panel">
+                    <summary>Nao sei minha senha atual</summary>
+                    <div class="form-grid compact-form">
+                        <input form="account-password-reset-form" type="hidden" name="action" value="request_my_password_reset">
+                        <p class="hint wide">Digite uma nova senha. Enviaremos um e-mail para confirmar a alteracao antes de atualizar sua conta.</p>
+                        <label>Nova senha<input form="account-password-reset-form" name="reset_password" type="password" autocomplete="new-password" required minlength="6"></label>
+                        <label>Confirmar nova senha<input form="account-password-reset-form" name="reset_password_confirm" type="password" autocomplete="new-password" required minlength="6"></label>
+                        <button form="account-password-reset-form" class="button secondary">Enviar confirmacao por e-mail</button>
+                    </div>
+                </details>
                 <label class="wide">Avatar<input name="avatar" type="file" accept="image/png,image/jpeg,image/webp"></label>
                 <?php if (!empty($user['avatar_path'])): ?>
                     <label class="check wide"><input type="checkbox" name="remove_avatar"> Remover avatar atual</label>
@@ -11813,16 +11920,6 @@ function render_account(): void
                 <p class="hint">Use uma imagem JPG, PNG ou WebP com ate 2 MB. Se nao enviar imagem, o avatar usa suas iniciais.</p>
                 <button class="button">Salvar minha conta</button>
             </form>
-            <details class="panel password-reset-panel">
-                <summary>Nao sei minha senha atual</summary>
-                <form class="form-grid compact-form" method="post">
-                    <input type="hidden" name="action" value="request_my_password_reset">
-                    <p class="hint wide">Digite uma nova senha. Enviaremos um e-mail para confirmar a alteracao antes de atualizar sua conta.</p>
-                    <label>Nova senha<input name="reset_password" type="password" autocomplete="new-password" required minlength="6"></label>
-                    <label>Confirmar nova senha<input name="reset_password_confirm" type="password" autocomplete="new-password" required minlength="6"></label>
-                    <button class="button secondary">Enviar confirmacao por e-mail</button>
-                </form>
-            </details>
         </section>
     <?php });
 }
