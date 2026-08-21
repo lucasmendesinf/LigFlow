@@ -3555,8 +3555,8 @@ function handle_post(): void
             flash('Somente administrador pode criar perfis de acesso.', 'error');
             redirect('?page=users');
         }
-        $profileId = save_access_profile((int)post('profile_id'), $companyId, (int)$user['id']);
-        redirect('?page=users&company_id=' . $companyId . ($profileId > 0 ? '&profile_id=' . $profileId : ''));
+        save_access_profile((int)post('profile_id'), $companyId, (int)$user['id']);
+        redirect('?page=users&company_id=' . $companyId);
     }
 
     if ($action === 'delete_access_profile' && can('users')) {
