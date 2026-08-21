@@ -7845,7 +7845,7 @@ function handle_sip_call_event(): never
         $providerBillable = first_payload_value($payload, ['billsec', 'billable_seconds', 'billable_duration', 'charged_seconds', 'talk_time']);
         $billable = call_billable_seconds($call, $duration, $wasAnswered, $providerBillable);
         $billing = call_billing_values($call, $billable);
-        db()->prepare("UPDATE calls SET status = ?, provider_status_raw = ?, internal_status = ?, error_message = NULLIF(?, ''), ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+        db()->prepare("UPDATE calls SET status = ?, provider_status_raw = ?, internal_status = ?, error_message = NULLIF(?, ''), ended_at = datetime('now'), finalized_at = COALESCE(finalized_at, datetime('now')), duration_seconds = ?, billable_seconds = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
             ->execute([$status, $rawProviderStatus, $internalStatus, $providerError, $duration, $billable, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
         telephony_record_call_debit($call, $billing, $agentId ?: null);
         $contactStatus = $wasAnswered ? 'pos_atendimento' : 'concluido';
