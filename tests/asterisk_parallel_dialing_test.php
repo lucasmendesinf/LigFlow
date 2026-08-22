@@ -48,12 +48,22 @@ $assert((int)$db->query('SELECT COUNT(*) FROM calls WHERE batch_id=1 AND finaliz
 $terminalStates = ['completed' => true, 'failed' => true, 'cancelled' => true];
 $assert(isset($terminalStates['failed']), 'terminal state does not regress after an out-of-order event');
 
-$noWinner = $db->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at='now' WHERE id=? AND winner_call_id IS NULL AND next_started_at IS NULL");
+$noWinner = $db->prepare("UPDATE dial_batches SET status='NO_WINNER' WHERE id=? AND winner_call_id IS NULL AND status IN ('ORIGINATING','RINGING')");
 $db->exec("INSERT INTO dial_batches(id,status) VALUES (2,'ORIGINATING')");
 $noWinner->execute([2]);
-$assert($noWinner->rowCount() === 1, 'batch with no winner advances once');
+$assert($noWinner->rowCount() === 1, 'batch with no winner becomes available for continuation');
 $noWinner->execute([2]);
-$assert($noWinner->rowCount() === 0, 'repeated final event does not start another batch');
+$assert($noWinner->rowCount() === 0, 'repeated final event does not reopen the batch');
+$claimContinuation = $db->prepare("UPDATE dial_batches SET next_started_at='now' WHERE id=? AND status='NO_WINNER' AND next_started_at IS NULL");
+$claimContinuation->execute([2]);
+$assert($claimContinuation->rowCount() === 1, 'next batch continuation is claimed once');
+$claimContinuation->execute([2]);
+$assert($claimContinuation->rowCount() === 0, 'duplicate poll cannot start a second continuation');
+
+$db->exec("UPDATE calls SET status='completed', finalized_at='now' WHERE id=11");
+$db->exec("UPDATE dial_batches SET status='FINISHED' WHERE id=1 AND winner_call_id=11");
+$activeFinishedWinner = (int)$db->query("SELECT COUNT(*) FROM dial_batches WHERE id=1 AND status IN ('ORIGINATING','RINGING','WINNER','CONNECTED')")->fetchColumn();
+$assert($activeFinishedWinner === 0, 'finished winner batch no longer blocks the next wave');
 
 $db->exec("UPDATE contacts SET status='em_ligacao', reserved_by=7 WHERE id IN (1,2)");
 $db->exec("UPDATE contacts SET status='reservado', reserved_by=7 WHERE id=3");

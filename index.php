@@ -6547,12 +6547,10 @@ function asterisk_continue_batch_if_exhausted(int $batchId): void
     if (!$batch || !empty($batch['winner_call_id'])) return;
     $live = (int)scalar("SELECT COUNT(*) FROM calls WHERE dial_batch_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [$batchId]);
     if ($live > 0) return;
-    db()->prepare("UPDATE dial_batches SET status='NO_WINNER', next_started_at=COALESCE(next_started_at,datetime('now')), updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL")
+    db()->prepare("UPDATE dial_batches SET status='NO_WINNER', updated_at=datetime('now') WHERE id=? AND winner_call_id IS NULL AND status IN ('ORIGINATING','RINGING')")
         ->execute([$batchId]);
     db()->prepare("UPDATE contacts SET status='concluido', reserved_by=NULL, reserved_at=NULL, reservation_expires_at=NULL WHERE id IN (SELECT contact_id FROM calls WHERE dial_batch_id=?) AND status IN ('reservado','em_ligacao')")
         ->execute([$batchId]);
-    db()->prepare("UPDATE users SET status='Disponivel' WHERE id=? AND company_id=? AND status='Discando automatico'")
-        ->execute([(int)$batch['agent_id'], (int)$batch['company_id']]);
 }
 
 function cancel_active_asterisk_batch(int $agentId, int $companyId): void
@@ -6976,8 +6974,12 @@ function finish_call(int $callId, int $resultId, string $notes, int $companyId):
     $billable = call_billable_seconds($call, $duration, true, $providerBillable);
     $billing = call_billing_values($call, $billable);
     $recording = $call['recording_url'] ?: (str_contains(strtolower((string)$call['provider']), 'demo') ? demo_recording_url($callId) : null);
-    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = 'atendida', ended_at = datetime('now'), duration_seconds = ?, billable_seconds = ?, result_id = ?, notes = ?, recording_url = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
+    db()->prepare("UPDATE calls SET status = 'completed', provider_status_raw = COALESCE(NULLIF(provider_status_raw, ''), status), internal_status = 'atendida', ended_at = datetime('now'), finalized_at = COALESCE(finalized_at, datetime('now')), duration_seconds = ?, billable_seconds = ?, result_id = ?, notes = ?, recording_url = ?, billing_rate_micros = ?, estimated_cost_micros = ?, estimated_cost = ?, updated_at = datetime('now') WHERE id = ?")
         ->execute([$duration, $billable, $resultId, $notes, $recording, $billing['rate_micros'], $billing['cost_micros'], $billing['cost_decimal'], $callId]);
+    if (!empty($call['dial_batch_id'])) {
+        db()->prepare("UPDATE dial_batches SET status='FINISHED', updated_at=datetime('now') WHERE id=? AND winner_call_id=?")
+            ->execute([(int)$call['dial_batch_id'], $callId]);
+    }
     telephony_record_call_debit($call, $billing, (int)($call['agent_id'] ?? 0) ?: null);
     db()->prepare("INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, 'call.completed', 'in_progress', 'completed', ?)")
         ->execute([$companyId, $callId, json_encode(['duration_seconds' => $duration, 'billable_seconds' => $billable, 'estimated_cost' => $billing['cost_decimal']])]);
@@ -10295,7 +10297,25 @@ function handle_agent_batch_state(): never
     }
     $state = agent_parallel_batch_state((int)$user['id'], (int)$user['company_id']);
     if (!$state) {
-        echo json_encode_safe(['ok' => true, 'active' => false]);
+        $batchId = max(0, (int)($_GET['batch_id'] ?? 0));
+        $batch = $batchId > 0
+            ? one('SELECT * FROM dial_batches WHERE id=? AND company_id=? AND agent_id=?', [$batchId, (int)$user['company_id'], (int)$user['id']])
+            : null;
+        $continueAuto = false;
+        if ($batch && (string)$batch['status'] === 'NO_WINNER' && empty($batch['next_started_at'])) {
+            $agentStatus = (string)(scalar('SELECT status FROM users WHERE id=? AND company_id=?', [(int)$user['id'], (int)$user['company_id']]) ?? '');
+            if ($agentStatus === 'Discando automatico') {
+                $claim = db()->prepare("UPDATE dial_batches SET next_started_at=datetime('now'), updated_at=datetime('now') WHERE id=? AND company_id=? AND agent_id=? AND status='NO_WINNER' AND next_started_at IS NULL");
+                $claim->execute([$batchId, (int)$user['company_id'], (int)$user['id']]);
+                $continueAuto = $claim->rowCount() === 1;
+            }
+        }
+        echo json_encode_safe([
+            'ok' => true,
+            'active' => false,
+            'continue_auto' => $continueAuto,
+            'campaign_id' => (int)($batch['campaign_id'] ?? 0),
+        ]);
         exit;
     }
     unset($state['batch']);

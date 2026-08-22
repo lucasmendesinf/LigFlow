@@ -994,7 +994,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         remoteAudio,
         onState: (state) => {
             if (state.call || !usesManagedAsterisk()) setText(statusEl, state.call || state.status);
-            if (state.status === 'INCOMING' && usesManagedAsterisk() && currentSipCallId) {
+            if (state.status === 'INCOMING' && usesManagedAsterisk() && (currentSipCallId || isAutoDialing())) {
                 service.answer();
             }
             if (state.register) setText(registerEl, state.register);
@@ -1128,6 +1128,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         setText(statusEl, state.status || managedCallPhase || 'iniciando');
         if (state.destination) setText(destinationEl, state.destination);
         if (!state.active) {
+            const preservePostCallModal = managedModalShownForCallId !== null;
             stopManagedCallPolling();
             currentSipCallId = null;
             root.setAttribute('data-managed-call-id', '0');
@@ -1140,7 +1141,10 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             root.querySelector('[data-webphone]')?.classList.remove('is-hidden');
             setDialpadCallStatus(false);
             document.querySelector('[data-active-call-banner]')?.remove();
-            if (managedModalShownForCallId !== null) {
+            if (preservePostCallModal) {
+                document.querySelector('[data-call-modal]')?.classList.remove('is-hidden');
+                setText(callDetail, 'Chamada encerrada. Registre o resultado para continuar.');
+            } else {
                 document.querySelector('[data-call-modal]')?.classList.add('is-hidden');
                 managedModalShownForCallId = null;
             }
@@ -1181,6 +1185,25 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
             managedCallPollTimer = setTimeout(pollManagedCallState, 1500);
         }
     };
+
+    const adoptManagedAsteriskCall = (callId) => {
+        const normalizedCallId = Number(callId || 0);
+        if (!usesManagedAsterisk() || normalizedCallId < 1) return false;
+        stopManagedCallPolling();
+        currentSipCallId = normalizedCallId;
+        managedCallPhase = '';
+        managedAutoAdvancePending = false;
+        root.setAttribute('data-managed-call-id', String(normalizedCallId));
+        panel?.classList.remove('is-hidden');
+        setText(callState, 'Conectando chamada vencedora');
+        setText(callDetail, 'Primeiro atendimento confirmado. Conectando seu ramal.');
+        pollManagedCallState();
+        return true;
+    };
+    window.ligflowAdoptManagedAsteriskCall = adoptManagedAsteriskCall;
+    window.addEventListener('ligflow:managed-asterisk-call', (event) => {
+        adoptManagedAsteriskCall(event.detail?.callId);
+    });
 
     const hangupManagedCall = async () => {
         if (!currentSipCallId) return;

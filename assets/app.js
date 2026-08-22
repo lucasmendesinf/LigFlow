@@ -355,18 +355,65 @@ setInterval(tickTimers, 1000);
 const parallelBatchState = document.querySelector('[data-parallel-batch-state]');
 if (parallelBatchState) {
     let batchPollingStopped = false;
+    const batchId = Number(parallelBatchState.getAttribute('data-batch-id') || 0);
     const updateBatchCounter = (name, value) => {
         document.querySelectorAll(`[data-batch-${name}]`).forEach((target) => {
             target.textContent = String(Number(value || 0));
         });
     };
+    const startNextParallelBatch = (campaignId) => {
+        const form = document.querySelector('[data-agent-status-form]');
+        if (!form) {
+            window.location.reload();
+            return;
+        }
+        let statusInput = form.querySelector('[data-auto-advance-status]');
+        if (!statusInput) {
+            statusInput = document.createElement('input');
+            statusInput.type = 'hidden';
+            statusInput.name = 'status';
+            statusInput.setAttribute('data-auto-advance-status', '1');
+            form.appendChild(statusInput);
+        }
+        const campaignInput = form.querySelector('[name="campaign_id"]');
+        if (campaignInput && Number(campaignId || 0) > 0) {
+            campaignInput.value = String(Number(campaignId));
+        }
+        statusInput.value = 'Disponivel';
+        HTMLFormElement.prototype.submit.call(form);
+    };
     const pollParallelBatch = async () => {
         if (batchPollingStopped) return;
         try {
-            const response = await fetch('?page=agent_batch_state', { headers: { Accept: 'application/json' }, cache: 'no-store' });
+            const response = await fetch(`?page=agent_batch_state&batch_id=${encodeURIComponent(batchId)}`, { headers: { Accept: 'application/json' }, cache: 'no-store' });
             const data = await response.json();
             if (!response.ok || !data?.ok) throw new Error('Falha ao consultar lote.');
-            if (!data.active || !data.batch?.awaiting_winner || Number(data.batch?.winner_call_id || 0) > 0) {
+            const winnerCallId = Number(data.batch?.winner_call_id || 0);
+            if (winnerCallId > 0) {
+                batchPollingStopped = true;
+                updateBatchCounter('active', data.batch.active_count);
+                updateBatchCounter('originated', data.batch.originated_count);
+                updateBatchCounter('ringing', data.batch.ringing_count);
+                updateBatchCounter('answered', data.batch.answered_count);
+                updateBatchCounter('finalized', data.batch.finalized_count);
+                const detail = { callId: winnerCallId };
+                if (typeof window.ligflowAdoptManagedAsteriskCall === 'function') {
+                    window.ligflowAdoptManagedAsteriskCall(winnerCallId);
+                } else {
+                    window.dispatchEvent(new CustomEvent('ligflow:managed-asterisk-call', { detail }));
+                }
+                return;
+            }
+            if (!data.active) {
+                batchPollingStopped = true;
+                if (data.continue_auto) {
+                    startNextParallelBatch(data.campaign_id);
+                } else {
+                    window.location.reload();
+                }
+                return;
+            }
+            if (!data.batch?.awaiting_winner) {
                 batchPollingStopped = true;
                 window.location.reload();
                 return;

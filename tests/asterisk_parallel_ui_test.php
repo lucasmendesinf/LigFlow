@@ -19,8 +19,10 @@ $assert(str_contains($source, '$isConnectedBatchWinner'), 'connected winner ente
 $assert(str_contains($source, "NOT IN ('LOSER','LATE_ANSWERED')"), 'loser and late answered calls are excluded from active UI fallback');
 $assert(str_contains($source, 'data-parallel-batch-state'), 'aggregate batch state is rendered');
 $assert(!str_contains($source, 'data-parallel-batch-phone'), 'aggregate state exposes no participant phone');
-$assert(str_contains($javascript, "fetch('?page=agent_batch_state'"), 'batch UI reuses one lightweight state endpoint');
-$assert(str_contains($javascript, 'window.location.reload()'), 'winner or completed batch returns to the normal UI');
+$assert(str_contains($javascript, 'page=agent_batch_state&batch_id='), 'batch UI reuses one lightweight state endpoint scoped to the current batch');
+$assert(str_contains($javascript, 'ligflowAdoptManagedAsteriskCall'), 'winner is adopted without reloading the registered webphone');
+$assert(str_contains($javascript, 'startNextParallelBatch'), 'batch without winner starts the next wave from the existing operation');
+$assert(str_contains(file_get_contents(dirname(__DIR__) . '/assets/nvoip-webphone.js') ?: '', "currentSipCallId || isAutoDialing()"), 'managed incoming consultant leg is auto-answered during automatic dialing');
 $assert(str_contains($source, '$isAutoDialing && !$isBatchWaitingForWinner && !$activeCall'), 'parallel waiting never reuses a serial auto-call phone');
 
 $db = new PDO('sqlite::memory:');
