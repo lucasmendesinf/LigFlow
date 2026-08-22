@@ -7,7 +7,7 @@ const APP_NAME = 'Lig Flow';
 const DATA_DIR = __DIR__ . '/data';
 const DB_FILE = DATA_DIR . '/callflow.sqlite';
 const IMPORT_DIR = __DIR__ . '/uploads/imports';
-const DB_SCHEMA_VERSION = 24;
+const DB_SCHEMA_VERSION = 26;
 const TERMS_VERSION = '2026-08-12.1';
 
 if (!is_dir(DATA_DIR)) {
@@ -36,11 +36,138 @@ if (is_file($asteriskRecordingFile)) {
         if ($companyId < 1 || $callId < 1) {
             throw new InvalidArgumentException('Empresa e chamada sao obrigatorias para nomear a gravacao.');
         }
-        $suffix = strtolower($uniqueSuffix ?? bin2hex(random_bytes(8)));
+        $suffix = strtolower($uniqueSuffix ?? substr(hash('sha256', 'ligflow-recording|' . $companyId . '|' . $callId), 0, 16));
         if (preg_match('/^[a-f0-9]{16}$/', $suffix) !== 1) {
             throw new InvalidArgumentException('Identificador unico da gravacao invalido.');
         }
         return sprintf('ligflow_%s_company-%d_call-%d_%s', gmdate('Ymd'), $companyId, $callId, $suffix);
+    }
+
+    function asterisk_recording_call_id_from_name(string $recordingName): int
+    {
+        if (preg_match('/^ligflow_[0-9]{8}_company-[1-9][0-9]*_call-([1-9][0-9]*)_[a-f0-9]{16}$/', $recordingName, $matches) !== 1) {
+            return 0;
+        }
+        return (int)$matches[1];
+    }
+
+    function asterisk_recording_claim_key(int $callId, string $recordingName): string
+    {
+        if ($callId < 1 || asterisk_recording_call_id_from_name($recordingName) !== $callId) {
+            throw new InvalidArgumentException('Chamada invalida para controle idempotente da gravacao.');
+        }
+        return hash('sha256', 'asterisk-recording-request|' . $callId . '|' . $recordingName);
+    }
+
+    function asterisk_recording_event_summary(array $event): array
+    {
+        $type = (string)($event['type'] ?? '');
+        $statuses = ['RecordingStarted' => 'RECORDING', 'RecordingFinished' => 'READY', 'RecordingFailed' => 'FAILED'];
+        if (!isset($statuses[$type]) || !is_array($event['recording'] ?? null)) return [];
+        $recording = $event['recording'];
+        $name = trim((string)($recording['name'] ?? ''));
+        $callId = asterisk_recording_call_id_from_name($name);
+        if ($callId < 1) return [];
+        $duration = $recording['duration_seconds'] ?? $recording['duration'] ?? null;
+        $size = $recording['size_bytes'] ?? $recording['size'] ?? null;
+        return [
+            'event_type' => $type,
+            'recording_name' => $name,
+            'status' => $statuses[$type],
+            'timestamp' => trim((string)($event['timestamp'] ?? gmdate(DATE_ATOM))),
+            'call_id' => $callId,
+            'format' => trim((string)($recording['format'] ?? 'wav')),
+            'cause' => trim((string)($event['cause'] ?? $event['cause_txt'] ?? '')),
+            'duration_seconds' => is_numeric($duration) ? max(0, (float)$duration) : null,
+            'size_bytes' => is_numeric($size) ? max(0, (int)$size) : null,
+        ];
+    }
+
+    function asterisk_recording_safe_name(string $recordingName): string
+    {
+        $recordingName = trim($recordingName);
+        if (asterisk_recording_call_id_from_name($recordingName) < 1 || preg_match('/^[A-Za-z0-9_-]{1,180}$/', $recordingName) !== 1) throw new InvalidArgumentException('Nome de gravacao Asterisk invalido.');
+        return $recordingName;
+    }
+
+    function asterisk_stored_recording_path(string $recordingName, bool $file = false): string
+    {
+        return '/recordings/stored/' . rawurlencode(asterisk_recording_safe_name($recordingName)) . ($file ? '/file' : '');
+    }
+
+    function asterisk_recording_metadata(array $recording, array $fallback = []): array
+    {
+        $duration = $recording['duration_seconds'] ?? $recording['duration'] ?? $fallback['duration_seconds'] ?? null;
+        $size = $recording['size_bytes'] ?? $recording['size'] ?? $fallback['size_bytes'] ?? null;
+        return ['duration_seconds' => is_numeric($duration) ? max(0, (float)$duration) : null, 'size_bytes' => is_numeric($size) ? max(0, (int)$size) : null];
+    }
+
+    function asterisk_recording_failure_reason(string $reason): ?string
+    {
+        $reason = trim(preg_replace('/[\x00-\x1F\x7F]+/', ' ', $reason) ?? '');
+        return $reason === '' ? null : substr($reason, 0, 500);
+    }
+
+    function asterisk_recording_retention_config(array $overrides = []): array
+    {
+        $read = static fn(string $name, int $default): int => max(1, (int)(getenv($name) !== false && trim((string)getenv($name)) !== '' ? getenv($name) : $default));
+        $usage = getenv('ASTERISK_RECORDING_STORAGE_USAGE_PERCENT');
+        return array_replace([
+            'short_threshold_seconds' => $read('ASTERISK_RECORDING_SHORT_THRESHOLD_SECONDS', 5),
+            'discard_grace_hours' => $read('ASTERISK_RECORDING_DISCARD_GRACE_HOURS', 24),
+            'retention_days' => $read('ASTERISK_RECORDING_RETENTION_DAYS', 90),
+            'disk_threshold_percent' => min(99, $read('ASTERISK_RECORDING_DISK_THRESHOLD_PERCENT', 80)),
+            'batch_size' => min(500, $read('ASTERISK_RECORDING_RETENTION_BATCH_SIZE', 25)),
+            'storage_usage_percent' => $usage !== false && trim((string)$usage) !== '' ? max(0, min(100, (float)$usage)) : null,
+        ], $overrides);
+    }
+
+    function asterisk_recording_retention_policy(float $durationSeconds, ?string $finishedAt, array $config, ?DateTimeImmutable $now = null): array
+    {
+        $now ??= new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        try { $base = $finishedAt ? (new DateTimeImmutable($finishedAt))->setTimezone(new DateTimeZone('UTC')) : $now; } catch (Throwable) { $base = $now; }
+        if ($durationSeconds < (float)$config['short_threshold_seconds']) {
+            return ['status' => 'DISCARD_PENDING', 'discard_eligible_at' => $base->modify('+' . (int)$config['discard_grace_hours'] . ' hours')->format('Y-m-d H:i:s'), 'retention_until' => null];
+        }
+        return ['status' => 'READY', 'discard_eligible_at' => null, 'retention_until' => $base->modify('+' . (int)$config['retention_days'] . ' days')->format('Y-m-d H:i:s')];
+    }
+
+    function asterisk_recording_apply_retention_policy(PDO $pdo, array $recording, array $config, ?DateTimeImmutable $now = null): array
+    {
+        if (!in_array((string)($recording['status'] ?? ''), ['READY', 'DISCARD_PENDING'], true) || !is_numeric($recording['duration_seconds'] ?? null)) return $recording;
+        $policy = asterisk_recording_retention_policy((float)$recording['duration_seconds'], (string)($recording['finished_at'] ?? $recording['created_at'] ?? ''), $config, $now);
+        $pdo->prepare("UPDATE call_recordings SET status=?, discard_eligible_at=?, retention_until=?, last_cleanup_error=NULL, updated_at=datetime('now') WHERE id=? AND company_id=? AND status IN ('READY','DISCARD_PENDING')")
+            ->execute([$policy['status'], $policy['discard_eligible_at'], $policy['retention_until'], (int)$recording['id'], (int)$recording['company_id']]);
+        return array_replace($recording, $policy);
+    }
+
+    function asterisk_wav_duration_from_stream($stream): ?float
+    {
+        if (!is_resource($stream)) return null;
+        $position = ftell($stream); rewind($stream); $header = fread($stream, 44); if ($position !== false) fseek($stream, $position);
+        if (!is_string($header) || strlen($header) < 44 || substr($header, 0, 4) !== 'RIFF' || substr($header, 8, 4) !== 'WAVE') return null;
+        $byteRate = unpack('V', substr($header, 28, 4))[1] ?? 0; $dataSize = unpack('V', substr($header, 40, 4))[1] ?? 0;
+        return $byteRate > 0 && $dataSize > 0 ? round($dataSize / $byteRate, 3) : null;
+    }
+
+    function asterisk_persist_recording_event(PDO $pdo, array $summary, array $call, array $metadata = []): bool
+    {
+        $callId = (int)($call['id'] ?? 0); $companyId = (int)($call['company_id'] ?? 0);
+        $name = asterisk_recording_safe_name((string)($summary['recording_name'] ?? ''));
+        if ($callId < 1 || $companyId < 1 || asterisk_recording_call_id_from_name($name) !== $callId) return false;
+        $race = strtoupper(trim((string)($call['race_outcome'] ?? '')));
+        if ((!empty($call['dial_batch_id']) && $race !== 'WINNER') || in_array($race, ['LOSER', 'LATE_ANSWERED', 'ORIGINATE_FAILED'], true)) return false;
+        $status = strtoupper(trim((string)($summary['status'] ?? ''))); if (!in_array($status, ['RECORDING', 'READY', 'FAILED'], true)) return false;
+        $metrics = asterisk_recording_metadata($metadata, $summary); $timestamp = trim((string)($summary['timestamp'] ?? '')) ?: gmdate('Y-m-d\TH:i:s\Z');
+        $stmt = $pdo->prepare("INSERT INTO call_recordings (company_id, call_id, recording_name, format, status, duration_seconds, size_bytes, started_at, finished_at, failure_reason, created_at, updated_at) VALUES (?, ?, ?, 'wav', ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) ON CONFLICT(call_id) DO UPDATE SET recording_name=excluded.recording_name, status=CASE WHEN call_recordings.status IN ('READY','DISCARD_PENDING','DISCARDED') THEN call_recordings.status WHEN call_recordings.status='FAILED' AND excluded.status='RECORDING' THEN call_recordings.status ELSE excluded.status END, duration_seconds=COALESCE(excluded.duration_seconds,call_recordings.duration_seconds), size_bytes=COALESCE(excluded.size_bytes,call_recordings.size_bytes), started_at=COALESCE(call_recordings.started_at,excluded.started_at), finished_at=COALESCE(excluded.finished_at,call_recordings.finished_at), failure_reason=CASE WHEN call_recordings.status IN ('READY','DISCARD_PENDING','DISCARDED') THEN call_recordings.failure_reason WHEN excluded.status='FAILED' THEN excluded.failure_reason WHEN excluded.status='READY' THEN NULL ELSE call_recordings.failure_reason END, updated_at=datetime('now')");
+        $stmt->execute([$companyId, $callId, $name, $status, $metrics['duration_seconds'], $metrics['size_bytes'], $status === 'RECORDING' ? $timestamp : null, in_array($status, ['READY','FAILED'], true) ? $timestamp : null, $status === 'FAILED' ? asterisk_recording_failure_reason((string)($summary['cause'] ?? 'Falha na gravacao ARI.')) : null]);
+        if ($status === 'READY' && $metrics['duration_seconds'] !== null) {
+            $saved = $pdo->prepare('SELECT * FROM call_recordings WHERE call_id=? AND company_id=? LIMIT 1');
+            $saved->execute([$callId, $companyId]);
+            $row = $saved->fetch(PDO::FETCH_ASSOC);
+            if (is_array($row)) asterisk_recording_apply_retention_policy($pdo, $row, asterisk_recording_retention_config());
+        }
+        return true;
     }
 
     function asterisk_bridge_recording_request(string $bridgeId, string $recordingName, string $format = 'wav'): array
@@ -88,6 +215,24 @@ if (is_file($asteriskRecordingFile)) {
         try {
             $result = $record($bridgeId, asterisk_bridge_recording_name((int)($call['company_id'] ?? 0), (int)($call['id'] ?? 0)), 'wav');
             return ['started' => true, 'result' => is_array($result) ? $result : []];
+        } catch (Throwable $e) {
+            return ['started' => false, 'error' => $e->getMessage()];
+        }
+    }
+
+    function asterisk_try_connected_bridge_recording(callable $record, array $call, string $bridgeId): array
+    {
+        if ((string)($call['status'] ?? '') !== 'connected' || empty($call['connected_at'])) return ['started' => false, 'skipped' => 'not_connected'];
+        if (!empty($call['finalized_at'])) return ['started' => false, 'skipped' => 'finalized'];
+        $raceOutcome = strtoupper(trim((string)($call['race_outcome'] ?? '')));
+        if ((!empty($call['dial_batch_id']) && $raceOutcome !== 'WINNER') || in_array($raceOutcome, ['LOSER', 'LATE_ANSWERED', 'ORIGINATE_FAILED'], true)) {
+            return ['started' => false, 'skipped' => 'not_winner'];
+        }
+        if ($bridgeId === '' || $bridgeId !== trim((string)($call['provider_bridge_id'] ?? ''))) return ['started' => false, 'skipped' => 'invalid_bridge'];
+        try {
+            $recordingName = asterisk_bridge_recording_name((int)($call['company_id'] ?? 0), (int)($call['id'] ?? 0));
+            $result = $record($bridgeId, $recordingName, 'wav');
+            return ['started' => true, 'recording_name' => $recordingName, 'result' => is_array($result) ? $result : []];
         } catch (Throwable $e) {
             return ['started' => false, 'error' => $e->getMessage()];
         }
@@ -660,6 +805,27 @@ function migrate(PDO $pdo): void
             payload_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS call_recordings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            call_id INTEGER NOT NULL UNIQUE,
+            recording_name TEXT NOT NULL UNIQUE,
+            format TEXT NOT NULL DEFAULT 'wav',
+            status TEXT NOT NULL DEFAULT 'RECORDING' CHECK(status IN ('RECORDING','READY','FAILED','DISCARD_PENDING','DISCARDED')),
+            duration_seconds REAL,
+            size_bytes INTEGER,
+            started_at TEXT,
+            finished_at TEXT,
+            failure_reason TEXT,
+            discard_eligible_at TEXT,
+            discarded_at TEXT,
+            retention_until TEXT,
+            last_cleanup_error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_call_recordings_company_status ON call_recordings(company_id, status);
+        CREATE INDEX IF NOT EXISTS idx_call_recordings_company_call ON call_recordings(company_id, call_id);
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             company_id INTEGER NOT NULL,
@@ -893,6 +1059,7 @@ function migrate(PDO $pdo): void
     ensure_index($pdo, 'idx_telephony_ledger_call', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_telephony_ledger_call ON telephony_ledger(call_id) WHERE call_id IS NOT NULL');
     migrate_call_attempt_columns($pdo);
     migrate_contacts_unique_per_list($pdo);
+    migrate_call_recordings_retention($pdo);
 }
 
 function ensure_column(PDO $pdo, string $table, string $column, string $definition): void
@@ -2314,6 +2481,84 @@ function asterisk_ari_request(array $config, string $method, string $path, ?arra
     return is_array($decoded) ? $decoded : [];
 }
 
+function migrate_call_recordings_retention(PDO $pdo): void
+{
+    $schema = (string)$pdo->query("SELECT sql FROM sqlite_master WHERE type='table' AND name='call_recordings'")->fetchColumn();
+    if ($schema === '') return;
+    $columns = $pdo->query('PRAGMA table_info(call_recordings)')->fetchAll(PDO::FETCH_ASSOC);
+    $names = array_column($columns, 'name');
+    $required = ['discard_eligible_at', 'discarded_at', 'retention_until', 'last_cleanup_error'];
+    if (str_contains($schema, "'DISCARD_PENDING'") && array_diff($required, $names) === []) {
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_call_recordings_cleanup ON call_recordings(status, discard_eligible_at, retention_until)');
+        return;
+    }
+
+    $pdo->exec('DROP TABLE IF EXISTS call_recordings_retention_new');
+    $pdo->exec("CREATE TABLE call_recordings_retention_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        call_id INTEGER NOT NULL UNIQUE,
+        recording_name TEXT NOT NULL UNIQUE,
+        format TEXT NOT NULL DEFAULT 'wav',
+        status TEXT NOT NULL DEFAULT 'RECORDING' CHECK(status IN ('RECORDING','READY','FAILED','DISCARD_PENDING','DISCARDED')),
+        duration_seconds REAL,
+        size_bytes INTEGER,
+        started_at TEXT,
+        finished_at TEXT,
+        failure_reason TEXT,
+        discard_eligible_at TEXT,
+        discarded_at TEXT,
+        retention_until TEXT,
+        last_cleanup_error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )");
+    $pdo->exec("INSERT INTO call_recordings_retention_new
+        (id, company_id, call_id, recording_name, format, status, duration_seconds, size_bytes, started_at, finished_at, failure_reason, created_at, updated_at)
+        SELECT id, company_id, call_id, recording_name, format, status, duration_seconds, size_bytes, started_at, finished_at, failure_reason, created_at, updated_at
+        FROM call_recordings");
+    $pdo->exec('DROP TABLE call_recordings');
+    $pdo->exec('ALTER TABLE call_recordings_retention_new RENAME TO call_recordings');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_call_recordings_company_status ON call_recordings(company_id, status)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_call_recordings_company_call ON call_recordings(company_id, call_id)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_call_recordings_cleanup ON call_recordings(status, discard_eligible_at, retention_until)');
+}
+
+function asterisk_ari_recording_file(array $config, string $recordingName): array
+{
+    $recordingName = asterisk_recording_safe_name($recordingName);
+    if (!function_exists('curl_init')) throw new RuntimeException('A extensao cURL e obrigatoria para recuperar gravacoes Asterisk.');
+    if ($config['ari_url'] === '' || $config['ari_username'] === '' || $config['ari_password'] === '') {
+        throw new RuntimeException('Configuracao ARI indisponivel para recuperar a gravacao.');
+    }
+    $url = $config['ari_url'] . asterisk_stored_recording_path($recordingName, true);
+    $stream = fopen('php://temp/maxmemory:5242880', 'w+b');
+    if ($stream === false) throw new RuntimeException('Nao foi possivel preparar o stream da gravacao.');
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FILE => $stream,
+        CURLOPT_USERPWD => $config['ari_username'] . ':' . $config['ari_password'],
+        CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
+        CURLOPT_HTTPHEADER => ['Accept: audio/wav,application/octet-stream'],
+        CURLOPT_TIMEOUT => max(30, (int)$config['originate_timeout_seconds']),
+    ]);
+    $ok = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $contentType = (string)(curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: 'audio/wav');
+    $error = curl_error($ch);
+    curl_close($ch);
+    if ($ok === false || $status < 200 || $status >= 300) {
+        rewind($stream);
+        $response = stream_get_contents($stream, 2048);
+        fclose($stream);
+        throw asterisk_ari_failure('GET', $url, $status, is_string($response) ? $response : '', $error, null);
+    }
+    $stat = fstat($stream) ?: [];
+    rewind($stream);
+    return ['stream' => $stream, 'content_type' => $contentType, 'size_bytes' => max(0, (int)($stat['size'] ?? 0))];
+}
+
 final class NvoipDirectProvider implements TelephonyProvider
 {
     public function mode(): string { return 'NVOIP_DIRECT'; }
@@ -2396,6 +2641,20 @@ final class AsteriskProvider implements TelephonyProvider
     public function recordBridge(string $bridgeId, string $recordingName, string $format = 'wav'): array
     {
         return asterisk_record_bridge_ari($this->ariRequest, $this->config, $bridgeId, $recordingName, $format);
+    }
+    public function storedRecordingInfo(string $recordingName): array
+    {
+        $recordingName = asterisk_recording_safe_name($recordingName);
+        return ($this->ariRequest)($this->config, 'GET', asterisk_stored_recording_path($recordingName), null);
+    }
+    public function storedRecordingFile(string $recordingName): array
+    {
+        return asterisk_ari_recording_file($this->config, $recordingName);
+    }
+    public function deleteStoredRecording(string $recordingName): void
+    {
+        $recordingName = asterisk_recording_safe_name($recordingName);
+        ($this->ariRequest)($this->config, 'DELETE', asterisk_stored_recording_path($recordingName), null);
     }
     public function connectConsultant(string $bridgeId, string $endpoint): array
     {
@@ -6524,19 +6783,6 @@ function asterisk_batch_answered(int $callId): void
                 ->execute([(string)$bridge['bridge_id'], $consultantChannelId, $callId]);
             db()->prepare("UPDATE dial_batches SET status='WINNER', updated_at=datetime('now') WHERE id=?")->execute([(int)$batch['id']]);
             asterisk_replay_orphan_events_for_call($callId, $consultantChannelId);
-            if (filter_var(env_value('ASTERISK_BRIDGE_RECORDING_HOMOLOGATION'), FILTER_VALIDATE_BOOLEAN)) {
-                $recording = asterisk_try_winner_bridge_recording(
-                    static fn(string $bridgeId, string $recordingName, string $format): array => $provider->recordBridge($bridgeId, $recordingName, $format),
-                    array_replace($call, ['race_outcome' => 'WINNER']),
-                    (string)$bridge['bridge_id']
-                );
-                if (empty($recording['started'])) {
-                    error_log('Falha ao iniciar gravacao ARI da chamada vencedora ' . $callId . ': ' . (string)($recording['error'] ?? $recording['skipped'] ?? 'erro desconhecido'));
-                } else {
-                    $recordingResult = (array)($recording['result'] ?? []);
-                    error_log('Gravacao ARI iniciada: call_id=' . $callId . ' bridge_id=' . (string)$bridge['bridge_id'] . ' arquivo=' . (string)($recordingResult['filename'] ?? ''));
-                }
-            }
         }
     } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
 }
@@ -7161,8 +7407,55 @@ function handle_recording_file(): never
     $callId = (int)($_GET['id'] ?? 0);
     [$clause, $params] = scoped_calls_clause('co', $user);
     $params[] = $callId;
-    $call = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE {$clause} AND co.id = ? LIMIT 1", $params);
-    if (!$call || empty($call['recording_url'])) {
+    $call = one("SELECT co.*, ct.name contato,
+            ar.id asterisk_recording_id, ar.recording_name asterisk_recording_name,
+            ar.format asterisk_recording_format, ar.status asterisk_recording_status
+        FROM calls co
+        LEFT JOIN contacts ct ON ct.id = co.contact_id
+        LEFT JOIN call_recordings ar ON ar.call_id = co.id AND ar.company_id = co.company_id
+        WHERE {$clause} AND co.id = ? LIMIT 1", $params);
+    if (!$call) {
+        http_response_code(404);
+        echo 'Gravacao nao encontrada.';
+        exit;
+    }
+
+    $download = ($_GET['download'] ?? '') === '1';
+    $safeName = preg_replace('/[^a-z0-9_-]+/i', '-', (string)($call['contato'] ?: 'ligacao'));
+    if (in_array((string)($call['asterisk_recording_status'] ?? ''), ['READY', 'DISCARD_PENDING'], true) && !empty($call['asterisk_recording_name'])) {
+        try {
+            $file = (new AsteriskProvider(asterisk_config()))->storedRecordingFile((string)$call['asterisk_recording_name']);
+            $stream = $file['stream'] ?? null;
+            if (!is_resource($stream)) throw new RuntimeException('Stream da gravacao Asterisk indisponivel.');
+            $size = max(0, (int)($file['size_bytes'] ?? 0));
+            $duration = asterisk_wav_duration_from_stream($stream);
+            db()->prepare('UPDATE call_recordings SET size_bytes = CASE WHEN ? > 0 THEN ? ELSE size_bytes END, duration_seconds = COALESCE(?, duration_seconds), updated_at = datetime(\'now\') WHERE id = ? AND company_id = ?')
+                ->execute([$size, $size, $duration, (int)$call['asterisk_recording_id'], (int)$call['company_id']]);
+            if ($duration !== null) {
+                $recording = one('SELECT * FROM call_recordings WHERE id=? AND company_id=?', [(int)$call['asterisk_recording_id'], (int)$call['company_id']]);
+                if ($recording) asterisk_recording_apply_retention_policy(db(), $recording, asterisk_recording_retention_config());
+            }
+            rewind($stream);
+            header('Content-Type: audio/wav');
+            if ($size > 0) header('Content-Length: ' . $size);
+            header('Content-Disposition: ' . ($download ? 'attachment; filename="ligflow-gravacao-' . $callId . '-' . trim((string)$safeName, '-') . '.wav"' : 'inline'));
+            fpassthru($stream);
+            fclose($stream);
+            exit;
+        } catch (Throwable $error) {
+            $isMissing = $error instanceof AsteriskAriRequestException && (int)($error->diagnostics()['http_status'] ?? 0) === 404;
+            if ($isMissing) {
+                db()->prepare('UPDATE call_recordings SET last_cleanup_error=?, updated_at=datetime(\'now\') WHERE id=? AND company_id=?')
+                    ->execute(['Stored Recording ausente no Asterisk; aguardando reconciliacao.', (int)$call['asterisk_recording_id'], (int)$call['company_id']]);
+            }
+            http_response_code($isMissing ? 404 : 502);
+            echo $isMissing ? 'Gravacao Asterisk nao encontrada; reconciliacao pendente.' : 'Nao foi possivel carregar a gravacao Asterisk.';
+            error_log('Falha no proxy de gravacao Asterisk: call_id=' . $callId . '; erro=' . asterisk_recording_failure_reason($error->getMessage()));
+            exit;
+        }
+    }
+
+    if (empty($call['recording_url'])) {
         http_response_code(404);
         echo 'Gravacao nao encontrada.';
         exit;
@@ -7203,8 +7496,6 @@ function handle_recording_file(): never
         exit;
     }
 
-    $download = ($_GET['download'] ?? '') === '1';
-    $safeName = preg_replace('/[^a-z0-9_-]+/i', '-', (string)($call['contato'] ?: 'ligacao'));
     header('Content-Type: ' . ($contentType ?: 'audio/mpeg'));
     header('Content-Length: ' . strlen((string)$body));
     if ($download) {
@@ -8158,8 +8449,89 @@ function connectManualCall(array $call, array $agent): void
     }
 }
 
+function asterisk_start_connected_bridge_recording(array $call): void
+{
+    if (!filter_var(env_value('ASTERISK_BRIDGE_RECORDING_HOMOLOGATION'), FILTER_VALIDATE_BOOLEAN)) return;
+
+    $callId = (int)($call['id'] ?? 0);
+    $companyId = (int)($call['company_id'] ?? 0);
+    $bridgeId = trim((string)($call['provider_bridge_id'] ?? ''));
+    if ($callId < 1 || $companyId < 1) return;
+
+    $recordingName = asterisk_bridge_recording_name($companyId, $callId);
+    $claimKey = asterisk_recording_claim_key($callId, $recordingName);
+    $requestedAt = gmdate(DATE_ATOM);
+    $claimPayload = [
+        'recording_name' => $recordingName,
+        'status' => 'REQUESTED',
+        'timestamp' => $requestedAt,
+        'call_id' => $callId,
+        'format' => 'wav',
+    ];
+    $claim = db()->prepare("INSERT OR IGNORE INTO asterisk_ari_events (event_key, call_id, event_type, payload_json) VALUES (?, ?, 'RecordingRequested', ?)");
+    $claim->execute([$claimKey, $callId, json_encode_safe($claimPayload)]);
+    if ($claim->rowCount() !== 1) return;
+
+    $provider = new AsteriskProvider(asterisk_config());
+    $result = asterisk_try_connected_bridge_recording(
+        static fn(string $targetBridgeId, string $name, string $format): array => $provider->recordBridge($targetBridgeId, $name, $format),
+        $call,
+        $bridgeId
+    );
+    if (empty($result['started'])) {
+        $failure = $claimPayload + [
+            'status' => 'REQUEST_FAILED',
+            'timestamp' => gmdate(DATE_ATOM),
+            'cause' => (string)($result['error'] ?? $result['skipped'] ?? 'erro desconhecido'),
+        ];
+        db()->prepare("UPDATE asterisk_ari_events SET event_type='RecordingRequestFailed', payload_json=? WHERE event_key=?")
+            ->execute([json_encode_safe($failure), $claimKey]);
+        log_call_status($companyId, $callId, 'Asterisk ARI', 'RECORDING_REQUEST_FAILED', 'Falha isolada ao solicitar gravacao do bridge.', $failure);
+        return;
+    }
+
+    log_call_status($companyId, $callId, 'Asterisk ARI', 'RECORDING_REQUESTED', 'Gravacao do bridge solicitada.', $claimPayload);
+}
+
+function asterisk_handle_recording_event(array $event): bool
+{
+    $summary = asterisk_recording_event_summary($event);
+    if ($summary === []) return false;
+
+    $callId = (int)$summary['call_id'];
+    $call = one('SELECT id, company_id, dial_batch_id, race_outcome FROM calls WHERE id=?', [$callId]);
+    if (!$call) return true;
+
+    $eventKey = asterisk_event_key($event);
+    $saved = db()->prepare('INSERT OR IGNORE INTO asterisk_ari_events (event_key, call_id, event_type, payload_json) VALUES (?, ?, ?, ?)');
+    $saved->execute([$eventKey, $callId, (string)$summary['event_type'], json_encode_safe($summary)]);
+    $isNewEvent = $saved->rowCount() === 1;
+
+    $metadata = [];
+    if ($isNewEvent && (string)$summary['status'] === 'READY') {
+        try {
+            $metadata = (new AsteriskProvider(asterisk_config()))->storedRecordingInfo((string)$summary['recording_name']);
+        } catch (Throwable $metadataError) {
+            error_log('Metadados da gravacao Asterisk indisponiveis: call_id=' . $callId . '; erro=' . asterisk_recording_failure_reason($metadataError->getMessage()));
+        }
+    }
+    try {
+        asterisk_persist_recording_event(db(), $summary, $call, $metadata);
+    } catch (Throwable $persistenceError) {
+        error_log('Falha isolada ao persistir gravacao Asterisk: call_id=' . $callId . '; erro=' . asterisk_recording_failure_reason($persistenceError->getMessage()));
+    }
+    if (!$isNewEvent) return true;
+
+    db()->prepare('INSERT INTO call_events (company_id, call_id, event_name, old_status, new_status, payload) VALUES (?, ?, ?, NULL, ?, ?)')
+        ->execute([(int)$call['company_id'], $callId, 'asterisk.' . strtolower((string)$summary['event_type']), (string)$summary['status'], json_encode_safe($summary)]);
+    log_call_status((int)$call['company_id'], $callId, 'Asterisk ARI', (string)$summary['status'], 'Evento de gravacao ARI recebido.', $summary);
+    return true;
+}
+
 function asterisk_handle_event(array $event): void
 {
+    if (asterisk_handle_recording_event($event)) return;
+
     $eventKey = asterisk_event_key($event);
     $identifiers = asterisk_event_identifiers($event);
     $channelId = (string)($event['channel']['id'] ?? $event['peer']['id'] ?? $event['caller']['id'] ?? '');
@@ -8220,6 +8592,14 @@ function asterisk_handle_event(array $event): void
                 if (!empty($call['dial_batch_id'])) {
                     db()->prepare("UPDATE dial_batches SET status='CONNECTED', updated_at=datetime('now') WHERE id=?")
                         ->execute([(int)$call['dial_batch_id']]);
+                }
+                $connectedCall = one('SELECT * FROM calls WHERE id=?', [(int)$call['id']]);
+                if ($connectedCall) {
+                    try {
+                        asterisk_start_connected_bridge_recording($connectedCall);
+                    } catch (Throwable $recordingError) {
+                        error_log('Falha isolada na homologacao da gravacao ARI: call_id=' . (int)$call['id'] . '; erro=' . $recordingError->getMessage());
+                    }
                 }
             } catch (Throwable $e) {
                 db()->prepare("UPDATE calls SET provider_status_raw='ASTERISK_CONSULTANT_BRIDGE_FAILED', error_message=?, updated_at=datetime('now') WHERE id=? AND finalized_at IS NULL")
@@ -11195,12 +11575,15 @@ function render_recordings_content(): void
             $params[] = $recordingDate;
         }
         $recordings = rows("SELECT co.id, co.created_at data, co.answered_at, co.ended_at, ct.name contato, u.name consultor, ca.name campanha,
-                   co.destination_number telefone, co.duration_seconds, co.recording_url, COALESCE(cr.name, '-') resultado, co.status
+                   co.destination_number telefone, co.duration_seconds, co.recording_url, COALESCE(cr.name, '-') resultado, co.status,
+                   ar.status asterisk_recording_status, ar.duration_seconds asterisk_recording_duration,
+                   ar.size_bytes asterisk_recording_size, ar.format asterisk_recording_format
             FROM calls co
             JOIN contacts ct ON ct.id = co.contact_id
             LEFT JOIN campaigns ca ON ca.id = co.campaign_id
             LEFT JOIN users u ON u.id = co.agent_id
             LEFT JOIN call_results cr ON cr.id = co.result_id
+            LEFT JOIN call_recordings ar ON ar.call_id = co.id AND ar.company_id = co.company_id
             WHERE " . implode(' AND ', $recordingWhere) . "
             ORDER BY co.id DESC LIMIT 100", $params);
         $webhookLogs = [];
@@ -11256,7 +11639,7 @@ function render_recordings_content(): void
             <div class="import-history-content">
             <div class="section-head">
                 <div>
-                    <p>Ouça e baixe as gravacoes recebidas pela Nvoip. As chamadas recentes ficam como pendentes ate o webhook informar a URL do audio.</p>
+                    <p>Ouça e baixe as gravacoes disponiveis pela Nvoip ou pelo Asterisk.</p>
                 </div>
             </div>
             <form method="get" class="form-grid recording-filters">
@@ -11275,9 +11658,14 @@ function render_recordings_content(): void
                         <tbody>
                         <?php foreach ($recordings as $call): ?>
                             <?php
-                            $hasRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
-                            $duration = call_conversation_duration_seconds($call);
+                            $hasLegacyRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
+                            $hasAsteriskRecording = in_array((string)($call['asterisk_recording_status'] ?? ''), ['READY', 'DISCARD_PENDING'], true);
+                            $hasRecording = $hasAsteriskRecording || $hasLegacyRecording;
+                            $duration = $hasAsteriskRecording && is_numeric($call['asterisk_recording_duration'] ?? null)
+                                ? max(0, (int)round((float)$call['asterisk_recording_duration']))
+                                : call_conversation_duration_seconds($call);
                             $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
+                            $recordingStatusText = $hasRecording ? 'Ouvir' : ((string)($call['asterisk_recording_status'] ?? '') === 'FAILED' ? 'Falhou' : 'Pendente');
                             ?>
                             <tr>
                                 <td><?= h($call['data']) ?></td>
@@ -11288,9 +11676,9 @@ function render_recordings_content(): void
                                 <td><?= h($durationText) ?></td>
                                 <td><?= h($call['resultado']) ?></td>
                                 <td>
-                                    <button class="recording-action <?= $hasRecording ? 'is-ready' : '' ?>" type="button" data-open-recording="<?= (int)$call['id'] ?>" title="<?= $hasRecording ? 'Ouvir gravacao' : 'Gravacao pendente' ?>">
+                                    <button class="recording-action <?= $hasRecording ? 'is-ready' : '' ?>" type="button" data-open-recording="<?= (int)$call['id'] ?>" title="<?= $hasRecording ? 'Ouvir gravacao' : 'Gravacao indisponivel' ?>">
                                         <span><?= $hasRecording ? '&#9679;' : '&#9711;' ?></span>
-                                        <?= $hasRecording ? 'Ouvir' : 'Pendente' ?>
+                                        <?= h($recordingStatusText) ?>
                                     </button>
                                 </td>
                             </tr>
@@ -11300,8 +11688,12 @@ function render_recordings_content(): void
                 </div>
                 <?php foreach ($recordings as $call): ?>
                     <?php
-                    $hasRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
-                    $duration = call_conversation_duration_seconds($call);
+                    $hasLegacyRecording = !empty($call['recording_url']) && preg_match('~^https?://~i', (string)$call['recording_url']);
+                    $hasAsteriskRecording = in_array((string)($call['asterisk_recording_status'] ?? ''), ['READY', 'DISCARD_PENDING'], true);
+                    $hasRecording = $hasAsteriskRecording || $hasLegacyRecording;
+                    $duration = $hasAsteriskRecording && is_numeric($call['asterisk_recording_duration'] ?? null)
+                        ? max(0, (int)round((float)$call['asterisk_recording_duration']))
+                        : call_conversation_duration_seconds($call);
                     $durationText = $duration > 0 ? gmdate($duration >= 3600 ? 'H:i:s' : 'i:s', $duration) : '-';
                     $playUrl = '?page=recording_file&id=' . (int)$call['id'];
                     $downloadUrl = $playUrl . '&download=1';
@@ -11333,10 +11725,12 @@ function render_recordings_content(): void
                                         <audio controls preload="none" src="<?= h($playUrl) ?>"></audio>
                                         <div class="button-row">
                                             <a class="button secondary" href="<?= h($downloadUrl) ?>">Baixar</a>
-                                            <a class="mini-link" href="<?= h((string)$call['recording_url']) ?>" target="_blank" rel="noopener">Abrir origem</a>
+                                            <?php if ($hasLegacyRecording && !$hasAsteriskRecording): ?>
+                                                <a class="mini-link" href="<?= h((string)$call['recording_url']) ?>" target="_blank" rel="noopener">Abrir origem</a>
+                                            <?php endif; ?>
                                         </div>
                                     <?php else: ?>
-                                        <p class="empty">Aguardando a Nvoip enviar a gravacao pelo webhook.</p>
+                                        <p class="empty"><?= (string)($call['asterisk_recording_status'] ?? '') === 'FAILED' ? 'A gravacao Asterisk falhou.' : 'Gravacao ainda nao disponivel.' ?></p>
                                         <small><?= h($call['status']) ?> - <?= h($call['data']) ?></small>
                                     <?php endif; ?>
                                 </div>

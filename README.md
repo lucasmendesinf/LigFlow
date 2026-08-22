@@ -92,6 +92,39 @@ Para autenticar, o sistema suporta dois caminhos:
 
 Se a API retornar `User sip not found`, confira se o usuario/ramal SIP informado existe na conta Nvoip e esta habilitado para ligacoes via API.
 
+## Retencao das gravacoes Asterisk
+
+As gravacoes novas feitas pelo bridge do Asterisk sao persistidas em `call_recordings` e removidas somente pela Stored Recordings API do ARI. O worker nunca apaga arquivos diretamente em `/var/spool/asterisk` e nao interfere nas URLs historicas de gravacao da Nvoip.
+
+Politica padrao:
+
+- gravacao com menos de 5 segundos: estado `DISCARD_PENDING`, com carencia de 24 horas;
+- gravacao com 5 segundos ou mais: estado `READY`, com retencao de 90 dias;
+- depois do prazo e de uma exclusao ARI confirmada: estado `DISCARDED` e preenchimento de `discarded_at`;
+- falha temporaria: o arquivo permanece recuperavel e `last_cleanup_error` permite nova tentativa;
+- resposta 404 da Stored Recordings API: o registro e reconciliado como `DISCARDED`, sem apagar o historico da chamada.
+
+Os valores ficam centralizados nas variaveis:
+
+```text
+ASTERISK_RECORDING_SHORT_THRESHOLD_SECONDS=5
+ASTERISK_RECORDING_DISCARD_GRACE_HOURS=24
+ASTERISK_RECORDING_RETENTION_DAYS=90
+ASTERISK_RECORDING_DISK_THRESHOLD_PERCENT=80
+ASTERISK_RECORDING_RETENTION_BATCH_SIZE=25
+ASTERISK_RECORDING_STORAGE_USAGE_PERCENT=
+```
+
+O uso do armazenamento nao e consultado por caminho local, porque o PHP pode estar em outro servidor. Uma monitoracao confiavel da VPS pode preencher `ASTERISK_RECORDING_STORAGE_USAGE_PERCENT`; a partir de 80%, o worker aumenta apenas o lote de gravacoes que ja estao elegiveis. Gravacoes recentes nunca sao removidas arbitrariamente.
+
+Execute o worker em pequenos lotes por cron, por exemplo a cada hora:
+
+```cron
+17 * * * * cd /caminho/do/LigFlow && /usr/bin/php asterisk_recording_retention_worker.php 25 >> data/asterisk_recording_retention.log 2>&1
+```
+
+O worker usa lock exclusivo, e idempotente e mantem intactos os estados `RECORDING`, `FAILED` e `DISCARDED`. Durante a carencia, `DISCARD_PENDING` continua disponivel para reproducao e download autorizados.
+
 ## CSV de exemplo
 
 ```csv
