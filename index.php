@@ -10516,6 +10516,8 @@ function render_agent(): void
             $isCallLive = false;
         }
         $webphoneCallLive = $webphoneActiveCall && in_array((string)$webphoneActiveCall['status'], ['in_progress', 'calling_origin', 'ringing', 'answered'], true);
+        $hasOngoingCall = (int)scalar("SELECT COUNT(*) FROM calls WHERE agent_id=? AND company_id=? AND finalized_at IS NULL AND status IN ('in_progress','calling_origin','ringing','answered','connected')", [(int)$user['id'], (int)$user['company_id']]) > 0;
+        $attendanceButtonBusy = $isAutoDialing || $hasOngoingCall;
         $showAnsweredModal = call_was_answered($activeCall);
         $lastCall = one("SELECT co.*, ct.name contato FROM calls co LEFT JOIN contacts ct ON ct.id = co.contact_id WHERE co.agent_id = ? ORDER BY co.id DESC LIMIT 1", [$user['id']]);
         $recentHistory = recent_phone_history((int)$user['company_id'], (int)$user['id']);
@@ -10572,7 +10574,8 @@ function render_agent(): void
                     <button
                         name="status"
                         value="Disponivel"
-                        class="button <?= $isAutoDialing ? 'danger is-locked' : 'success' ?>"
+                        class="button <?= $attendanceButtonBusy ? 'danger' : 'success' ?><?= $isAutoDialing ? ' is-locked' : '' ?>"
+                        data-start-attendance-button
                         <?= $isAutoDialing ? 'type="button" aria-disabled="true"' : 'type="submit"' ?>
                     ><?= $isAutoDialing ? 'Atendimento em andamento' : 'Iniciar atendimento' ?></button>
                     <?php if ($isAutoDialing): ?><span class="operation-online"><span></span> Online</span><?php endif; ?>

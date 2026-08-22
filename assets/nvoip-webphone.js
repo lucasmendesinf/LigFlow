@@ -458,6 +458,7 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
     const callDetail = root.querySelector('[data-floating-call-detail]') || monitor?.querySelector('small');
     const remoteAudio = root.querySelector('[data-floating-remote-audio]');
     const stopCallButtons = Array.from(document.querySelectorAll('[data-floating-stop-call]'));
+    const startAttendanceButton = document.querySelector('[data-start-attendance-button]');
     let config = null;
     let connecting = false;
     let autoCallStarted = false;
@@ -493,6 +494,9 @@ document.querySelectorAll('[data-sip-floating]').forEach((root) => {
         stopCallButtons.forEach((button) => {
             button.hidden = !visible;
         });
+        const attendanceBusy = visible || root.getAttribute('data-auto-dialing') === '1';
+        startAttendanceButton?.classList.toggle('danger', attendanceBusy);
+        startAttendanceButton?.classList.toggle('success', !attendanceBusy);
     };
 
     const refreshCallButtonReady = () => {
